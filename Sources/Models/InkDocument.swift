@@ -72,6 +72,8 @@ struct InkStroke: Codable, Identifiable, Equatable {
     var pts: [Double]         // Flat [x0, y0, p0, x1, y1, p1, ...] in PDF points (top-left origin)
     var straight: Bool?
     var _bakedSmooth: Bool?
+    var _smoothLevel: Int?
+    var _sens: Double?
     var _smartShape: String?
 
     var pointCount: Int { pts.count / 3 }
@@ -186,5 +188,21 @@ extension UIColor {
         } else {
             self.init(red: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
         }
+    }
+
+    func toHexString() -> String {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        if getRed(&r, green: &g, blue: &b, alpha: &a) {
+            return String(
+                format: "#%02x%02x%02x",
+                Int(round(max(0, min(1, r)) * 255)),
+                Int(round(max(0, min(1, g)) * 255)),
+                Int(round(max(0, min(1, b)) * 255))
+            )
+        }
+        return "#1c1c1e"
     }
 }
