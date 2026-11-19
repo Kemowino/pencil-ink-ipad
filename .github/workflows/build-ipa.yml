@@ -55,12 +55,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-0.5.1}"
+          TAG="v${VER:-1.0.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa \
               --title "Pencil Ink Native $TAG" \
-              --notes "Automated iPadOS build ($TAG). Tap PencilInkNative.ipa below to download directly on your iPad." \
+              --notes "Pencil Ink Native $TAG — Goodnotes-style Document Tabs, PDF Reading Modes (Dark/Sepia), Outline & Search, Apple Pencil Double-Tap, Visual Bookshelf, Hobonichi Weeks, and Live Bidirectional Google Drive CRDT Sync." \
               --latest
           fi

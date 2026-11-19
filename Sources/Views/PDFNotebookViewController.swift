@@ -2,6 +2,20 @@ import UIKit
 import SwiftUI
 import PDFKit
 import QuartzCore
+import Combine
+
+struct PDFOutlineEntry: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let pageNumber: Int     // 1-based slot index
+    let depth: Int
+}
+
+struct PDFSearchHit: Identifiable, Hashable {
+    let id: String
+    let pageNumber: Int     // 1-based slot index
+    let snippet: String
+}
 
 enum DrawingTool: String {
     case pen
@@ -80,6 +94,8 @@ final class NotebookToolState: ObservableObject {
     @Published var isHobonichi: Bool = false
     @Published var currentSlotLabel: String = ""
     @Published var isOnHoboNotes: Bool = false
+    @Published var isWriting: Bool = false
+    var previousTool: DrawingTool = .pen
 
     private var toastWorkItem: DispatchWorkItem?
     private var loadingPrefs = false
@@ -141,7 +157,6 @@ final class NotebookToolState: ObservableObject {
         var eraseHlOnly: Bool
         var laserColorHex: String
         var laserTrail: Bool
-        var twoFingerScrollLock: Bool?
     }
 
     private func loadPrefs() {
@@ -189,8 +204,7 @@ final class NotebookToolState: ObservableObject {
             eraserSizeIndex: eraserSizeIndex,
             eraseHlOnly: eraseHlOnly,
             laserColorHex: laserColorHex,
-            laserTrail: laserTrail,
-            twoFingerScrollLock: false
+            laserTrail: laserTrail
         )
         if let data = try? JSONEncoder().encode(p) {
             UserDefaults.standard.set(data, forKey: prefsKey)
@@ -226,7 +240,7 @@ private final class InkScrollView: UIScrollView {
     }
 }
 
-final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate {
+final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
     let pdfURL: URL
     let relativePath: String
     let toolState: NotebookToolState
@@ -290,6 +304,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var syncPollTimer: Timer?
     private var pendingRemoteDoc: InkDocument?
     private var foregroundObserver: NSObjectProtocol?
+    private var resignActiveObserver: NSObjectProtocol?
+    private var memoryWarningObserver: NSObjectProtocol?
+    private var settingsCancellables = Set<AnyCancellable>()
+    private var isTabActive: Bool = true
+    private var currentReadingMode: PDFReadingMode = .original
     private var isHoboDoc: Bool = false
     private var lastHoboPlannerKey: String? = nil
 
@@ -297,11 +316,18 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         "pencilink.lastpage." + pdfURL.lastPathComponent
     }
 
-    init(pdfURL: URL, relativePath: String, toolState: NotebookToolState, syncManager: DriveSyncManager?) {
+    init(
+        pdfURL: URL,
+        relativePath: String,
+        toolState: NotebookToolState,
+        syncManager: DriveSyncManager?,
+        isActive: Bool = true
+    ) {
         self.pdfURL = pdfURL
         self.relativePath = relativePath
         self.toolState = toolState
         self.syncManager = syncManager
+        self.isTabActive = isActive
         var loaded = InkDocument.load(for: pdfURL)
         if loaded.name.isEmpty { loaded.name = relativePath }
         self.inkDoc = loaded
@@ -315,24 +341,158 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     deinit {
         stopLaserLoop()
         syncPollTimer?.invalidate()
-        if let obs = foregroundObserver {
-            NotificationCenter.default.removeObserver(obs)
-        }
+        if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = resignActiveObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = memoryWarningObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 0.118, green: 0.122, blue: 0.141, alpha: 1.0)
+        currentReadingMode = AppSettings.shared.pdfReadingMode
         setupScrollView()
         setupTapUndoGestures()
+        setupPencilInteraction()
+        bindAppSettings()
         loadPDF()
         startLiveDriveSync()
+
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.syncNowWithDrive(silent: true, forceFolderScan: true)
+            guard let self, self.isTabActive else { return }
+            self.syncNowWithDrive(silent: true, forceFolderScan: true)
+        }
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.saveNow()
+        }
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.evictOffscreenBitmaps(keepOnlyVisible: true)
+        }
+    }
+
+    private func setupPencilInteraction() {
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        view.addInteraction(interaction)
+    }
+
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        guard isTabActive else { return }
+        let action = AppSettings.shared.pencilDoubleTap
+        switch action {
+        case .off:
+            return
+        case .switchEraser:
+            let next: DrawingTool = (toolState.tool == .eraser) ? .pen : .eraser
+            toolState.previousTool = toolState.tool
+            toolState.tool = next
+            onToolChanged(to: next)
+            Haptics.light()
+            toolState.showToast(next == .eraser ? "Eraser" : "Pen")
+        case .switchLastTool:
+            let cur = toolState.tool
+            let prev = (toolState.previousTool == cur) ? .eraser : toolState.previousTool
+            toolState.previousTool = cur
+            toolState.tool = prev
+            onToolChanged(to: prev)
+            Haptics.light()
+            toolState.showToast(prev.rawValue.capitalized)
+        }
+    }
+
+    private func bindAppSettings() {
+        let settings = AppSettings.shared
+        pencilRecognizer.pencilOnly = !settings.drawWithFinger
+
+        settings.$drawWithFinger
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] allowFinger in
+                self?.pencilRecognizer.pencilOnly = !allowFinger
+            }
+            .store(in: &settingsCancellables)
+
+        settings.$pdfReadingMode
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newMode in
+                self?.applyReadingMode(newMode)
+            }
+            .store(in: &settingsCancellables)
+
+        settings.$syncPollSeconds
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.isTabActive else { return }
+                self.startLiveDriveSync()
+            }
+            .store(in: &settingsCancellables)
+    }
+
+    func applyReadingMode(_ mode: PDFReadingMode) {
+        guard currentReadingMode != mode else { return }
+        currentReadingMode = mode
+        layoutGeneration += 1
+        renderingKeys.removeAll()
+        for pv in pageViews {
+            pv.setReadingMode(mode)
+        }
+        updateVisiblePages(forceSharp: true)
+    }
+
+    /// Called by `TabManager` when switching between open document tabs.
+    func setTabActive(_ active: Bool) {
+        guard isTabActive != active else { return }
+        isTabActive = active
+        if active {
+            if currentReadingMode != AppSettings.shared.pdfReadingMode {
+                applyReadingMode(AppSettings.shared.pdfReadingMode)
+            }
+            pencilRecognizer.pencilOnly = !AppSettings.shared.drawWithFinger
+            updateVisiblePages(forceSharp: true)
+            startLiveDriveSync()
+        } else {
+            syncPollTimer?.invalidate()
+            syncPollTimer = nil
+            cancelHoldTimer()
+            clearLassoSelection(commitFirst: true)
+            saveNow()
+            evictOffscreenBitmaps(keepOnlyVisible: false)
+        }
+    }
+
+    private func evictOffscreenBitmaps(keepOnlyVisible: Bool) {
+        guard !pageViews.isEmpty else { return }
+        if !keepOnlyVisible && !isTabActive {
+            for pv in pageViews where pv !== activePageView {
+                pv.evictBitmap()
+            }
+            return
+        }
+        let zoom = max(0.1, scrollView.zoomScale)
+        let visibleInDoc = CGRect(
+            x: scrollView.contentOffset.x / zoom,
+            y: scrollView.contentOffset.y / zoom,
+            width: scrollView.bounds.width / zoom,
+            height: scrollView.bounds.height / zoom
+        )
+        let zone = visibleInDoc.insetBy(dx: 0, dy: -visibleInDoc.height * 0.5)
+        for (idx, pv) in pageViews.enumerated() where pv !== activePageView {
+            if !pageFrames[idx].intersects(zone) {
+                pv.evictBitmap()
+            }
         }
     }
 
@@ -458,17 +618,19 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     @objc private func handleTwoFingerTap() {
-        guard activePageView == nil, CACurrentMediaTime() - lastPencilUpTime > 0.16 else { return }
+        guard AppSettings.shared.fingerTapUndoRedo, activePageView == nil, CACurrentMediaTime() - lastPencilUpTime > 0.16 else { return }
         if !undoStack.isEmpty {
             performUndo()
+            Haptics.light()
             toolState.showToast("Undo")
         }
     }
 
     @objc private func handleThreeFingerTap() {
-        guard activePageView == nil, CACurrentMediaTime() - lastPencilUpTime > 0.16 else { return }
+        guard AppSettings.shared.fingerTapUndoRedo, activePageView == nil, CACurrentMediaTime() - lastPencilUpTime > 0.16 else { return }
         if !redoStack.isEmpty {
             performRedo()
+            Haptics.light()
             toolState.showToast("Redo")
         }
     }
@@ -558,7 +720,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         for slot in pageSlots {
             let x = (containerW - slot.size.width) * 0.5
             let frame = CGRect(x: x, y: y, width: slot.size.width, height: slot.size.height)
-            let pv = PageCanvasView(slot: slot, hoboDoc: inkDoc, hoboAllSlots: pageSlots, isHobo: isHoboDoc)
+            let pv = PageCanvasView(slot: slot, hoboDoc: inkDoc, hoboAllSlots: pageSlots, isHobo: isHoboDoc, readingMode: currentReadingMode)
             pv.frame = frame
             if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
                 pv.setStrokes(strokes)
@@ -711,7 +873,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func updateVisiblePages(forceSharp: Bool) {
-        guard !isRebuildingPages, !pageViews.isEmpty else { return }
+        guard isTabActive, !isRebuildingPages, !pageViews.isEmpty else { return }
         let zoom = max(0.1, scrollView.zoomScale)
         let visibleInDoc = CGRect(
             x: scrollView.contentOffset.x / zoom,
@@ -744,8 +906,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             renderingKeys.insert(pv.pageKey)
             let slot = pv.slot
             let targetZoom = zoom
+            let mode = currentReadingMode
             renderQueue.async { [weak self, weak pv] in
-                let img = PageCanvasView.renderSlotBackground(slot: slot, pdfDoc: doc, zoomScale: targetZoom)
+                let img = PageCanvasView.renderSlotBackground(slot: slot, pdfDoc: doc, zoomScale: targetZoom, readingMode: mode)
                 DispatchQueue.main.async {
                     guard let self, self.layoutGeneration == gen else { return }
                     self.renderingKeys.remove(slot.key)
@@ -995,6 +1158,83 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         rebuildPageViews(focusKey: key)
         scheduleSave()
         toolState.showToast("Added Back Notes N-\(nextNum)")
+    }
+
+
+    // MARK: - PDF Outline (Table of Contents) & Text Search
+
+    func extractPDFOutline() -> [PDFOutlineEntry] {
+        guard let doc = pdfDoc, let root = doc.outlineRoot else { return [] }
+        var out: [PDFOutlineEntry] = []
+        var counter = 0
+
+        func walk(_ node: PDFOutline, depth: Int) {
+            let count = node.numberOfChildren
+            for i in 0..<count {
+                guard let child = node.child(at: i) else { continue }
+                let label = (child.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let destPage = child.destination?.page ?? (child.action as? PDFActionGoTo)?.destination.page
+                if !label.isEmpty, let page = destPage {
+                    let pdfIdx = doc.index(for: page)
+                    if pdfIdx != NSNotFound {
+                        let pdfN = pdfIdx + 1
+                        let slotIdx = pageSlots.firstIndex(where: { $0.pdfN == pdfN }) ?? min(max(0, pdfIdx), max(0, pageSlots.count - 1))
+                        counter += 1
+                        out.append(PDFOutlineEntry(
+                            id: "\(counter)-\(pdfN)",
+                            title: label,
+                            pageNumber: slotIdx + 1,
+                            depth: min(depth, 3)
+                        ))
+                    }
+                }
+                if child.numberOfChildren > 0 && out.count < 800 {
+                    walk(child, depth: depth + 1)
+                }
+            }
+        }
+
+        walk(root, depth: 0)
+        return out
+    }
+
+    func searchPDFText(_ query: String, completion: @escaping ([PDFSearchHit]) -> Void) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2, let doc = pdfDoc else {
+            completion([])
+            return
+        }
+        let slotsCopy = pageSlots
+        renderQueue.async {
+            let matches = doc.findString(trimmed, withOptions: [.caseInsensitive])
+            var hits: [PDFSearchHit] = []
+            var seenPages = Set<Int>()
+            for (idx, sel) in matches.enumerated() {
+                if hits.count >= 80 { break }
+                guard let page = sel.pages.first else { continue }
+                let pdfIdx = doc.index(for: page)
+                guard pdfIdx != NSNotFound else { continue }
+                let pdfN = pdfIdx + 1
+                if seenPages.contains(pdfN) { continue }
+                seenPages.insert(pdfN)
+
+                let slotIdx = slotsCopy.firstIndex(where: { $0.pdfN == pdfN }) ?? min(max(0, pdfIdx), max(0, slotsCopy.count - 1))
+                let snippet: String
+                if let ext = sel.copy() as? PDFSelection {
+                    ext.extend(atStart: 28)
+                    ext.extend(atEnd: 48)
+                    snippet = (ext.string ?? trimmed)
+                        .replacingOccurrences(of: "\n", with: " ")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    snippet = sel.string ?? trimmed
+                }
+                hits.append(PDFSearchHit(id: "\(pdfN)-\(idx)", pageNumber: slotIdx + 1, snippet: snippet))
+            }
+            DispatchQueue.main.async {
+                completion(hits)
+            }
+        }
     }
 
     // MARK: - Thumbnails & Share / Export
@@ -1351,6 +1591,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                     self.shapeSnapTipPoint = CGPoint(x: last.x, y: last.y)
                 }
                 self.paintLive(on: pv)
+                Task { @MainActor in Haptics.light() }
                 self.toolState.showToast("Snapped to \(detected.kind)")
             }
         }
@@ -1367,6 +1608,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let docPt = touch.preciseLocation(in: documentContainer)
         guard let pv = pageView(at: docPt) else { return }
         activePageView = pv
+        if !toolState.isWriting {
+            DispatchQueue.main.async { self.toolState.isWriting = true }
+        }
 
         if toolState.tool == .lasso {
             handleLassoBegan(touch, on: pv)
@@ -1702,6 +1946,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
         defer {
             activePageView = nil
+            if toolState.isWriting {
+                DispatchQueue.main.async { self.toolState.isWriting = false }
+            }
             flushPendingRemoteDoc()
             activeSmoother = nil
             activeStartPoint = nil
@@ -2040,14 +2287,16 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     func startLiveDriveSync() {
         syncPollTimer?.invalidate()
-        guard let sm = syncManager, sm.config.isConnected else { return }
-        // Full folder scan + pull latest remote deltas immediately on open
+        syncPollTimer = nil
+        guard isTabActive, let sm = syncManager, sm.config.isConnected else { return }
+        // Full folder scan + pull latest remote deltas immediately on open / tab focus
         syncNowWithDrive(silent: true, forceFolderScan: true)
-        // Fast 3.5s metadata poll while book is open (0 downloads unless a remote shard changed!)
-        syncPollTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: true) { [weak self] _ in
+        let interval = AppSettings.shared.syncPollSeconds
+        guard interval >= 2.0 else { return }
+        syncPollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.activePageView == nil, !self.laserDown, !self.isDirty,
+                guard self.isTabActive, self.activePageView == nil, !self.laserDown, !self.isDirty,
                       let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else { return }
                 self.syncNowWithDrive(silent: true, forceFolderScan: false)
             }
@@ -2168,6 +2417,7 @@ struct PDFNotebookRepresentable: UIViewControllerRepresentable {
     let relativePath: String
     let toolState: NotebookToolState
     let syncManager: DriveSyncManager
+    let isActive: Bool
     let controllerBox: ControllerBox
 
     final class ControllerBox {
@@ -2179,7 +2429,8 @@ struct PDFNotebookRepresentable: UIViewControllerRepresentable {
             pdfURL: pdfURL,
             relativePath: relativePath,
             toolState: toolState,
-            syncManager: syncManager
+            syncManager: syncManager,
+            isActive: isActive
         )
         controllerBox.vc = vc
         return vc
@@ -2187,5 +2438,6 @@ struct PDFNotebookRepresentable: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PDFNotebookViewController, context: Context) {
         controllerBox.vc = uiViewController
+        uiViewController.setTabActive(isActive)
     }
 }

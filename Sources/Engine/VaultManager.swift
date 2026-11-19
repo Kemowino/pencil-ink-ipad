@@ -29,10 +29,14 @@ final class VaultManager: ObservableObject {
     @Published var isUsingLocalFallback: Bool = false
     @Published var coverColors: [String: Int] = [:]
     @Published var journalPaths: Set<String> = []
+    @Published var favoritePaths: Set<String> = []
+    @Published var recentPaths: [String] = []
 
     private let bookmarkKey = "pencilink.vault.bookmark.v1"
     private let coverColorsKey = "pencilink.native.coverColors.v1"
     private let journalPathsKey = "pencilink.native.journalPaths.v1"
+    private let favoritePathsKey = "pencilink.native.favoritePaths.v1"
+    private let recentPathsKey = "pencilink.native.recentPaths.v1"
     private var scopedRootURL: URL?
     private var accessingRoot = false
     private let thumbCache = NSCache<NSString, UIImage>()
@@ -56,6 +60,12 @@ final class VaultManager: ObservableObject {
         if let arr = UserDefaults.standard.stringArray(forKey: journalPathsKey) {
             journalPaths = Set(arr)
         }
+        if let favs = UserDefaults.standard.stringArray(forKey: favoritePathsKey) {
+            favoritePaths = Set(favs)
+        }
+        if let recs = UserDefaults.standard.stringArray(forKey: recentPathsKey) {
+            recentPaths = recs
+        }
     }
 
     private func saveMetadata() {
@@ -63,6 +73,34 @@ final class VaultManager: ObservableObject {
             UserDefaults.standard.set(data, forKey: coverColorsKey)
         }
         UserDefaults.standard.set(Array(journalPaths), forKey: journalPathsKey)
+        UserDefaults.standard.set(Array(favoritePaths), forKey: favoritePathsKey)
+        UserDefaults.standard.set(recentPaths, forKey: recentPathsKey)
+    }
+
+    func toggleFavorite(_ relativePath: String) {
+        if favoritePaths.contains(relativePath) {
+            favoritePaths.remove(relativePath)
+        } else {
+            favoritePaths.insert(relativePath)
+        }
+        saveMetadata()
+    }
+
+    func isFavorite(_ relativePath: String) -> Bool {
+        favoritePaths.contains(relativePath)
+    }
+
+    func recordRecentlyOpened(_ relativePath: String) {
+        recentPaths.removeAll { $0 == relativePath }
+        recentPaths.insert(relativePath, at: 0)
+        if recentPaths.count > 16 {
+            recentPaths = Array(recentPaths.prefix(16))
+        }
+        saveMetadata()
+    }
+
+    func clearThumbnailCache() {
+        thumbCache.removeAllObjects()
     }
 
     func setCoverColor(for relativePath: String, paletteID: Int) {
@@ -438,12 +476,13 @@ final class VaultManager: ObservableObject {
         return (target, rel)
     }
 
-    func renamePDF(_ item: PDFItem, newTitle: String) throws {
+    @discardableResult
+    func renamePDF(_ item: PDFItem, newTitle: String) throws -> (url: URL, relPath: String, title: String)? {
         let clean = newTitle.replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        guard !clean.isEmpty else { return nil }
         let parent = item.url.deletingLastPathComponent()
         let dest = parent.appendingPathComponent("\(clean).pdf")
-        if dest.path == item.url.path { return }
+        if dest.path == item.url.path { return nil }
         try FileManager.default.moveItem(at: item.url, to: dest)
         let oldSidecar = InkDocument.sidecarURL(for: item.url)
         let newSidecar = InkDocument.sidecarURL(for: dest)
@@ -457,8 +496,13 @@ final class VaultManager: ObservableObject {
         if journalPaths.remove(item.relativePath) != nil {
             journalPaths.insert(newRel)
         }
+        if favoritePaths.remove(item.relativePath) != nil {
+            favoritePaths.insert(newRel)
+        }
+        recentPaths = recentPaths.map { $0 == item.relativePath ? newRel : $0 }
         saveMetadata()
         refreshPDFList()
+        return (dest, newRel, clean)
     }
 
     func duplicatePDF(_ item: PDFItem) throws {
@@ -486,6 +530,8 @@ final class VaultManager: ObservableObject {
         }
         coverColors.removeValue(forKey: item.relativePath)
         journalPaths.remove(item.relativePath)
+        favoritePaths.remove(item.relativePath)
+        recentPaths.removeAll { $0 == item.relativePath }
         saveMetadata()
         refreshPDFList()
     }

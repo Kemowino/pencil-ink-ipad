@@ -4,13 +4,17 @@ import SwiftUI
 struct PencilInkApp: App {
     @StateObject private var vault = VaultManager()
     @StateObject private var syncManager = DriveSyncManager()
+    @StateObject private var tabManager = TabManager()
+    @StateObject private var settings = AppSettings.shared
 
     var body: some Scene {
         WindowGroup {
-            LibraryView()
+            WorkspaceRootView()
                 .environmentObject(vault)
                 .environmentObject(syncManager)
-                .preferredColorScheme(.dark)
+                .environmentObject(tabManager)
+                .environmentObject(settings)
+                .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
     }
 }

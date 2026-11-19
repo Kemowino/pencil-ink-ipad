@@ -1,5 +1,6 @@
 import UIKit
 import PDFKit
+import CoreImage
 
 struct LaserPoint {
     let x: CGFloat
@@ -22,24 +23,40 @@ final class PageCanvasView: UIView {
 
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
+    private(set) var readingMode: PDFReadingMode = .original
     let isHobonichiSlot: Bool
     var isTemplateOnly: Bool { isHobonichiSlot || slot.effectivePDFPageNumber == nil }
     var renderedImage: UIImage? { pdfImageView.image }
 
-    init(slot: PageSlot, hoboDoc: InkDocument? = nil, hoboAllSlots: [PageSlot] = [], isHobo: Bool = false) {
+    private static let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false])
+
+    init(
+        slot: PageSlot,
+        hoboDoc: InkDocument? = nil,
+        hoboAllSlots: [PageSlot] = [],
+        isHobo: Bool = false,
+        readingMode: PDFReadingMode = .original
+    ) {
         self.slot = slot
+        self.readingMode = readingMode
         let hoboKind = HobonichiEngine.slotKind(for: slot, isHobo: isHobo)
         self.isHobonichiSlot = (hoboKind != nil)
         let hv: HobonichiPaperView? = (hoboKind != nil)
             ? HobonichiPaperView(slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: isHobo)
             : nil
         let tplView: TemplatePaperView? = (hv == nil && slot.effectivePDFPageNumber == nil)
-            ? TemplatePaperView(template: slot.template)
+            ? TemplatePaperView(template: slot.template, readingMode: readingMode)
             : nil
         self.hoboView = hv
         self.templateView = tplView
         super.init(frame: CGRect(origin: .zero, size: slot.size))
-        backgroundColor = (hv != nil) ? HobonichiEngine.creamColor : .white
+        if hv != nil {
+            backgroundColor = HobonichiEngine.creamColor
+        } else {
+            backgroundColor = Self.paperBackdropColor(for: readingMode)
+        }
+        staticInkView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
+        liveOverlayView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
         layer.cornerRadius = 3
         layer.masksToBounds = true
         isUserInteractionEnabled = false
@@ -182,6 +199,89 @@ final class PageCanvasView: UIView {
         }
     }
 
+    func setReadingMode(_ mode: PDFReadingMode) {
+        guard readingMode != mode else { return }
+        readingMode = mode
+        if !isHobonichiSlot {
+            backgroundColor = Self.paperBackdropColor(for: mode)
+            staticInkView.smartDarkInk = (mode == .dark)
+            staticInkView.setNeedsDisplay()
+            liveOverlayView.smartDarkInk = (mode == .dark)
+            if let tv = templateView {
+                tv.readingMode = mode
+                tv.setNeedsDisplay()
+            } else {
+                evictBitmap()
+            }
+        }
+    }
+
+    static func paperBackdropColor(for mode: PDFReadingMode) -> UIColor {
+        switch mode {
+        case .original: return .white
+        case .dark: return UIColor(red: 0.11, green: 0.115, blue: 0.13, alpha: 1.0)
+        case .sepia: return UIColor(red: 0.965, green: 0.935, blue: 0.87, alpha: 1.0)
+        }
+    }
+
+    static func displayColor(for hex: String, smartDark: Bool) -> UIColor {
+        let base = UIColor(hex: hex)
+        guard smartDark else { return base }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+        guard base.getRed(&r, green: &g, blue: &b, alpha: &a) else { return base }
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b
+        if lum < 0.28 {
+            return UIColor(red: 0.93, green: 0.94, blue: 0.97, alpha: a)
+        }
+        return base
+    }
+
+    static func applyReadingFilter(to image: UIImage, mode: PDFReadingMode) -> UIImage {
+        guard mode != .original, let cgImg = image.cgImage else { return image }
+        switch mode {
+        case .original:
+            return image
+        case .dark:
+            let input = CIImage(cgImage: cgImg)
+            guard let invert = CIFilter(name: "CIColorInvert") else { return image }
+            invert.setValue(input, forKey: kCIInputImageKey)
+            guard let inverted = invert.outputImage else { return image }
+            let finalCI: CIImage
+            if let hue = CIFilter(name: "CIHueAdjust") {
+                hue.setValue(inverted, forKey: kCIInputImageKey)
+                hue.setValue(Float.pi, forKey: kCIInputAngleKey)
+                finalCI = hue.outputImage ?? inverted
+            } else {
+                finalCI = inverted
+            }
+            // Gently lift pure #000000 black background to comfortable OLED dark slate
+            let lifted: CIImage
+            if let tone = CIFilter(name: "CIColorControls") {
+                tone.setValue(finalCI, forKey: kCIInputImageKey)
+                tone.setValue(0.06, forKey: kCIInputBrightnessKey)
+                tone.setValue(0.92, forKey: kCIInputContrastKey)
+                lifted = tone.outputImage ?? finalCI
+            } else {
+                lifted = finalCI
+            }
+            if let outCG = sharedCIContext.createCGImage(lifted, from: input.extent) {
+                return UIImage(cgImage: outCG, scale: image.scale, orientation: image.imageOrientation)
+            }
+            return image
+        case .sepia:
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = image.scale
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
+            return renderer.image { ctx in
+                image.draw(at: .zero)
+                ctx.cgContext.setBlendMode(.multiply)
+                UIColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0).setFill()
+                ctx.cgContext.fill(CGRect(origin: .zero, size: image.size))
+            }
+        }
+    }
+
     func evictBitmap() {
         guard !isTemplateOnly else { return }
         pdfImageView.image = nil
@@ -198,7 +298,13 @@ final class PageCanvasView: UIView {
         return box.size
     }
 
-    static func renderSlotBackground(slot: PageSlot, pdfDoc: PDFDocument?, zoomScale: CGFloat, maxPixels: CGFloat = 6_000_000) -> UIImage {
+    static func renderSlotBackground(
+        slot: PageSlot,
+        pdfDoc: PDFDocument?,
+        zoomScale: CGFloat,
+        maxPixels: CGFloat = 6_000_000,
+        readingMode: PDFReadingMode = .original
+    ) -> UIImage {
         let pageSize = slot.size
         let dpr = min(UIScreen.main.scale, 2.0)
         let desiredScale = max(0.35, min(zoomScale * dpr, 3.0))
@@ -209,10 +315,11 @@ final class PageCanvasView: UIView {
         format.scale = finalScale
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: pageSize, format: format)
-        return renderer.image { rendererCtx in
+        let baseImg = renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
             drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx)
         }
+        return applyReadingFilter(to: baseImg, mode: readingMode)
     }
 
     func updateHobonichiData(doc: InkDocument, allSlots: [PageSlot]) {
@@ -246,16 +353,22 @@ final class PageCanvasView: UIView {
         ctx.restoreGState()
     }
 
-    static func drawStrokes(_ strokes: [InkStroke], in ctx: CGContext, clipRect: CGRect? = nil, hiddenIDs: Set<String> = []) {
+    static func drawStrokes(
+        _ strokes: [InkStroke],
+        in ctx: CGContext,
+        clipRect: CGRect? = nil,
+        hiddenIDs: Set<String> = [],
+        smartDarkInk: Bool = false
+    ) {
         guard !strokes.isEmpty else { return }
         ctx.saveGState()
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 
-        // 1. Highlighters first (multiply blend, 0.42 alpha)
+        // 1. Highlighters first (multiply on light/sepia paper, screen/normal translucent on dark paper)
         ctx.saveGState()
-        ctx.setBlendMode(.multiply)
-        ctx.setAlpha(0.42)
+        ctx.setBlendMode(smartDarkInk ? .screen : .multiply)
+        ctx.setAlpha(smartDarkInk ? 0.34 : 0.42)
         for s in strokes where s.tool == "highlighter" {
             if hiddenIDs.contains(s.id) { continue }
             if let rect = clipRect {
@@ -274,6 +387,16 @@ final class PageCanvasView: UIView {
             if let rect = clipRect {
                 let pad = CGFloat(s.size) * 1.8 + 4
                 guard s.boundingBox().insetBy(dx: -pad, dy: -pad).intersects(rect) else { continue }
+            }
+            if smartDarkInk {
+                let liftedColor = displayColor(for: s.color, smartDark: true)
+                let liftedHex = liftedColor.toHexString()
+                if liftedHex != s.color {
+                    var copy = s
+                    copy.color = liftedHex
+                    StrokeGeometry.drawCommittedStroke(copy, in: ctx)
+                    continue
+                }
             }
             StrokeGeometry.drawCommittedStroke(s, in: ctx)
         }
@@ -306,10 +429,11 @@ private final class StaticInkView: UIView {
     var pageSize: CGSize = .zero
     var strokes: [InkStroke] = []
     var hiddenStrokeIDs: Set<String> = []
+    var smartDarkInk: Bool = false
 
     override func draw(_ rect: CGRect) {
         guard !strokes.isEmpty, let ctx = UIGraphicsGetCurrentContext() else { return }
-        PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs)
+        PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs, smartDarkInk: smartDarkInk)
     }
 }
 
@@ -324,6 +448,7 @@ private final class LiveInkOverlayView: UIView {
     }
 
     var mode: Mode = .none
+    var smartDarkInk: Bool = false
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
@@ -332,14 +457,20 @@ private final class LiveInkOverlayView: UIView {
             return
         case let .stroke(points, color, size, tool, style, straight, isSmartShape):
             ctx.saveGState()
+            let drawCol: UIColor
             if tool == "highlighter" {
-                ctx.setBlendMode(.multiply)
-                ctx.setAlpha(0.42)
+                ctx.setBlendMode(smartDarkInk ? .screen : .multiply)
+                ctx.setAlpha(smartDarkInk ? 0.34 : 0.42)
+                drawCol = color
+            } else if smartDarkInk {
+                drawCol = PageCanvasView.displayColor(for: color.toHexString(), smartDark: true)
+            } else {
+                drawCol = color
             }
             StrokeGeometry.drawStroke(
                 in: ctx,
                 points: points,
-                color: color,
+                color: drawCol,
                 baseSize: size,
                 tool: tool,
                 style: style,
@@ -473,12 +604,14 @@ private final class LiveInkOverlayView: UIView {
 
 private final class TemplatePaperView: UIView {
     let template: PaperTemplate
+    var readingMode: PDFReadingMode
 
-    init(template: PaperTemplate) {
+    init(template: PaperTemplate, readingMode: PDFReadingMode = .original) {
         self.template = template
+        self.readingMode = readingMode
         super.init(frame: .zero)
         isOpaque = true
-        backgroundColor = .white
+        backgroundColor = PageCanvasView.paperBackdropColor(for: readingMode)
         contentMode = .redraw
     }
 
@@ -489,6 +622,63 @@ private final class TemplatePaperView: UIView {
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         template.draw(in: ctx, size: bounds.size)
+        if readingMode == .sepia {
+            ctx.saveGState()
+            ctx.setBlendMode(.multiply)
+            UIColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0).setFill()
+            ctx.fill(bounds)
+            ctx.restoreGState()
+        } else if readingMode == .dark {
+            ctx.saveGState()
+            ctx.setFillColor(red: 0.115, green: 0.12, blue: 0.135, alpha: 1.0)
+            ctx.fill(bounds)
+            let w = bounds.width, h = bounds.height
+            switch template {
+            case .blank:
+                break
+            case .lined:
+                ctx.setStrokeColor(red: 0.30, green: 0.36, blue: 0.45, alpha: 0.7)
+                ctx.setLineWidth(0.8)
+                var y: CGFloat = 68
+                while y <= h - 42 {
+                    ctx.move(to: CGPoint(x: 36, y: y)); ctx.addLine(to: CGPoint(x: w - 36, y: y))
+                    y += 28
+                }
+                ctx.strokePath()
+            case .grid:
+                ctx.setStrokeColor(red: 0.25, green: 0.28, blue: 0.34, alpha: 0.8)
+                ctx.setLineWidth(0.6)
+                var x: CGFloat = 36
+                while x <= w - 36 { ctx.move(to: CGPoint(x: x, y: 36)); ctx.addLine(to: CGPoint(x: x, y: h - 36)); x += 18 }
+                var y: CGFloat = 36
+                while y <= h - 36 { ctx.move(to: CGPoint(x: 36, y: y)); ctx.addLine(to: CGPoint(x: w - 36, y: y)); y += 18 }
+                ctx.strokePath()
+            case .dot:
+                ctx.setFillColor(red: 0.44, green: 0.47, blue: 0.54, alpha: 0.85)
+                var x: CGFloat = 36
+                while x <= w - 36 {
+                    var y: CGFloat = 36
+                    while y <= h - 36 {
+                        ctx.fillEllipse(in: CGRect(x: x - 1.25, y: y - 1.25, width: 2.5, height: 2.5))
+                        y += 18
+                    }
+                    x += 18
+                }
+            case .cornell:
+                ctx.setStrokeColor(red: 0.30, green: 0.36, blue: 0.45, alpha: 0.7)
+                ctx.setLineWidth(0.75)
+                var y: CGFloat = 112
+                while y <= h - 155 { ctx.move(to: CGPoint(x: 175, y: y)); ctx.addLine(to: CGPoint(x: w - 36, y: y)); y += 26 }
+                ctx.strokePath()
+                ctx.setStrokeColor(red: 0.72, green: 0.36, blue: 0.36, alpha: 0.85)
+                ctx.setLineWidth(1.0)
+                ctx.move(to: CGPoint(x: 36, y: 84)); ctx.addLine(to: CGPoint(x: w - 36, y: 84))
+                ctx.move(to: CGPoint(x: 175, y: 84)); ctx.addLine(to: CGPoint(x: 175, y: h - 140))
+                ctx.move(to: CGPoint(x: 36, y: h - 140)); ctx.addLine(to: CGPoint(x: w - 36, y: h - 140))
+                ctx.strokePath()
+            }
+            ctx.restoreGState()
+        }
     }
 }
 
