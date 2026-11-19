@@ -89,7 +89,7 @@ struct BookLogState: Codable {
     }
 }
 
-/// Manages direct Google Drive CRDT delta sync for Pencil Ink Native.
+/// Manages fast, bidirectional Google Drive CRDT delta sync for Pencil Ink Native.
 /// Fully compatible with Obsidian Pencil Ink's `.ink.d` folder & `log_<device>_*.json` format.
 @MainActor
 final class DriveSyncManager: ObservableObject {
@@ -97,6 +97,7 @@ final class DriveSyncManager: ObservableObject {
     @Published var visualState: SyncVisualState = .disconnected
     @Published var statusText: String = "Not Connected"
     @Published var lastError: String = ""
+    @Published var lastDiagnostic: String = ""
     @Published var lastSyncedAt: Date? = nil
     @Published var sessionBytesUp: Int64 = 0
     @Published var sessionBytesDown: Int64 = 0
@@ -107,6 +108,8 @@ final class DriveSyncManager: ObservableObject {
     private let client: GoogleDriveClient
     private var logStates: [String: BookLogState] = [:]
     private var logSeen: [String: [String: RemoteLogEntry]] = [:]
+    private var folderCheckAt: [String: Date] = [:]
+    private var extraFolderCache: [String: [String]] = [:]
     private var activeSyncTasks: [String: Task<(InkDocument, Bool), Error>] = [:]
     private var debounceTimers: [String: DispatchWorkItem] = [:]
 
@@ -163,65 +166,11 @@ final class DriveSyncManager: ObservableObject {
         config.refreshToken = ""
         config.expiresAt = 0
         lastError = ""
+        lastDiagnostic = ""
         saveConfig()
         visualState = .disconnected
         statusText = "Not Connected"
     }
-
-    /// 1-Tap Import from your Obsidian vault's `.obsidian/plugins/pencil-ink/data.json`!
-    func importFromObsidianVault(_ vaultURL: URL?) -> String {
-        guard let root = vaultURL else {
-            return "Select your Obsidian vault folder in Library first."
-        }
-        let dataURL = root
-            .appendingPathComponent(".obsidian")
-            .appendingPathComponent("plugins")
-            .appendingPathComponent("pencil-ink")
-            .appendingPathComponent("data.json")
-
-        var rawData: Data?
-        var coordErr: NSError?
-        NSFileCoordinator().coordinate(readingItemAt: dataURL, options: [], error: &coordErr) { url in
-            rawData = try? Data(contentsOf: url)
-        }
-        if rawData == nil {
-            rawData = try? Data(contentsOf: dataURL)
-        }
-        guard let data = rawData,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return "Could not find .obsidian/plugins/pencil-ink/data.json inside your vault."
-        }
-
-        let cid = (json["clientId"] as? String) ?? ""
-        let csec = (json["clientSecret"] as? String) ?? ""
-        let folder = (json["driveFolder"] as? String) ?? "Obsidian Vault"
-        let refresh = (json["refreshToken"] as? String) ?? ""
-        let access = (json["accessToken"] as? String) ?? ""
-        let expires = (json["expiresAt"] as? Double) ?? 0
-
-        guard !cid.isEmpty else {
-            return "Obsidian Pencil Ink does not have a Google Client ID configured yet."
-        }
-
-        config.clientId = cid
-        config.clientSecret = csec
-        config.driveFolder = folder.isEmpty ? "Obsidian Vault" : folder
-        if !refresh.isEmpty {
-            config.refreshToken = refresh
-            config.accessToken = access
-            config.expiresAt = expires
-        }
-        lastError = ""
-        saveConfig()
-        if !refresh.isEmpty {
-            visualState = .ok
-            statusText = "Connected via Obsidian"
-            return "Imported credentials & Google Drive login from Obsidian!"
-        } else {
-            return "Imported Client ID, Secret & Folder from Obsidian. Tap Sign in with Google to connect."
-        }
-    }
-
 
     // MARK: - Device Key Codec (100% Compatible with Obsidian Pencil Ink `PENCIL-INK-DEVICE:...`)
 
@@ -256,8 +205,6 @@ final class DriveSyncManager: ObservableObject {
         return Self.deviceKeyPrefix + jsonData.base64EncodedString()
     }
 
-    /// Parses and applies an Obsidian Pencil Ink Device Key (`PENCIL-INK-DEVICE:...`).
-    /// Returns `(success, message)`.
     func applyDeviceKey(_ raw: String) -> (ok: Bool, message: String) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix(Self.deviceKeyPrefix) else {
@@ -286,6 +233,8 @@ final class DriveSyncManager: ObservableObject {
             config.driveFolder = df
         }
         lastError = ""
+        folderCheckAt.removeAll()
+        extraFolderCache.removeAll()
         saveConfig()
         if config.isConnected {
             visualState = .ok
@@ -345,7 +294,7 @@ final class DriveSyncManager: ObservableObject {
         return String(format: "%.2f MB", b / 1_048_576.0)
     }
 
-    // MARK: - Debounced Auto-Push & Live Book Sync
+    // MARK: - Fast Debounced Auto-Push & Live Book Sync
 
     func scheduleBookSync(
         pdfURL: URL,
@@ -361,16 +310,27 @@ final class DriveSyncManager: ObservableObject {
             self.debounceTimers.removeValue(forKey: key)
             let localDoc = localDocProvider()
             Task { @MainActor in
-                if let (merged, changed) = await self.syncBook(pdfURL: pdfURL, relativePath: relativePath, localDoc: localDoc), changed {
+                if let (merged, changed) = await self.syncBook(
+                    pdfURL: pdfURL,
+                    relativePath: relativePath,
+                    localDoc: localDoc,
+                    forceFolderScan: false
+                ), changed {
                     onMerged(merged)
                 }
             }
         }
         debounceTimers[key] = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: item)
+        // Fast 0.55s debounce so strokes leave the iPad in <1 second!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: item)
     }
 
-    func syncBook(pdfURL: URL, relativePath: String, localDoc: InkDocument) async -> (InkDocument, Bool)? {
+    func syncBook(
+        pdfURL: URL,
+        relativePath: String,
+        localDoc: InkDocument,
+        forceFolderScan: Bool = false
+    ) async -> (InkDocument, Bool)? {
         guard config.isConnected else { return nil }
         let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
         if let running = activeSyncTasks[inkRelPath] {
@@ -385,7 +345,12 @@ final class DriveSyncManager: ObservableObject {
         let task = Task<(InkDocument, Bool), Error> { [weak self] in
             guard let self else { throw DriveClientError.notConnected }
             await self.client.updateConfig(currentCfg)
-            return try await self.performBookSync(pdfURL: pdfURL, inkRelPath: inkRelPath, localDoc: localDoc)
+            return try await self.performBookSync(
+                pdfURL: pdfURL,
+                inkRelPath: inkRelPath,
+                localDoc: localDoc,
+                forceFolderScan: forceFolderScan
+            )
         }
         activeSyncTasks[inkRelPath] = task
 
@@ -421,7 +386,7 @@ final class DriveSyncManager: ObservableObject {
 
     func syncAllAnnotatedBooks(vault: VaultManager) async {
         guard config.isConnected, let root = vault.vaultURL else { return }
-        let rootPath = root.path
+        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
         let annotated = vault.pdfs.filter { $0.hasInk }
         guard !annotated.isEmpty else {
             lastSyncedAt = Date()
@@ -430,22 +395,28 @@ final class DriveSyncManager: ObservableObject {
             return
         }
         for item in annotated {
+            let itemPath = item.url.standardizedFileURL.resolvingSymlinksInPath().path
             let rel: String
-            if item.url.path.hasPrefix(rootPath) {
-                rel = String(item.url.path.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if itemPath.hasPrefix(rootPath) {
+                rel = String(itemPath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             } else {
                 rel = item.url.lastPathComponent
             }
             let local = InkDocument.load(for: item.url)
-            if let (merged, changed) = await syncBook(pdfURL: item.url, relativePath: rel, localDoc: local), changed {
+            if let (merged, changed) = await syncBook(pdfURL: item.url, relativePath: rel, localDoc: local, forceFolderScan: true), changed {
                 try? merged.save(for: item.url)
             }
         }
     }
 
-    // MARK: - Core CRDT Sync Implementation (Exact Match to `src/logs.ts` & `src/sync.ts`)
+    // MARK: - Core Bidirectional CRDT Sync (Exact Match to Obsidian `src/logs.ts` & `src/sync.ts`)
 
-    private func performBookSync(pdfURL: URL, inkRelPath: String, localDoc: InkDocument) async throws -> (InkDocument, Bool) {
+    private func performBookSync(
+        pdfURL: URL,
+        inkRelPath: String,
+        localDoc: InkDocument,
+        forceFolderScan: Bool
+    ) async throws -> (InkDocument, Bool) {
         let dir = (inkRelPath as NSString).deletingLastPathComponent
         let fileName = (inkRelPath as NSString).lastPathComponent
         let folderName = fileName.hasSuffix(".json")
@@ -455,67 +426,134 @@ final class DriveSyncManager: ObservableObject {
         var st = loadLogState(for: inkRelPath)
         var seen = logSeen[inkRelPath] ?? [:]
 
-        // 1. Resolve or create `<Book.pdf.ink.d>` folder on Drive
-        let parentID = try await client.ensureRemoteDir(relativeDir: dir)
+        // 1. Resolve ALL matching `<Book.pdf.ink.d>` folders on Drive (prevents split-folder one-way sync!)
+        let needFolderScan = forceFolderScan
+            || st.folderId.isEmpty
+            || (folderCheckAt[inkRelPath].map { Date().timeIntervalSince($0) > 25 } ?? true)
+
         var folderID = st.folderId
-        var extraFolderIDs: [String] = []
-        if folderID.isEmpty {
-            let folders = try await client.findChildren(parentID: parentID, name: folderName, mimeType: GoogleDriveClient.folderMime)
-                .sorted { $0.id < $1.id }
+        var extraFolderIDs = extraFolderCache[inkRelPath] ?? []
+
+        if needFolderScan {
+            let parentID = try await client.ensureRemoteDir(relativeDir: dir)
+            let folders = try await client.findChildren(
+                parentID: parentID,
+                name: folderName,
+                mimeType: GoogleDriveClient.folderMime
+            ).sorted { $0.id < $1.id }
+
             if let first = folders.first {
+                // Always adopt the smallest-ID folder as canonical primary (matching Obsidian!)
+                if !folderID.isEmpty && folderID != first.id {
+                    // Reset our own uploaded file IDs if primary folder changed so dirty files upload to canonical folder
+                    st.ids.removeAll()
+                    for key in st.own.keys { st.markDirty(BookLogState.pageFile(label: st.label, key: key)) }
+                    if !st.erased.isEmpty { st.markDirty(BookLogState.eraseFile(label: st.label)) }
+                    if !st.ownBlanks.isEmpty { st.markDirty(BookLogState.blanksFile(label: st.label)) }
+                    if !st.ownBookmarks.isEmpty || !st.ownRemoved.isEmpty { st.markDirty(BookLogState.marksFile(label: st.label)) }
+                }
                 folderID = first.id
                 extraFolderIDs = folders.dropFirst().map { $0.id }
             } else {
                 let made = try await client.createFolder(name: folderName, parentID: parentID)
                 folderID = made.id
+                extraFolderIDs = []
             }
             st.folderId = folderID
+            extraFolderCache[inkRelPath] = extraFolderIDs
+            folderCheckAt[inkRelPath] = Date()
         }
 
-        let listing = try await client.listChildren(parentIDs: [folderID] + extraFolderIDs)
+        let allFolderIDs = [folderID] + extraFolderIDs
+        let listing = try await client.listChildren(parentIDs: allFolderIDs)
         let hadFormat = listing.contains { $0.name == "format.json" }
 
-        // Map our own existing log files & detect duplicates
+        // Map our own existing log files inside canonical primary folder & flag duplicates
         var duplicateIDs: [String] = []
         for f in listing where f.name.hasPrefix("log_\(st.label)_") {
-            if st.ids[f.name] == nil {
-                st.ids[f.name] = f.id
-            } else if st.ids[f.name] != f.id {
-                duplicateIDs.append(f.id)
+            let inPrimary = (f.parents?.contains(folderID) ?? true)
+            if inPrimary {
+                if st.ids[f.name] == nil {
+                    st.ids[f.name] = f.id
+                } else if st.ids[f.name] != f.id {
+                    duplicateIDs.append(f.id)
+                }
             }
         }
 
-        // 2. Pull other devices' changed `log_*` files (skip unchanged md5)
+        // 2. Pull ALL other devices' changed `log_*` files across ALL matching folders in parallel!
         var remoteGroups: [String: [DriveFileMeta]] = [:]
         for f in listing {
             if !f.name.hasPrefix("log_") || f.name.hasPrefix("log_\(st.label)_") { continue }
             remoteGroups[f.name, default: []].append(f)
         }
 
+        if forceFolderScan {
+            st.seenMd5.removeAll()
+        }
+
+        var toDownload: [(name: String, group: [DriveFileMeta])] = []
         for (name, group) in remoteGroups {
-            if group.count == 1, seen[name] != nil, let md5 = group[0].md5Checksum, st.seenMd5[name] == md5 {
-                continue
-            }
-            var combined: RemoteLogEntry? = nil
-            var lastMd5: String? = nil
-            var unreadable = false
-            for f in group {
-                let bytes = try await client.download(fileID: f.id)
-                lastMd5 = WireCodec.md5Hex(bytes)
-                if let parsed = parseRemoteEntry(name: name, bytes: bytes) {
-                    combined = combineRemoteEntries(combined, parsed)
-                } else {
-                    unreadable = true
+            if group.count == 1, seen[name] != nil {
+                let rev = "\(group[0].md5Checksum ?? "")|\(group[0].modifiedTime ?? "")"
+                if !rev.isEmpty && st.seenMd5[name] == rev {
+                    continue
                 }
             }
-            if let entry = combined {
-                seen[name] = entry
-                if unreadable || group.count > 1 {
-                    st.seenMd5.removeValue(forKey: name)
-                } else if let m = lastMd5 {
-                    st.seenMd5[name] = m
+            toDownload.append((name, group))
+        }
+
+        var parseFailures = 0
+        var downloadedCount = 0
+
+        if !toDownload.isEmpty {
+            let clientRef = self.client
+            let results: [(String, RemoteLogEntry?, String?, Bool)] = try await withThrowingTaskGroup(
+                of: (String, RemoteLogEntry?, String?, Bool).self
+            ) { groupTask in
+                for item in toDownload {
+                    groupTask.addTask {
+                        var combined: RemoteLogEntry? = nil
+                        var unreadable = false
+                        for f in item.group {
+                            let bytes = try await clientRef.download(fileID: f.id)
+                            if let parsed = DriveSyncManager.parseRemoteEntryStatic(name: item.name, bytes: bytes) {
+                                combined = DriveSyncManager.combineRemoteEntriesStatic(combined, parsed)
+                            } else {
+                                unreadable = true
+                            }
+                        }
+                        let rev: String? = (item.group.count == 1 && !unreadable)
+                            ? "\(item.group[0].md5Checksum ?? "")|\(item.group[0].modifiedTime ?? "")"
+                            : nil
+                        return (item.name, combined, rev, unreadable)
+                    }
+                }
+                var collected: [(String, RemoteLogEntry?, String?, Bool)] = []
+                for try await r in groupTask {
+                    collected.append(r)
+                }
+                return collected
+            }
+
+            for (name, entry, rev, unreadable) in results {
+                downloadedCount += 1
+                if unreadable { parseFailures += 1 }
+                if let e = entry {
+                    seen[name] = e
+                    if let r = rev, !r.isEmpty {
+                        st.seenMd5[name] = r
+                    } else {
+                        st.seenMd5.removeValue(forKey: name)
+                    }
                 }
             }
+        }
+
+        // Remove any deleted remote files from `seen`
+        for name in Array(seen.keys) where remoteGroups[name] == nil {
+            seen.removeValue(forKey: name)
+            st.seenMd5.removeValue(forKey: name)
         }
 
         // 3. Diff local document into our device's append-only CRDT log
@@ -541,30 +579,50 @@ final class DriveSyncManager: ObservableObject {
             }
         }
 
-        // 4. Derive merged document & upload ONLY our dirty log files
+        // 4. Derive merged document & upload ONLY our dirty log files CONCURRENTLY!
         let merged = deriveDoc(st: st, seen: seen, name: localDoc.name)
 
         let dirtyFiles = st.dirty
-        for name in dirtyFiles {
-            let payload: Data
-            if name.hasSuffix("_erase.json") {
-                payload = try JSONEncoder().encode(WireCodec.EraseLogPayload(v: 1, erased: st.erased))
-            } else if name.hasSuffix("_blanks.json") {
-                payload = try JSONEncoder().encode(WireCodec.BlanksLogPayload(v: 1, blanks: Array(st.ownBlanks.values)))
-            } else if name.hasSuffix("_marks.json") {
-                payload = try JSONEncoder().encode(WireCodec.MarksLogPayload(v: 1, bookmarks: st.ownBookmarks, removed: st.ownRemoved))
-            } else {
-                let pageKey = BookLogState.keyOfFile(name)
-                payload = try WireCodec.encodePageShard(key: pageKey, strokes: st.own[pageKey] ?? [])
+        if !dirtyFiles.isEmpty {
+            var prepared: [(name: String, existingID: String?, payload: Data)] = []
+            for name in dirtyFiles {
+                let payload: Data
+                if name.hasSuffix("_erase.json") {
+                    payload = try JSONEncoder().encode(WireCodec.EraseLogPayload(v: 1, erased: st.erased))
+                } else if name.hasSuffix("_blanks.json") {
+                    payload = try JSONEncoder().encode(WireCodec.BlanksLogPayload(v: 1, blanks: Array(st.ownBlanks.values)))
+                } else if name.hasSuffix("_marks.json") {
+                    payload = try JSONEncoder().encode(WireCodec.MarksLogPayload(v: 1, bookmarks: st.ownBookmarks, removed: st.ownRemoved))
+                } else {
+                    let pageKey = BookLogState.keyOfFile(name)
+                    payload = try WireCodec.encodePageShard(key: pageKey, strokes: st.own[pageKey] ?? [])
+                }
+                prepared.append((name, st.ids[name], payload))
             }
-            let uploaded = try await client.uploadMultipart(
-                fileID: st.ids[name],
-                name: name,
-                parentID: folderID,
-                payload: payload
-            )
-            st.ids[name] = uploaded.id
-            st.dirty.removeAll { $0 == name }
+
+            let clientRef = self.client
+            let primaryID = folderID
+            let uploadedPairs: [(String, String)] = try await withThrowingTaskGroup(of: (String, String).self) { groupTask in
+                for item in prepared {
+                    groupTask.addTask {
+                        let meta = try await clientRef.uploadMultipart(
+                            fileID: item.existingID,
+                            name: item.name,
+                            parentID: primaryID,
+                            payload: item.payload
+                        )
+                        return (item.name, meta.id)
+                    }
+                }
+                var out: [(String, String)] = []
+                for try await pair in groupTask { out.append(pair) }
+                return out
+            }
+
+            for (name, newID) in uploadedPairs {
+                st.ids[name] = newID
+                st.dirty.removeAll { $0 == name }
+            }
         }
 
         if isJoining && !hadFormat {
@@ -584,6 +642,13 @@ final class DriveSyncManager: ObservableObject {
         logStates[inkRelPath] = st
         logSeen[inkRelPath] = seen
         saveLogState(st, for: inkRelPath)
+
+        let remoteCount = remoteGroups.count
+        let folderCount = allFolderIDs.count
+        let diagPath = dir.isEmpty ? folderName : "\(dir)/\(folderName)"
+        lastDiagnostic = "\(diagPath) · \(folderCount) folder\(folderCount == 1 ? "" : "s") · \(remoteCount) remote shard\(remoteCount == 1 ? "" : "s")"
+            + (downloadedCount > 0 ? " (↓\(downloadedCount))" : "")
+            + (parseFailures > 0 ? " · ⚠️ \(parseFailures) decode err" : "")
 
         let changedLocally = !sameContent(merged, localDoc)
         if changedLocally {
@@ -792,24 +857,27 @@ final class DriveSyncManager: ObservableObject {
         return doc
     }
 
-    private func parseRemoteEntry(name: String, bytes: Data) -> RemoteLogEntry? {
+    nonisolated static func parseRemoteEntryStatic(name: String, bytes: Data) -> RemoteLogEntry? {
         if name.hasSuffix("_erase.json") {
-            guard let p = try? JSONDecoder().decode(WireCodec.EraseLogPayload.self, from: bytes) else { return nil }
+            let raw = WireCodec.isGzip(bytes) ? ((try? WireCodec.gzipDecompress(bytes)) ?? bytes) : bytes
+            guard let p = try? JSONDecoder().decode(WireCodec.EraseLogPayload.self, from: raw) else { return nil }
             return RemoteLogEntry(erased: p.erased)
         }
         if name.hasSuffix("_blanks.json") {
-            guard let p = try? JSONDecoder().decode(WireCodec.BlanksLogPayload.self, from: bytes) else { return nil }
+            let raw = WireCodec.isGzip(bytes) ? ((try? WireCodec.gzipDecompress(bytes)) ?? bytes) : bytes
+            guard let p = try? JSONDecoder().decode(WireCodec.BlanksLogPayload.self, from: raw) else { return nil }
             return RemoteLogEntry(blanks: p.blanks)
         }
         if name.hasSuffix("_marks.json") {
-            guard let p = try? JSONDecoder().decode(WireCodec.MarksLogPayload.self, from: bytes) else { return nil }
+            let raw = WireCodec.isGzip(bytes) ? ((try? WireCodec.gzipDecompress(bytes)) ?? bytes) : bytes
+            guard let p = try? JSONDecoder().decode(WireCodec.MarksLogPayload.self, from: raw) else { return nil }
             return RemoteLogEntry(bookmarks: p.bookmarks, removed: p.removed)
         }
         guard let shard = WireCodec.decodePageShard(bytes) else { return nil }
         return RemoteLogEntry(key: shard.key, strokes: shard.strokes)
     }
 
-    private func combineRemoteEntries(_ a: RemoteLogEntry?, _ b: RemoteLogEntry) -> RemoteLogEntry {
+    nonisolated static func combineRemoteEntriesStatic(_ a: RemoteLogEntry?, _ b: RemoteLogEntry) -> RemoteLogEntry {
         guard var out = a else { return b }
         if let k = b.key { out.key = k }
         if let bs = b.strokes {

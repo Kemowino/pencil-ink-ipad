@@ -62,6 +62,14 @@ actor GoogleDriveClient {
 
     private var rootFolderIDCache: (spec: String, id: String)?
     private var dirIDCache: [String: String] = [:]
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.urlCache = nil
+        cfg.timeoutIntervalForRequest = 35
+        cfg.timeoutIntervalForResource = 90
+        return URLSession(configuration: cfg)
+    }()
     private let onConfigUpdated: @Sendable (DriveConfig) -> Void
 
     init(config: DriveConfig, onConfigUpdated: @escaping @Sendable (DriveConfig) -> Void) {
@@ -134,7 +142,7 @@ actor GoogleDriveClient {
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = Data(body.utf8)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let access = json["access_token"] as? String else {
@@ -170,7 +178,7 @@ actor GoogleDriveClient {
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = Data(body.utf8)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if status != 200 {
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -205,16 +213,17 @@ actor GoogleDriveClient {
         var attempt = 0
         while true {
             let token = try await ensureValidToken()
-            var req = URLRequest(url: url)
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
             req.httpMethod = method
-            req.timeoutInterval = timeout
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            req.setValue("no-cache", forHTTPHeaderField: "Pragma")
             if let ct = contentType {
                 req.setValue(ct, forHTTPHeaderField: "Content-Type")
             }
             req.httpBody = body
 
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await session.data(for: req)
             let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401 && attempt < 1 {
                 config.expiresAt = 0

@@ -74,6 +74,16 @@ struct SyncStatusPopoverView: View {
                 }
             }
 
+            if !syncManager.lastDiagnostic.isEmpty {
+                Text(syncManager.lastDiagnostic)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+
             if !syncManager.lastError.isEmpty {
                 Text(syncManager.lastError)
                     .font(.caption)

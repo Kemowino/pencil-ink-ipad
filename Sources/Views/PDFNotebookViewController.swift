@@ -77,6 +77,9 @@ final class NotebookToolState: ObservableObject {
     @Published var pageSlots: [PageSlot] = []
     @Published var bookmarkedKeys: Set<String> = []
     @Published var removedPagesCount: Int = 0
+    @Published var isHobonichi: Bool = false
+    @Published var currentSlotLabel: String = ""
+    @Published var isOnHoboNotes: Bool = false
 
     private var toastWorkItem: DispatchWorkItem?
     private var loadingPrefs = false
@@ -286,6 +289,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var isDirty = false
     private var syncPollTimer: Timer?
     private var pendingRemoteDoc: InkDocument?
+    private var foregroundObserver: NSObjectProtocol?
+    private var isHoboDoc: Bool = false
+    private var lastHoboPlannerKey: String? = nil
 
     private var lastPageStorageKey: String {
         "pencilink.lastpage." + pdfURL.lastPathComponent
@@ -309,6 +315,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     deinit {
         stopLaserLoop()
         syncPollTimer?.invalidate()
+        if let obs = foregroundObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
     }
 
     override func viewDidLoad() {
@@ -318,6 +327,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         setupTapUndoGestures()
         loadPDF()
         startLiveDriveSync()
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.syncNowWithDrive(silent: true, forceFolderScan: true)
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -525,6 +541,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         pageFrames.removeAll()
 
         let defSize = pdfPageSizes.first ?? CGSize(width: 595, height: 842)
+        isHoboDoc = HobonichiEngine.isHobonichi(doc: inkDoc, pdfPageCount: pdfPageSizes.count, firstPageSize: pdfPageSizes.first)
         pageSlots = inkDoc.buildPageSlots(pdfPageSizes: pdfPageSizes, defaultSize: defSize)
 
         let gap: CGFloat = 14
@@ -541,7 +558,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         for slot in pageSlots {
             let x = (containerW - slot.size.width) * 0.5
             let frame = CGRect(x: x, y: y, width: slot.size.width, height: slot.size.height)
-            let pv = PageCanvasView(slot: slot)
+            let pv = PageCanvasView(slot: slot, hoboDoc: inkDoc, hoboAllSlots: pageSlots, isHobo: isHoboDoc)
             pv.frame = frame
             if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
                 pv.setStrokes(strokes)
@@ -589,11 +606,22 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let slotsCopy = pageSlots
         let marked = Set(inkDoc.bookmarks.filter { $0.value.on }.keys)
         let removedCount = inkDoc.removedCount
+        let hobo = isHoboDoc
+        let curIdx = max(0, min(slotsCopy.count - 1, toolState.currentPage - 1))
+        let curSlot = slotsCopy[safe: curIdx]
+        let label = (hobo && curSlot != nil) ? HobonichiEngine.slotLabel(for: curSlot!, doc: inkDoc) : ""
+        let onNotes = hobo && curSlot != nil && (curSlot!.pdfN == 2 || curSlot!.blank?.kind == "hobo-notes")
+        if hobo, let pv0 = pageViews.first, pv0.slot.pdfN == 1 {
+            pv0.updateHobonichiData(doc: inkDoc, allSlots: slotsCopy)
+        }
         DispatchQueue.main.async {
             self.toolState.pageSlots = slotsCopy
             self.toolState.totalPages = max(1, slotsCopy.count)
             self.toolState.bookmarkedKeys = marked
             self.toolState.removedPagesCount = removedCount
+            self.toolState.isHobonichi = hobo
+            self.toolState.currentSlotLabel = label
+            self.toolState.isOnHoboNotes = onNotes
             if self.toolState.currentPage > slotsCopy.count {
                 self.toolState.currentPage = max(1, slotsCopy.count)
             }
@@ -668,8 +696,16 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
         if toolState.currentPage != current {
             UserDefaults.standard.set(current, forKey: lastPageStorageKey)
+            let slot = pageSlots[safe: current - 1]
+            let label = (isHoboDoc && slot != nil) ? HobonichiEngine.slotLabel(for: slot!, doc: inkDoc) : ""
+            let onNotes = isHoboDoc && slot != nil && (slot!.pdfN == 2 || slot!.blank?.kind == "hobo-notes")
+            if isHoboDoc, let s = slot, s.blank?.anchor == 1 {
+                lastHoboPlannerKey = s.key
+            }
             DispatchQueue.main.async {
                 self.toolState.currentPage = current
+                self.toolState.currentSlotLabel = label
+                self.toolState.isOnHoboNotes = onNotes
             }
         }
     }
@@ -855,14 +891,123 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         toolState.showToast("Cleared page writing")
     }
 
+
+    // MARK: - Hobonichi Techo Weeks Navigation & Auto-Expansion
+
+    func jumpToHoboIndex() {
+        guard isHoboDoc else { return }
+        if let cur = pageSlots[safe: toolState.currentPage - 1], cur.blank?.anchor == 1 {
+            lastHoboPlannerKey = cur.key
+        }
+        jumpToPage(1, animated: true)
+    }
+
+    func jumpToHoboCurrentWeek() {
+        guard isHoboDoc else { return }
+        let monStr = HobonichiEngine.dateStr(HobonichiEngine.mondayOf(Date()))
+        let targetKey = InkDocument.blankKey("hw-\(monStr)")
+        if let idx = pageSlots.firstIndex(where: { $0.key == targetKey }) {
+            lastHoboPlannerKey = targetKey
+            jumpToPage(idx + 1, animated: true)
+            return
+        }
+        // Auto-expand current week + next 4 weeks so "This Week" always lands on today's spread!
+        let added = HobonichiEngine.buildPlannerEntries(
+            startDate: Date(),
+            numWeeks: 4,
+            existingBlanks: inkDoc.blanks,
+            startNotePages: 0
+        )
+        if !added.isEmpty {
+            for b in added { inkDoc.blanks[b.id] = b }
+            inkDoc.layoutBlanks()
+            rebuildPageViews(focusKey: targetKey)
+            scheduleSave()
+            toolState.showToast("Expanded journal to this week")
+        }
+    }
+
+    func toggleHoboNotesRibbon() {
+        guard isHoboDoc else { return }
+        let curSlot = pageSlots[safe: toolState.currentPage - 1]
+        let onNotes = (curSlot?.pdfN == 2 || curSlot?.blank?.kind == "hobo-notes")
+        if onNotes {
+            if let key = lastHoboPlannerKey, let idx = pageSlots.firstIndex(where: { $0.key == key }) {
+                jumpToPage(idx + 1, animated: true)
+            } else {
+                jumpToHoboCurrentWeek()
+            }
+        } else {
+            if let cur = curSlot, cur.blank?.anchor == 1 {
+                lastHoboPlannerKey = cur.key
+            }
+            if let notesIdx = pageSlots.firstIndex(where: { $0.pdfN == 2 || $0.blank?.kind == "hobo-notes" }) {
+                jumpToPage(notesIdx + 1, animated: true)
+            }
+        }
+    }
+
+    func expandHoboWeeks(_ count: Int) {
+        guard isHoboDoc else { return }
+        var latestDate = HobonichiEngine.mondayOf(Date())
+        for b in inkDoc.blanks.values where b.kind == "hobo-week" {
+            let d = HobonichiEngine.parseDate(b.monday)
+            if d > latestDate { latestDate = d }
+        }
+        let nextStart = HobonichiEngine.calendar.date(byAdding: .day, value: 7, to: latestDate) ?? latestDate
+        let added = HobonichiEngine.buildPlannerEntries(
+            startDate: nextStart,
+            numWeeks: count,
+            existingBlanks: inkDoc.blanks,
+            startNotePages: 0
+        )
+        guard !added.isEmpty else { return }
+        for b in added { inkDoc.blanks[b.id] = b }
+        inkDoc.layoutBlanks()
+        let firstNewKey = InkDocument.blankKey(added[0].id)
+        rebuildPageViews(focusKey: firstNewKey)
+        scheduleSave()
+        toolState.showToast("Added +\(count) weeks to journal")
+    }
+
+    func addHoboBackNotesPage() {
+        guard isHoboDoc else { return }
+        var maxNum = 1
+        for b in inkDoc.blanks.values where b.kind == "hobo-notes" {
+            if let n = b.noteNum, n > maxNum { maxNum = n }
+        }
+        let nextNum = maxNum + 1
+        let id = "hn-\(nextNum)-\(Int(Date().timeIntervalSince1970 % 10000))"
+        var b = BlankPage(
+            id: id,
+            anchor: 2,
+            parent: "2",
+            ord: nextNum,
+            w: Double(HobonichiEngine.pageWidth),
+            h: Double(HobonichiEngine.pageHeight),
+            t: Int64(1000 + nextNum)
+        )
+        b.kind = "hobo-notes"
+        b.noteNum = nextNum
+        inkDoc.blanks[b.id] = b
+        inkDoc.layoutBlanks()
+        let key = InkDocument.blankKey(b.id)
+        rebuildPageViews(focusKey: key)
+        scheduleSave()
+        toolState.showToast("Added Back Notes N-\(nextNum)")
+    }
+
     // MARK: - Thumbnails & Share / Export
 
     func renderThumbnailAsync(for slot: PageSlot, targetWidth: CGFloat, completion: @escaping (UIImage?) -> Void) {
         let doc = pdfDoc
         let strokes = inkDoc.pages[slot.key] ?? []
+        let hDoc = inkDoc
+        let hSlots = pageSlots
+        let hobo = isHoboDoc
         let scale = max(0.25, targetWidth / max(1, slot.size.width))
         renderQueue.async {
-            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: scale)
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: scale, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
             DispatchQueue.main.async {
                 completion(img)
             }
@@ -874,11 +1019,14 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         guard let slot = pageSlots[safe: toolState.currentPage - 1] else { return }
         let strokes = inkDoc.pages[slot.key] ?? []
         let doc = pdfDoc
+        let hDoc = inkDoc
+        let hSlots = pageSlots
+        let hobo = isHoboDoc
         let pageNum = toolState.currentPage
         let baseName = pdfURL.deletingPathExtension().lastPathComponent
         toolState.showToast("Rendering PNG…")
         renderQueue.async { [weak self] in
-            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: 2.0)
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: 2.0, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
             guard let data = img.pngData() else { return }
             let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName) - Page \(pageNum).png")
             do {
@@ -897,6 +1045,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let slots = pageSlots
         guard !slots.isEmpty else { return }
         let doc = pdfDoc
+        let hDoc = inkDoc
+        let hobo = isHoboDoc
         let pagesCopy = inkDoc.pages
         let baseName = pdfURL.deletingPathExtension().lastPathComponent
         toolState.showToast("Exporting PDF (\(slots.count) pages)…")
@@ -910,7 +1060,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                         let pageRect = CGRect(origin: .zero, size: slot.size)
                         pdfCtx.beginPage(withBounds: pageRect, pageInfo: [:])
                         let cg = pdfCtx.cgContext
-                        PageCanvasView.drawSlotBackground(slot: slot, pdfDoc: doc, in: cg)
+                        PageCanvasView.drawSlotBackground(slot: slot, pdfDoc: doc, in: cg, hoboDoc: hDoc, hoboAllSlots: slots, isHobo: hobo)
                         if let strokes = pagesCopy[slot.key], !strokes.isEmpty {
                             PageCanvasView.drawStrokes(strokes, in: cg)
                         }
@@ -1884,33 +2034,39 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             self?.saveNow()
         }
         saveWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: item)
+        // Fast 0.35s local save debounce for snappy sync
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
     }
 
     func startLiveDriveSync() {
         syncPollTimer?.invalidate()
         guard let sm = syncManager, sm.config.isConnected else { return }
-        // Pull latest remote deltas right when opening the book
-        syncNowWithDrive(silent: true)
-        // Poll Google Drive every 10s while the book is open (yielding if writing)
-        syncPollTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+        // Full folder scan + pull latest remote deltas immediately on open
+        syncNowWithDrive(silent: true, forceFolderScan: true)
+        // Fast 3.5s metadata poll while book is open (0 downloads unless a remote shard changed!)
+        syncPollTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.activePageView == nil, !self.laserDown,
+                guard self.activePageView == nil, !self.laserDown, !self.isDirty,
                       let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else { return }
-                self.syncNowWithDrive(silent: true)
+                self.syncNowWithDrive(silent: true, forceFolderScan: false)
             }
         }
     }
 
-    func syncNowWithDrive(silent: Bool = false) {
+    func syncNowWithDrive(silent: Bool = false, forceFolderScan: Bool = false) {
         guard let sm = syncManager else { return }
         let snap = inkDoc
         let url = pdfURL
         let rel = relativePath
         Task { @MainActor in
             guard sm.config.isConnected else { return }
-            if let (merged, changed) = await sm.syncBook(pdfURL: url, relativePath: rel, localDoc: snap) {
+            if let (merged, changed) = await sm.syncBook(
+                pdfURL: url,
+                relativePath: rel,
+                localDoc: snap,
+                forceFolderScan: forceFolderScan || !silent
+            ) {
                 if changed {
                     self.applyRemoteMergedDocument(merged)
                     if !silent { self.toolState.showToast("Synced remote updates") }
@@ -1927,14 +2083,30 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         applyRemoteMergedDocument(pending)
     }
 
-    private func applyRemoteMergedDocument(_ merged: InkDocument) {
+    private func applyRemoteMergedDocument(_ remoteMerged: InkDocument) {
         if activePageView != nil || laserDown {
-            pendingRemoteDoc = merged
+            pendingRemoteDoc = remoteMerged
             return
         }
-        let structureChanged = (inkDoc.blanks != merged.blanks || inkDoc.removed != merged.removed)
+        // Safely preserve any brand-new local strokes drawn mid-flight while sync was running!
+        var combined = remoteMerged
+        for (pageKey, localList) in inkDoc.pages {
+            var cur = combined.pages[pageKey] ?? []
+            let haveIDs = Set(cur.map { $0.id })
+            var addedAny = false
+            for s in localList where !haveIDs.contains(s.id) && combined.deleted[s.id] == nil {
+                cur.append(s)
+                addedAny = true
+            }
+            if addedAny {
+                cur.sort { $0.t != $1.t ? $0.t < $1.t : $0.id < $1.id }
+                combined.pages[pageKey] = cur
+            }
+        }
+
+        let structureChanged = (inkDoc.blanks != combined.blanks || inkDoc.removed != combined.removed)
         let oldPages = inkDoc.pages
-        inkDoc = merged
+        inkDoc = combined
 
         if structureChanged {
             clearLassoSelection(commitFirst: false)

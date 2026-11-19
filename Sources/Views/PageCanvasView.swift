@@ -15,26 +15,42 @@ final class PageCanvasView: UIView {
     var pageSize: CGSize { slot.size }
 
     private let templateView: TemplatePaperView?
+    private let hoboView: HobonichiPaperView?
     private let pdfImageView = UIImageView()
     private let staticInkView = StaticInkView()
     private let liveOverlayView = LiveInkOverlayView()
 
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
-    var isTemplateOnly: Bool { slot.effectivePDFPageNumber == nil }
+    let isHobonichiSlot: Bool
+    var isTemplateOnly: Bool { isHobonichiSlot || slot.effectivePDFPageNumber == nil }
     var renderedImage: UIImage? { pdfImageView.image }
 
-    init(slot: PageSlot) {
+    init(slot: PageSlot, hoboDoc: InkDocument? = nil, hoboAllSlots: [PageSlot] = [], isHobo: Bool = false) {
         self.slot = slot
-        let tplView: TemplatePaperView? = (slot.effectivePDFPageNumber == nil) ? TemplatePaperView(template: slot.template) : nil
+        let hoboKind = HobonichiEngine.slotKind(for: slot, isHobo: isHobo)
+        self.isHobonichiSlot = (hoboKind != nil)
+        let hv: HobonichiPaperView? = (hoboKind != nil)
+            ? HobonichiPaperView(slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: isHobo)
+            : nil
+        let tplView: TemplatePaperView? = (hv == nil && slot.effectivePDFPageNumber == nil)
+            ? TemplatePaperView(template: slot.template)
+            : nil
+        self.hoboView = hv
         self.templateView = tplView
         super.init(frame: CGRect(origin: .zero, size: slot.size))
-        backgroundColor = .white
+        backgroundColor = (hv != nil) ? HobonichiEngine.creamColor : .white
         layer.cornerRadius = 3
         layer.masksToBounds = true
         isUserInteractionEnabled = false
 
-        if let tv = tplView {
+        if let hv = hv {
+            hv.frame = bounds
+            hv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(hv)
+            isRendered = true
+            renderedZoomScale = 1.0
+        } else if let tv = tplView {
             tv.frame = bounds
             tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             addSubview(tv)
@@ -156,6 +172,10 @@ final class PageCanvasView: UIView {
             tv.contentScaleFactor = targetScale
             tv.setNeedsDisplay()
         }
+        if let hv = hoboView, abs(hv.contentScaleFactor - targetScale) > 0.25 {
+            hv.contentScaleFactor = targetScale
+            hv.setNeedsDisplay()
+        }
         if isTemplateOnly {
             renderedZoomScale = zoomScale
             isRendered = true
@@ -195,9 +215,25 @@ final class PageCanvasView: UIView {
         }
     }
 
-    static func drawSlotBackground(slot: PageSlot, pdfDoc: PDFDocument?, in ctx: CGContext) {
+    func updateHobonichiData(doc: InkDocument, allSlots: [PageSlot]) {
+        guard let hv = hoboView else { return }
+        hv.doc = doc
+        hv.allSlots = allSlots
+        hv.setNeedsDisplay()
+    }
+
+    static func drawSlotBackground(
+        slot: PageSlot,
+        pdfDoc: PDFDocument?,
+        in ctx: CGContext,
+        hoboDoc: InkDocument? = nil,
+        hoboAllSlots: [PageSlot] = [],
+        isHobo: Bool = false
+    ) {
         ctx.saveGState()
-        if let pdfN = slot.effectivePDFPageNumber, let page = pdfDoc?.page(at: pdfN - 1) {
+        if isHobo, HobonichiEngine.slotKind(for: slot, isHobo: true) != nil {
+            HobonichiEngine.drawSpread(in: ctx, slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: true)
+        } else if let pdfN = slot.effectivePDFPageNumber, let page = pdfDoc?.page(at: pdfN - 1) {
             UIColor.white.setFill()
             ctx.fill(CGRect(origin: .zero, size: slot.size))
             ctx.translateBy(x: 0, y: slot.size.height)
@@ -245,14 +281,22 @@ final class PageCanvasView: UIView {
     }
 
     /// Renders a complete composite image (PDF/template + ink strokes) for thumbnails or PNG sharing.
-    static func renderCompositeImage(slot: PageSlot, pdfDoc: PDFDocument?, strokes: [InkStroke], scale: CGFloat) -> UIImage {
+    static func renderCompositeImage(
+        slot: PageSlot,
+        pdfDoc: PDFDocument?,
+        strokes: [InkStroke],
+        scale: CGFloat,
+        hoboDoc: InkDocument? = nil,
+        hoboAllSlots: [PageSlot] = [],
+        isHobo: Bool = false
+    ) -> UIImage {
         let format = UIGraphicsImageRendererFormat()
         format.scale = max(0.25, scale)
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: slot.size, format: format)
         return renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
-            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx)
+            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx, hoboDoc: hoboDoc, hoboAllSlots: hoboAllSlots, isHobo: isHobo)
             drawStrokes(strokes, in: ctx)
         }
     }
@@ -445,5 +489,33 @@ private final class TemplatePaperView: UIView {
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         template.draw(in: ctx, size: bounds.size)
+    }
+}
+
+
+private final class HobonichiPaperView: UIView {
+    let slot: PageSlot
+    var doc: InkDocument
+    var allSlots: [PageSlot]
+    let isHobo: Bool
+
+    init(slot: PageSlot, doc: InkDocument, allSlots: [PageSlot], isHobo: Bool) {
+        self.slot = slot
+        self.doc = doc
+        self.allSlots = allSlots
+        self.isHobo = isHobo
+        super.init(frame: .zero)
+        isOpaque = true
+        backgroundColor = HobonichiEngine.creamColor
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        HobonichiEngine.drawSpread(in: ctx, slot: slot, doc: doc, allSlots: allSlots, isHobo: isHobo)
     }
 }

@@ -159,7 +159,7 @@ struct BlankPage: Codable, Equatable, Identifiable {
         let rh = (try? c.decode(Double.self, forKey: .h)) ?? 842
         w = rw > 0 ? rw : 595
         h = rh > 0 ? rh : 842
-        t = (try? c.decode(Int64.self, forKey: .t)) ?? 0
+        if let ti = try? c.decode(Int64.self, forKey: .t) { t = ti } else if let td = try? c.decode(Double.self, forKey: .t) { t = Int64(td.rounded()) } else { t = 0 }
         src = try? c.decode(Int.self, forKey: .src)
         pattern = try? c.decode(String.self, forKey: .pattern)
         kind = try? c.decode(String.self, forKey: .kind)
@@ -183,6 +183,30 @@ struct PageMark: Codable, Equatable {
         self.t = t
         self.title = title
         self.tag = tag
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case on, t, title, tag
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let b = try? c.decode(Bool.self, forKey: .on) {
+            on = b
+        } else if let n = try? c.decode(Int.self, forKey: .on) {
+            on = n != 0
+        } else {
+            on = false
+        }
+        if let ti = try? c.decode(Int64.self, forKey: .t) {
+            t = ti
+        } else if let td = try? c.decode(Double.self, forKey: .t) {
+            t = Int64(td.rounded())
+        } else {
+            t = 0
+        }
+        title = try? c.decode(String.self, forKey: .title)
+        tag = try? c.decode(String.self, forKey: .tag)
     }
 }
 

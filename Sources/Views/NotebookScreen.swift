@@ -36,6 +36,11 @@ struct NotebookScreen: View {
                     .padding(.top, 10)
                     .padding(.horizontal, 12)
 
+                if toolState.isHobonichi {
+                    hobonichiRibbonBar
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
                 if toolState.hasLassoSelection {
                     lassoActionBar
                         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -61,7 +66,9 @@ struct NotebookScreen: View {
                     jumpPageInput = "\(toolState.currentPage)"
                     activePopover = .jumpPage
                 } label: {
-                    Text("Page \(toolState.currentPage) / \(toolState.totalPages)  ·  \(toolState.saveStatus)")
+                    Text(toolState.isHobonichi && !toolState.currentSlotLabel.isEmpty
+                         ? "\(toolState.currentSlotLabel)  ·  \(toolState.currentPage)/\(toolState.totalPages)  ·  \(toolState.saveStatus)"
+                         : "Page \(toolState.currentPage) / \(toolState.totalPages)  ·  \(toolState.saveStatus)")
                         .font(.system(size: 12, weight: .semibold, design: .rounded))
                         .foregroundColor(.white.opacity(0.9))
                         .padding(.horizontal, 16)
@@ -259,7 +266,7 @@ struct NotebookScreen: View {
                             syncManager: syncManager,
                             onSyncNow: {
                                 controllerBox.vc?.saveNow()
-                                controllerBox.vc?.syncNowWithDrive(silent: false)
+                                controllerBox.vc?.syncNowWithDrive(silent: false, forceFolderScan: true)
                             },
                             onOpenSettings: {
                                 activePopover = nil
@@ -282,6 +289,75 @@ struct NotebookScreen: View {
         .clipShape(Capsule())
         .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
         .shadow(color: .black.opacity(0.42), radius: 14, y: 6)
+    }
+
+
+    // Hobonichi Techo Weeks Two-Ribbon Bar (shown automatically for Hobonichi journals)
+    private var hobonichiRibbonBar: some View {
+        HStack(spacing: 6) {
+            Button {
+                controllerBox.vc?.jumpToHoboIndex()
+            } label: {
+                Text("Index")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(toolState.currentPage == 1 ? .white : Color(red: 0.96, green: 0.95, blue: 0.92))
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 5)
+                    .background(toolState.currentPage == 1 ? Color(red: 0.78, green: 0.29, blue: 0.19) : Color.white.opacity(0.09))
+                    .clipShape(Capsule())
+            }
+
+            Button {
+                controllerBox.vc?.jumpToHoboCurrentWeek()
+            } label: {
+                Text("This Week")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(Color(red: 0.96, green: 0.95, blue: 0.92))
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 5)
+                    .background(Color.white.opacity(0.09))
+                    .clipShape(Capsule())
+            }
+
+            Button {
+                controllerBox.vc?.toggleHoboNotesRibbon()
+            } label: {
+                Text(toolState.isOnHoboNotes ? "⇄ Back to Week" : "⇄ Notes")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(toolState.isOnHoboNotes ? Color(white: 0.1) : Color(red: 0.96, green: 0.95, blue: 0.92))
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 5)
+                    .background(toolState.isOnHoboNotes ? Color(red: 0.83, green: 0.69, blue: 0.22) : Color.white.opacity(0.09))
+                    .clipShape(Capsule())
+            }
+
+            Menu {
+                Button { controllerBox.vc?.expandHoboWeeks(4) } label: {
+                    Label("Add +4 Weeks (1 Month)", systemImage: "calendar.badge.plus")
+                }
+                Button { controllerBox.vc?.expandHoboWeeks(12) } label: {
+                    Label("Add +12 Weeks (3 Months)", systemImage: "calendar.badge.plus")
+                }
+                Divider()
+                Button { controllerBox.vc?.addHoboBackNotesPage() } label: {
+                    Label("Add Back Notes Spread", systemImage: "note.text.badge.plus")
+                }
+            } label: {
+                Text("+ Expand")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(Color(red: 0.83, green: 0.69, blue: 0.22))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color(red: 0.83, green: 0.69, blue: 0.22).opacity(0.16))
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color(red: 0.11, green: 0.12, blue: 0.14).opacity(0.95))
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Color(red: 0.83, green: 0.69, blue: 0.22).opacity(0.38), lineWidth: 1))
+        .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
     }
 
     // Floating Lasso Action Bar (appears whenever strokes are circled)

@@ -1,10 +1,11 @@
 import Foundation
+import Compression
 import CryptoKit
 
 /// Exact wire-format codec matching Obsidian Pencil Ink (`src/wire.ts` & `src/logs.ts`):
 /// - Base36 delta-encoded flat `[x, y, p]` stroke points
-/// - Standard RFC 1952 gzip compression/decompression using Apple's native `NSData.CompressionAlgorithm.zlib`
-///   (raw RFC 1951 DEFLATE) + IEEE 802.3 CRC32 — zero external dependencies or linker flags.
+/// - Standard RFC 1952 gzip compression/decompression with dual Foundation + Compression fallback
+/// - Defensive JSON decoders so remote shards from Obsidian Mac/Windows/iOS NEVER silently fail
 enum WireCodec {
     // MARK: - Base36 Delta Point Codec (Matches `src/wire.ts`)
 
@@ -58,7 +59,7 @@ enum WireCodec {
         return out
     }
 
-    // MARK: - Compact Stroke & Log Shard Structs
+    // MARK: - Defensive Compact Stroke & Log Shard Structs
 
     struct CompactStroke: Codable {
         var id: String
@@ -83,6 +84,34 @@ enum WireCodec {
             self.bs = (stroke._bakedSmooth == true) ? 1 : nil
             self.sh = stroke._smartShape
             self.st = (stroke.straight == true) ? 1 : nil
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, t, tool, style, color, size, d, bs, sh, st
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            if let ti = try? c.decode(Int64.self, forKey: .t) {
+                t = ti
+            } else if let td = try? c.decode(Double.self, forKey: .t) {
+                t = Int64(td.rounded())
+            } else {
+                t = 0
+            }
+            tool = (try? c.decode(String.self, forKey: .tool)) ?? "pen"
+            style = try? c.decode(String.self, forKey: .style)
+            color = (try? c.decode(String.self, forKey: .color)) ?? "#1c1c1e"
+            size = (try? c.decode(Double.self, forKey: .size)) ?? 2.4
+            d = (try? c.decode(String.self, forKey: .d)) ?? ""
+            if let v = try? c.decode(Int.self, forKey: .bs) { bs = v }
+            else if let b = try? c.decode(Bool.self, forKey: .bs) { bs = b ? 1 : 0 }
+            else { bs = nil }
+            sh = try? c.decode(String.self, forKey: .sh)
+            if let v = try? c.decode(Int.self, forKey: .st) { st = v }
+            else if let b = try? c.decode(Bool.self, forKey: .st) { st = b ? 1 : 0 }
+            else { st = nil }
         }
 
         func expand() -> InkStroke? {
@@ -113,17 +142,64 @@ enum WireCodec {
     struct EraseLogPayload: Codable {
         var v: Int
         var erased: [String: Int64]
+
+        init(v: Int = 1, erased: [String: Int64]) {
+            self.v = v
+            self.erased = erased
+        }
+
+        enum CodingKeys: String, CodingKey { case v, erased }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            v = (try? c.decode(Int.self, forKey: .v)) ?? 1
+            if let map = try? c.decode([String: Int64].self, forKey: .erased) {
+                erased = map
+            } else if let dmap = try? c.decode([String: Double].self, forKey: .erased) {
+                erased = dmap.mapValues { Int64($0.rounded()) }
+            } else {
+                erased = [:]
+            }
+        }
     }
 
     struct BlanksLogPayload: Codable {
         var v: Int
         var blanks: [BlankPage]
+
+        init(v: Int = 1, blanks: [BlankPage]) {
+            self.v = v
+            self.blanks = blanks
+        }
+
+        enum CodingKeys: String, CodingKey { case v, blanks }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            v = (try? c.decode(Int.self, forKey: .v)) ?? 1
+            blanks = (try? c.decode([BlankPage].self, forKey: .blanks)) ?? []
+        }
     }
 
     struct MarksLogPayload: Codable {
         var v: Int
         var bookmarks: [String: PageMark]
         var removed: [String: PageMark]
+
+        init(v: Int = 1, bookmarks: [String: PageMark], removed: [String: PageMark]) {
+            self.v = v
+            self.bookmarks = bookmarks
+            self.removed = removed
+        }
+
+        enum CodingKeys: String, CodingKey { case v, bookmarks, removed }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            v = (try? c.decode(Int.self, forKey: .v)) ?? 1
+            bookmarks = (try? c.decode([String: PageMark].self, forKey: .bookmarks)) ?? [:]
+            removed = (try? c.decode([String: PageMark].self, forKey: .removed)) ?? [:]
+        }
     }
 
     static func encodePageShard(key: String, strokes: [InkStroke]) throws -> Data {
@@ -148,8 +224,9 @@ enum WireCodec {
         var strokes: [InkStroke] = []
         strokes.reserveCapacity(payload.s.count)
         for cs in payload.s {
-            guard let st = cs.expand() else { return nil }
-            strokes.append(st)
+            if let st = cs.expand() {
+                strokes.append(st)
+            }
         }
         return (payload.key, strokes)
     }
@@ -161,7 +238,7 @@ enum WireCodec {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    // MARK: - RFC 1952 Gzip (Pure Swift Header/Trailer + Native Foundation Raw DEFLATE)
+    // MARK: - RFC 1952 Gzip (Header/Trailer + Dual Foundation/Compression Raw DEFLATE)
 
     private static let crc32Table: [UInt32] = {
         (0..<256).map { i -> UInt32 in
@@ -194,10 +271,8 @@ enum WireCodec {
             deflated = try (data as NSData).compressed(using: .zlib) as Data
         }
         var out = Data(capacity: 10 + deflated.count + 8)
-        // Standard 10-byte RFC 1952 gzip header
         out.append(contentsOf: [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03])
         out.append(deflated)
-        // 8-byte trailer: CRC32 (LE) + ISIZE (LE)
         var crcLE = crc32(data).littleEndian
         var sizeLE = UInt32(truncatingIfNeeded: data.count).littleEndian
         withUnsafeBytes(of: &crcLE) { out.append(contentsOf: $0) }
@@ -213,23 +288,19 @@ enum WireCodec {
         }
         let flg = bytes[3]
         var offset = 10
-        // FEXTRA
         if (flg & 0x04) != 0 {
             guard offset + 2 <= bytes.count else { throw NSError(domain: "WireCodec", code: 1) }
             let xlen = Int(bytes[offset]) | (Int(bytes[offset + 1]) << 8)
             offset += 2 + xlen
         }
-        // FNAME
         if (flg & 0x08) != 0 {
             while offset < bytes.count && bytes[offset] != 0 { offset += 1 }
             offset += 1
         }
-        // FCOMMENT
         if (flg & 0x10) != 0 {
             while offset < bytes.count && bytes[offset] != 0 { offset += 1 }
             offset += 1
         }
-        // FHCRC
         if (flg & 0x02) != 0 {
             offset += 2
         }
@@ -240,6 +311,26 @@ enum WireCodec {
         if payload.count == 2 && payload[0] == 0x03 && payload[1] == 0x00 {
             return Data()
         }
-        return try (payload as NSData).decompressed(using: .zlib) as Data
+        if let fast = try? (payload as NSData).decompressed(using: .zlib) as Data {
+            return fast
+        }
+        // Fallback via Compression streaming decoder (handles arbitrary expansion ratios & Chromium gzip streams)
+        return try streamInflateRawDeflate(payload)
+    }
+
+    private static func streamInflateRawDeflate(_ payload: Data) throws -> Data {
+        var output = Data()
+        let filter = try OutputFilter(.decompress, using: .zlib) { chunk in
+            if let chunk = chunk { output.append(chunk) }
+        }
+        let pageSize = 32_768
+        var idx = 0
+        while idx < payload.count {
+            let end = min(payload.count, idx + pageSize)
+            try filter.write(payload.subdata(in: idx..<end))
+            idx = end
+        }
+        try filter.finalize()
+        return output
     }
 }
