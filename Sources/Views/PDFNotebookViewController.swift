@@ -7,6 +7,7 @@ enum DrawingTool: String {
     case pen
     case highlighter
     case eraser
+    case lasso
     case laser
 }
 
@@ -61,12 +62,21 @@ final class NotebookToolState: ObservableObject {
     @Published var laserTrail: Bool = true { didSet { persist() } }
     let laserColors: [String] = ["#ff3b30", "#0a84ff", "#30d158", "#ff9f0a"]
 
+    // Live UI State
     @Published var canUndo: Bool = false
     @Published var canRedo: Bool = false
     @Published var currentPage: Int = 1
     @Published var totalPages: Int = 1
     @Published var saveStatus: String = "Saved"
     @Published var toastMessage: String = ""
+
+    // Lasso & Page Overview State
+    @Published var hasLassoSelection: Bool = false
+    @Published var lassoSelectedCount: Int = 0
+    @Published var hasLassoClipboard: Bool = false
+    @Published var pageSlots: [PageSlot] = []
+    @Published var bookmarkedKeys: Set<String> = []
+    @Published var removedPagesCount: Int = 0
 
     private var toastWorkItem: DispatchWorkItem?
     private var loadingPrefs = false
@@ -87,6 +97,11 @@ final class NotebookToolState: ObservableObject {
     var activeEraserRadius: Double {
         eraserSizes[max(0, min(eraserSizes.count - 1, eraserSizeIndex))] * 0.5
     }
+    var isCurrentPageBookmarked: Bool {
+        let idx = currentPage - 1
+        guard idx >= 0 && idx < pageSlots.count else { return false }
+        return bookmarkedKeys.contains(pageSlots[idx].key)
+    }
 
     init() {
         loadPrefs()
@@ -100,7 +115,7 @@ final class NotebookToolState: ObservableObject {
                 self?.toastMessage = ""
             }
             self.toastWorkItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: item)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
         }
     }
 
@@ -180,10 +195,11 @@ final class NotebookToolState: ObservableObject {
     }
 }
 
-private struct UndoAction {
-    let pageKey: String
-    let added: [InkStroke]
-    let removed: [InkStroke]
+private enum UndoAction {
+    case strokes(pageKey: String, added: [InkStroke], removed: [InkStroke])
+    case addBlank(blank: BlankPage, strokes: [InkStroke])
+    case deleteBlank(blank: BlankPage, strokes: [InkStroke])
+    case setRemoved(pdfN: Int, newRemoved: Bool)
 }
 
 private final class DisplayLinkProxy: NSObject {
@@ -212,7 +228,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     let toolState: NotebookToolState
 
     private var pdfDoc: PDFDocument?
+    private var pdfPageSizes: [CGSize] = []
     private var inkDoc: InkDocument
+    private var pageSlots: [PageSlot] = []
     private var pageViews: [PageCanvasView] = []
     private var pageFrames: [CGRect] = []
 
@@ -221,7 +239,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private let pencilRecognizer = PencilDrawingGestureRecognizer()
 
     private let renderQueue = DispatchQueue(label: "com.pencilink.pdfrender", qos: .userInitiated)
-    private var renderingPages = Set<Int>()
+    private var renderingKeys = Set<String>()
     private var baseFitScale: CGFloat = 1.0
     private var didInitialLayout = false
     private var lastLayoutWidth: CGFloat = 0
@@ -246,6 +264,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var activeEraseOriginals: [InkStroke] = []
     private var activeErasePieces: [String: InkStroke] = [:]
     private var activeEraseLastPoint: CGPoint?
+
+    // Lasso state
+    private var lassoSelection: LassoSelection?
+    private var lassoClipboard: LassoClipboard?
 
     // Laser Pointer state
     private var laserPageView: PageCanvasView?
@@ -313,6 +335,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         cancelHoldTimer()
+        clearLassoSelection(commitFirst: true)
         stopLaserLoop()
         saveNow()
     }
@@ -352,7 +375,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         documentContainer.isMultipleTouchEnabled = true
         scrollView.addSubview(documentContainer)
 
-        // Attach hardware Pencil recognizer to scrollView (Apple Drawing App pattern)
         pencilRecognizer.pencilOnly = true
         pencilRecognizer.delegate = self
         pencilRecognizer.onPencilBegan = { [weak self] touch, event in
@@ -420,62 +442,118 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
+    func onToolChanged(to newTool: DrawingTool) {
+        if newTool != .lasso && lassoSelection != nil {
+            clearLassoSelection(commitFirst: true)
+        }
+    }
+
+    func resetZoom() {
+        fitToWidth()
+        updateVisiblePages(forceSharp: true)
+        toolState.showToast("Fit to width")
+    }
+
     func jumpToPage(_ pageNumber: Int, animated: Bool = true) {
         let idx = max(0, min(pageFrames.count - 1, pageNumber - 1))
         guard idx >= 0, idx < pageFrames.count else { return }
         let zoom = max(0.1, scrollView.zoomScale)
-        let targetY = max(0, pageFrames[idx].minY * zoom - 72)
+        let targetY = max(0, pageFrames[idx].minY * zoom - 76)
         let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height + scrollView.contentInset.bottom)
         scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: min(targetY, maxY)), animated: animated)
         updateCurrentPageLabel()
         updateVisiblePages(forceSharp: true)
     }
 
+    // MARK: - PDF Loading & Page Slot Rebuilding
+
     private func loadPDF() {
         guard let doc = PDFDocument(url: pdfURL) else { return }
         pdfDoc = doc
         let count = doc.pageCount
-        DispatchQueue.main.async {
-            self.toolState.totalPages = max(1, count)
-            self.toolState.currentPage = 1
+        pdfPageSizes.removeAll()
+        pdfPageSizes.reserveCapacity(count)
+        for i in 0..<count {
+            let sz = doc.page(at: i).map { PageCanvasView.normalizedPageSize(for: $0) } ?? CGSize(width: 595, height: 842)
+            pdfPageSizes.append(sz)
         }
+        rebuildPageViews(focusKey: nil)
+    }
+
+    private func rebuildPageViews(focusKey: String?) {
+        let prevZoom = scrollView.zoomScale
+        let keepKey = focusKey ?? pageSlots[safe: toolState.currentPage - 1]?.key
+
+        renderingKeys.removeAll()
+        for pv in pageViews { pv.removeFromSuperview() }
+        pageViews.removeAll()
+        pageFrames.removeAll()
+
+        let defSize = pdfPageSizes.first ?? CGSize(width: 595, height: 842)
+        pageSlots = inkDoc.buildPageSlots(pdfPageSizes: pdfPageSizes, defaultSize: defSize)
 
         let gap: CGFloat = 14
         let topPad: CGFloat = 80
         let bottomPad: CGFloat = 90
         var maxW: CGFloat = 595
-        var sizes: [CGSize] = []
-        sizes.reserveCapacity(count)
-        for i in 0..<count {
-            let sz = doc.page(at: i).map { PageCanvasView.normalizedPageSize(for: $0) } ?? CGSize(width: 595, height: 842)
-            sizes.append(sz)
-            if sz.width > maxW { maxW = sz.width }
+        for s in pageSlots {
+            if s.size.width > maxW { maxW = s.size.width }
         }
-
         let sidePad: CGFloat = 16
         let containerW = maxW + sidePad * 2
         var y = topPad
-        pageViews.removeAll()
-        pageFrames.removeAll()
 
-        for i in 0..<count {
-            let sz = sizes[i]
-            let x = (containerW - sz.width) * 0.5
-            let frame = CGRect(x: x, y: y, width: sz.width, height: sz.height)
-            let pv = PageCanvasView(pageIndex: i, pageSize: sz)
+        for slot in pageSlots {
+            let x = (containerW - slot.size.width) * 0.5
+            let frame = CGRect(x: x, y: y, width: slot.size.width, height: slot.size.height)
+            let pv = PageCanvasView(slot: slot)
             pv.frame = frame
-            if let strokes = inkDoc.pages[pv.pageKey], !strokes.isEmpty {
+            if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
                 pv.setStrokes(strokes)
             }
             documentContainer.addSubview(pv)
             pageViews.append(pv)
             pageFrames.append(frame)
-            y += sz.height + gap
+            y += slot.size.height + gap
         }
 
-        let totalH = y - gap + bottomPad
+        let totalH = max(200, y - gap + bottomPad)
+        let savedTransform = documentContainer.transform
+        documentContainer.transform = .identity
         documentContainer.frame = CGRect(x: 0, y: 0, width: containerW, height: totalH)
-        scrollView.contentSize = documentContainer.frame.size
+        documentContainer.transform = savedTransform
+        if didInitialLayout && prevZoom > 0.1 {
+            scrollView.contentSize = CGSize(width: containerW * prevZoom, height: totalH * prevZoom)
+            centerContentIfNeeded()
+        } else {
+            scrollView.contentSize = documentContainer.frame.size
+        }
+
+        syncDocumentMetadataToUI()
+
+        if didInitialLayout {
+            if let fk = keepKey, let targetIdx = pageSlots.firstIndex(where: { $0.key == fk }) {
+                jumpToPage(targetIdx + 1, animated: focusKey != nil)
+            } else {
+                updateCurrentPageLabel()
+                updateVisiblePages(forceSharp: true)
+            }
+        }
+    }
+
+    private func syncDocumentMetadataToUI() {
+        let slotsCopy = pageSlots
+        let marked = Set(inkDoc.bookmarks.filter { $0.value.on }.keys)
+        let removedCount = inkDoc.removedCount
+        DispatchQueue.main.async {
+            self.toolState.pageSlots = slotsCopy
+            self.toolState.totalPages = max(1, slotsCopy.count)
+            self.toolState.bookmarkedKeys = marked
+            self.toolState.removedPagesCount = removedCount
+            if self.toolState.currentPage > slotsCopy.count {
+                self.toolState.currentPage = max(1, slotsCopy.count)
+            }
+        }
     }
 
     private func fitToWidth() {
@@ -514,6 +592,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
         centerContentIfNeeded()
         updateVisiblePages(forceSharp: true)
+        if let sel = lassoSelection, let pv = pageView(forKey: sel.pageKey) {
+            pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+        }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
@@ -540,7 +621,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func updateVisiblePages(forceSharp: Bool) {
-        guard let doc = pdfDoc, !pageViews.isEmpty else { return }
+        guard !pageViews.isEmpty else { return }
         let zoom = max(0.1, scrollView.zoomScale)
         let visibleInDoc = CGRect(
             x: scrollView.contentOffset.x / zoom,
@@ -550,6 +631,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         )
         let renderZone = visibleInDoc.insetBy(dx: 0, dy: -visibleInDoc.height * 1.2)
         let keepZone = visibleInDoc.insetBy(dx: 0, dy: -visibleInDoc.height * 3.0)
+        let doc = pdfDoc
 
         for (idx, pv) in pageViews.enumerated() {
             let f = pageFrames[idx]
@@ -561,19 +643,440 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             }
             guard f.intersects(renderZone) else { continue }
             let needScale = !pv.isRendered || (forceSharp && abs(pv.renderedZoomScale - zoom) / max(0.1, pv.renderedZoomScale) > 0.25)
-            guard needScale, !renderingPages.contains(idx) else { continue }
-            renderingPages.insert(idx)
-            let pageSize = pv.pageSize
+            guard needScale, !renderingKeys.contains(pv.pageKey) else { continue }
+            renderingKeys.insert(pv.pageKey)
+            let slot = pv.slot
             let targetZoom = zoom
             renderQueue.async { [weak self, weak pv] in
-                guard let self, let pv, let page = doc.page(at: idx) else { return }
-                let img = PageCanvasView.renderPage(page, pageSize: pageSize, zoomScale: targetZoom)
+                guard let self, let pv else { return }
+                let img = PageCanvasView.renderSlotBackground(slot: slot, pdfDoc: doc, zoomScale: targetZoom)
                 DispatchQueue.main.async {
-                    self.renderingPages.remove(idx)
+                    self.renderingKeys.remove(slot.key)
                     pv.applyRenderedImage(img, zoomScale: targetZoom)
                 }
             }
         }
+    }
+
+    // MARK: - Page Management & Bookmarks
+
+    func insertBlankPage(after slotIndex: Int, template: PaperTemplate) {
+        clearLassoSelection(commitFirst: true)
+        let ref = pageSlots[safe: max(0, min(pageSlots.count - 1, slotIndex))]
+        let defSz = pdfPageSizes.first ?? CGSize(width: 595, height: 842)
+        let w = Double(ref?.size.width ?? defSz.width)
+        let h = Double(ref?.size.height ?? defSz.height)
+        let pos = InkDocument.placeBlankTree(after: ref)
+        let blank = BlankPage(
+            id: InkStroke.newID(),
+            anchor: pos.anchor,
+            parent: pos.parent,
+            ord: 0,
+            w: w,
+            h: h,
+            t: pos.t,
+            src: nil,
+            pattern: template.rawValue
+        )
+        inkDoc.blanks[blank.id] = blank
+        inkDoc.layoutBlanks()
+        pushUndo(.addBlank(blank: blank, strokes: []))
+        rebuildPageViews(focusKey: InkDocument.blankKey(blank.id))
+        scheduleSave()
+        toolState.showToast("Added \(template.title) page")
+    }
+
+    func duplicatePage(at slotIndex: Int) {
+        clearLassoSelection(commitFirst: true)
+        guard let slot = pageSlots[safe: slotIndex] else { return }
+        let pos = InkDocument.placeBlankTree(after: slot)
+        let blank = BlankPage(
+            id: InkStroke.newID(),
+            anchor: pos.anchor,
+            parent: pos.parent,
+            ord: 0,
+            w: Double(slot.size.width),
+            h: Double(slot.size.height),
+            t: pos.t,
+            src: slot.effectivePDFPageNumber,
+            pattern: slot.blank?.pattern
+        )
+        inkDoc.blanks[blank.id] = blank
+        inkDoc.layoutBlanks()
+
+        let srcStrokes = inkDoc.pages[slot.key] ?? []
+        let copiedStrokes: [InkStroke] = srcStrokes.map { s in
+            var c = s
+            c.id = InkStroke.newID()
+            return c
+        }
+        if !copiedStrokes.isEmpty {
+            inkDoc.pages[InkDocument.blankKey(blank.id)] = copiedStrokes
+        }
+        pushUndo(.addBlank(blank: blank, strokes: copiedStrokes))
+        rebuildPageViews(focusKey: InkDocument.blankKey(blank.id))
+        scheduleSave()
+        toolState.showToast("Page duplicated")
+    }
+
+    func deletePage(at slotIndex: Int) {
+        clearLassoSelection(commitFirst: true)
+        guard pageSlots.count > 1, let slot = pageSlots[safe: slotIndex] else {
+            toolState.showToast("Cannot delete the last page")
+            return
+        }
+        let focusAfter = pageSlots[safe: max(0, slotIndex - 1)]?.key
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        if let blank = slot.blank {
+            let strokes = inkDoc.pages[slot.key] ?? []
+            inkDoc.blanks.removeValue(forKey: blank.id)
+            inkDoc.pages.removeValue(forKey: slot.key)
+            inkDoc.deleted[blank.id] = nowMs
+            pushUndo(.deleteBlank(blank: blank, strokes: strokes))
+            rebuildPageViews(focusKey: focusAfter)
+            scheduleSave()
+            toolState.showToast("Page deleted (Undo to restore)")
+        } else if let pdfN = slot.pdfN {
+            inkDoc.removed[String(pdfN)] = PageMark(on: true, t: nowMs)
+            pushUndo(.setRemoved(pdfN: pdfN, newRemoved: true))
+            rebuildPageViews(focusKey: focusAfter)
+            scheduleSave()
+            toolState.showToast("Page hidden (Restore in Overview)")
+        }
+    }
+
+    func restoreAllRemovedPages() {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var restored = 0
+        for (k, mark) in inkDoc.removed where mark.on {
+            inkDoc.removed[k] = PageMark(on: false, t: nowMs)
+            restored += 1
+        }
+        guard restored > 0 else { return }
+        rebuildPageViews(focusKey: nil)
+        scheduleSave()
+        toolState.showToast("Restored \(restored) page\(restored == 1 ? "" : "s")")
+    }
+
+    func toggleBookmarkForCurrentPage() {
+        guard let slot = pageSlots[safe: toolState.currentPage - 1] else { return }
+        toggleBookmark(for: slot.key)
+    }
+
+    func toggleBookmark(for pageKey: String) {
+        let nowOn = !inkDoc.isBookmarked(pageKey)
+        let prev = inkDoc.bookmarks[pageKey]
+        inkDoc.bookmarks[pageKey] = PageMark(
+            on: nowOn,
+            t: Int64(Date().timeIntervalSince1970 * 1000),
+            title: prev?.title,
+            tag: prev?.tag
+        )
+        syncDocumentMetadataToUI()
+        scheduleSave()
+        toolState.showToast(nowOn ? "Page bookmarked" : "Bookmark removed")
+    }
+
+    func clearCurrentPageStrokes() {
+        clearLassoSelection(commitFirst: true)
+        guard let slot = pageSlots[safe: toolState.currentPage - 1],
+              let existing = inkDoc.pages[slot.key], !existing.isEmpty else {
+            toolState.showToast("Page is already clear")
+            return
+        }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        for s in existing { inkDoc.deleted[s.id] = nowMs }
+        inkDoc.pages.removeValue(forKey: slot.key)
+        pageView(forKey: slot.key)?.setStrokes([])
+        pushUndo(.strokes(pageKey: slot.key, added: [], removed: existing))
+        scheduleSave()
+        toolState.showToast("Cleared page writing")
+    }
+
+    // MARK: - Thumbnails & Share / Export
+
+    func renderThumbnailAsync(for slot: PageSlot, targetWidth: CGFloat, completion: @escaping (UIImage?) -> Void) {
+        let doc = pdfDoc
+        let strokes = inkDoc.pages[slot.key] ?? []
+        let scale = max(0.25, targetWidth / max(1, slot.size.width))
+        renderQueue.async {
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: scale)
+            DispatchQueue.main.async {
+                completion(img)
+            }
+        }
+    }
+
+    func exportCurrentPagePNG() {
+        clearLassoSelection(commitFirst: true)
+        guard let slot = pageSlots[safe: toolState.currentPage - 1] else { return }
+        let strokes = inkDoc.pages[slot.key] ?? []
+        let doc = pdfDoc
+        let pageNum = toolState.currentPage
+        let baseName = pdfURL.deletingPathExtension().lastPathComponent
+        toolState.showToast("Rendering PNG…")
+        renderQueue.async { [weak self] in
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: 2.0)
+            guard let data = img.pngData() else { return }
+            let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName) - Page \(pageNum).png")
+            do {
+                try data.write(to: outURL, options: .atomic)
+                DispatchQueue.main.async {
+                    self?.presentShareSheet(items: [outURL])
+                }
+            } catch {
+                self?.toolState.showToast("PNG export failed")
+            }
+        }
+    }
+
+    func exportAnnotatedPDF() {
+        clearLassoSelection(commitFirst: true)
+        let slots = pageSlots
+        guard !slots.isEmpty else { return }
+        let doc = pdfDoc
+        let pagesCopy = inkDoc.pages
+        let baseName = pdfURL.deletingPathExtension().lastPathComponent
+        toolState.showToast("Exporting PDF (\(slots.count) pages)…")
+        renderQueue.async { [weak self] in
+            let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName) (Annotated).pdf")
+            let firstBounds = CGRect(origin: .zero, size: slots[0].size)
+            let renderer = UIGraphicsPDFRenderer(bounds: firstBounds)
+            do {
+                try renderer.writePDF(to: outURL) { pdfCtx in
+                    for slot in slots {
+                        let pageRect = CGRect(origin: .zero, size: slot.size)
+                        pdfCtx.beginPage(withBounds: pageRect, pageInfo: [:])
+                        let cg = pdfCtx.cgContext
+                        PageCanvasView.drawSlotBackground(slot: slot, pdfDoc: doc, in: cg)
+                        if let strokes = pagesCopy[slot.key], !strokes.isEmpty {
+                            PageCanvasView.drawStrokes(strokes, in: cg)
+                        }
+                    }
+                }
+                DispatchQueue.main.async {
+                    self?.presentShareSheet(items: [outURL])
+                }
+            } catch {
+                self?.toolState.showToast("PDF export failed")
+            }
+        }
+    }
+
+    private func presentShareSheet(items: [Any]) {
+        let avc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let pop = avc.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: view.bounds.midX, y: 76, width: 1, height: 1)
+            pop.permittedArrowDirections = .up
+        }
+        present(avc, animated: true)
+    }
+
+    // MARK: - Lasso Operations (Called from Floating Action Bar & Pencil)
+
+    private func syncLassoUIState() {
+        let count = lassoSelection?.strokes.count ?? 0
+        let hasClip = lassoClipboard != nil
+        DispatchQueue.main.async {
+            self.toolState.hasLassoSelection = count > 0
+            self.toolState.lassoSelectedCount = count
+            self.toolState.hasLassoClipboard = hasClip
+        }
+    }
+
+    func clearLassoSelection(commitFirst: Bool = true) {
+        if commitFirst { commitLassoTransformIfNeeded() }
+        guard let sel = lassoSelection else {
+            syncLassoUIState()
+            return
+        }
+        lassoSelection = nil
+        if let pv = pageView(forKey: sel.pageKey) {
+            pv.setHiddenStrokeIDs([])
+            pv.clearLiveOverlay()
+        }
+        syncLassoUIState()
+    }
+
+    private func commitLassoTransformIfNeeded() {
+        guard var sel = lassoSelection, !sel.strokes.isEmpty, sel.hasTransform else {
+            if var sel = lassoSelection {
+                sel.tx = 0; sel.ty = 0; sel.scale = 1.0; sel.rotation = 0.0
+                lassoSelection = sel
+            }
+            return
+        }
+        let selIds = Set(sel.strokes.map { $0.id })
+        let list = inkDoc.pages[sel.pageKey] ?? []
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var removed: [InkStroke] = []
+        var added: [InkStroke] = []
+
+        let nextList: [InkStroke] = list.map { item in
+            guard selIds.contains(item.id) else { return item }
+            removed.append(item)
+            inkDoc.deleted[item.id] = nowMs
+            let moved = LassoMath.transformedStroke(
+                item,
+                pivot: sel.pivot,
+                tx: sel.tx,
+                ty: sel.ty,
+                scale: sel.scale,
+                rotation: sel.rotation
+            )
+            added.append(moved)
+            return moved
+        }
+
+        inkDoc.pages[sel.pageKey] = nextList
+        let newBox = LassoMath.combinedBox(of: added)
+        sel.strokes = added
+        sel.origBox = newBox
+        sel.box = newBox
+        sel.pivot = CGPoint(x: newBox.midX, y: newBox.midY)
+        sel.tx = 0; sel.ty = 0; sel.scale = 1.0; sel.rotation = 0.0
+        lassoSelection = sel
+
+        if let pv = pageView(forKey: sel.pageKey) {
+            pv.setStrokes(nextList, hiddenIDs: sel.hiddenStrokeIDs)
+            pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+        }
+        pushUndo(.strokes(pageKey: sel.pageKey, added: added, removed: removed))
+        scheduleSave()
+    }
+
+    func lassoRecolor(hex: String) {
+        commitLassoTransformIfNeeded()
+        guard var sel = lassoSelection, !sel.strokes.isEmpty else { return }
+        let selIds = Set(sel.strokes.map { $0.id })
+        let list = inkDoc.pages[sel.pageKey] ?? []
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var removed: [InkStroke] = []
+        var added: [InkStroke] = []
+
+        let nextList: [InkStroke] = list.map { item in
+            guard selIds.contains(item.id) else { return item }
+            removed.append(item)
+            inkDoc.deleted[item.id] = nowMs
+            var copy = item
+            copy.id = InkStroke.newID()
+            copy.t = nowMs
+            copy.color = hex
+            added.append(copy)
+            return copy
+        }
+
+        inkDoc.pages[sel.pageKey] = nextList
+        sel.strokes = added
+        lassoSelection = sel
+        if let pv = pageView(forKey: sel.pageKey) {
+            pv.setStrokes(nextList, hiddenIDs: sel.hiddenStrokeIDs)
+            pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+        }
+        pushUndo(.strokes(pageKey: sel.pageKey, added: added, removed: removed))
+        scheduleSave()
+    }
+
+    func lassoCopy() {
+        commitLassoTransformIfNeeded()
+        guard let sel = lassoSelection, !sel.strokes.isEmpty else { return }
+        lassoClipboard = LassoClipboard(
+            center: CGPoint(x: sel.box.midX, y: sel.box.midY),
+            width: sel.box.width,
+            height: sel.box.height,
+            strokes: sel.strokes
+        )
+        syncLassoUIState()
+        toolState.showToast("Copied \(sel.strokes.count) stroke\(sel.strokes.count == 1 ? "" : "s") — tap page to paste")
+    }
+
+    func lassoCut() {
+        lassoCopy()
+        lassoDelete()
+    }
+
+    func lassoDuplicate() {
+        commitLassoTransformIfNeeded()
+        guard var sel = lassoSelection, !sel.strokes.isEmpty else { return }
+        let offset: CGFloat = 14.0
+        let added = sel.strokes.map { LassoMath.translatedCopy($0, dx: offset, dy: offset) }
+        var list = inkDoc.pages[sel.pageKey] ?? []
+        list.append(contentsOf: added)
+        inkDoc.pages[sel.pageKey] = list
+
+        let newBox = LassoMath.combinedBox(of: added)
+        sel.strokes = added
+        sel.origBox = newBox
+        sel.box = newBox
+        sel.pivot = CGPoint(x: newBox.midX, y: newBox.midY)
+        sel.tx = 0; sel.ty = 0; sel.scale = 1.0; sel.rotation = 0.0
+        lassoSelection = sel
+
+        if let pv = pageView(forKey: sel.pageKey) {
+            pv.setStrokes(list, hiddenIDs: sel.hiddenStrokeIDs)
+            pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+        }
+        pushUndo(.strokes(pageKey: sel.pageKey, added: added, removed: []))
+        scheduleSave()
+        toolState.showToast("Duplicated selection")
+    }
+
+    func lassoDelete() {
+        commitLassoTransformIfNeeded()
+        guard let sel = lassoSelection, !sel.strokes.isEmpty else { return }
+        let selIds = Set(sel.strokes.map { $0.id })
+        let list = inkDoc.pages[sel.pageKey] ?? []
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var removed: [InkStroke] = []
+        var kept: [InkStroke] = []
+        for item in list {
+            if selIds.contains(item.id) {
+                removed.append(item)
+                inkDoc.deleted[item.id] = nowMs
+            } else {
+                kept.append(item)
+            }
+        }
+        if kept.isEmpty { inkDoc.pages.removeValue(forKey: sel.pageKey) }
+        else { inkDoc.pages[sel.pageKey] = kept }
+
+        lassoSelection = nil
+        if let pv = pageView(forKey: sel.pageKey) {
+            pv.setStrokes(kept, hiddenIDs: [])
+            pv.clearLiveOverlay()
+        }
+        syncLassoUIState()
+        pushUndo(.strokes(pageKey: sel.pageKey, added: [], removed: removed))
+        scheduleSave()
+        toolState.showToast("Deleted selection")
+    }
+
+    private func pasteLassoClipboard(on pv: PageCanvasView, at pt: CGPoint) {
+        guard let clip = lassoClipboard, !clip.strokes.isEmpty else { return }
+        let dx = pt.x - clip.center.x
+        let dy = pt.y - clip.center.y
+        let added = clip.strokes.map { LassoMath.translatedCopy($0, dx: dx, dy: dy) }
+        var list = inkDoc.pages[pv.pageKey] ?? []
+        list.append(contentsOf: added)
+        inkDoc.pages[pv.pageKey] = list
+
+        let newBox = LassoMath.combinedBox(of: added)
+        var sel = LassoSelection(pageKey: pv.pageKey)
+        sel.mode = .none
+        sel.strokes = added
+        sel.origBox = newBox
+        sel.box = newBox
+        sel.pivot = CGPoint(x: newBox.midX, y: newBox.midY)
+        lassoSelection = sel
+
+        pv.setStrokes(list, hiddenIDs: sel.hiddenStrokeIDs)
+        pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+        syncLassoUIState()
+        pushUndo(.strokes(pageKey: pv.pageKey, added: added, removed: []))
+        scheduleSave()
+        toolState.showToast("Pasted selection")
     }
 
     // MARK: - Hardware 240Hz Pencil Input
@@ -587,6 +1090,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         return nil
     }
 
+    private func pageView(forKey key: String) -> PageCanvasView? {
+        pageViews.first(where: { $0.pageKey == key })
+    }
+
     private func localPoint(of touch: UITouch, in pageView: PageCanvasView, prev: InkPoint?) -> InkPoint {
         let p = touch.preciseLocation(in: pageView)
         let x = max(0, min(pageView.pageSize.width, p.x))
@@ -597,11 +1104,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         if touch.maximumPossibleForce > 0 && touch.force > 0 {
             pressure = max(0.08, min(1.0, touch.force / touch.maximumPossibleForce))
         } else if toolState.tool == .pen && toolState.penStyle != .ball {
-            // Velocity-driven expressive pressure for 3rd-party styluses without pressure sensors!
             if let prev = prev {
                 let dt = max(0.002, t - prev.t)
                 let speed = hypot(x - prev.x, y - prev.y) / CGFloat(dt)
-                // Slower strokes -> fuller ink (0.78); brisk strokes -> sleeker line (0.28)
                 let targetP = max(0.26, min(0.82, 0.80 - (speed / 950.0) * 0.52))
                 activeVelPressure = activeVelPressure * 0.72 + targetP * 0.28
                 pressure = activeVelPressure
@@ -652,6 +1157,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         guard let pv = pageView(at: docPt) else { return }
         activePageView = pv
 
+        if toolState.tool == .lasso {
+            handleLassoBegan(touch, on: pv)
+            return
+        }
+
         if toolState.tool == .laser {
             if let oldPV = laserPageView, oldPV !== pv {
                 oldPV.clearLiveOverlay()
@@ -696,9 +1206,80 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         paintLive(on: pv)
     }
 
+    private func handleLassoBegan(_ touch: UITouch, on pv: PageCanvasView) {
+        let raw = localPoint(of: touch, in: pv, prev: nil)
+        let pt = CGPoint(x: raw.x, y: raw.y)
+        let zoom = max(0.5, scrollView.zoomScale)
+
+        if let cur = lassoSelection, cur.pageKey != pv.pageKey {
+            clearLassoSelection(commitFirst: true)
+        }
+
+        if var sel = lassoSelection, sel.pageKey == pv.pageKey, !sel.strokes.isEmpty {
+            let h = sel.handles(zoomScale: zoom)
+            let hitR = 16.0 / zoom
+
+            // 1. Rotation handle
+            if hypot(pt.x - h.cx, pt.y - h.rotY) <= hitR {
+                commitLassoTransformIfNeeded()
+                sel = lassoSelection ?? sel
+                sel.mode = .rotating
+                sel.pivot = CGPoint(x: h.cx, y: h.cy)
+                sel.startAngle = atan2(pt.y - h.cy, pt.x - h.cx)
+                sel.rotation = 0
+                lassoSelection = sel
+                return
+            }
+
+            // 2. Corner scaling handles
+            for c in h.corners {
+                if hypot(pt.x - c.x, pt.y - c.y) <= hitR {
+                    commitLassoTransformIfNeeded()
+                    sel = lassoSelection ?? sel
+                    sel.mode = .scaling
+                    sel.pivot = CGPoint(x: c.ax, y: c.ay)
+                    sel.startDistX = max(8.0, abs(c.x - c.ax)) * (c.x >= c.ax ? 1.0 : -1.0)
+                    sel.startDistY = max(8.0, abs(c.y - c.ay)) * (c.y >= c.ay ? 1.0 : -1.0)
+                    sel.origBox = sel.box
+                    sel.scale = 1.0
+                    lassoSelection = sel
+                    return
+                }
+            }
+
+            // 3. Inside box -> drag
+            if pt.x >= h.bx0 - hitR * 0.5 && pt.x <= h.bx1 + hitR * 0.5 &&
+               pt.y >= h.by0 - hitR * 0.5 && pt.y <= h.by1 + hitR * 0.5 {
+                commitLassoTransformIfNeeded()
+                sel = lassoSelection ?? sel
+                sel.mode = .dragging
+                sel.startPoint = pt
+                sel.origBox = sel.box
+                sel.pivot = CGPoint(x: sel.box.midX, y: sel.box.midY)
+                sel.tx = 0; sel.ty = 0
+                lassoSelection = sel
+                return
+            }
+
+            // Tapped outside selection -> commit & clear, then start new lasso
+            clearLassoSelection(commitFirst: true)
+        }
+
+        var fresh = LassoSelection(pageKey: pv.pageKey)
+        fresh.mode = .drawing
+        fresh.poly = [pt]
+        lassoSelection = fresh
+        pv.updateLasso(selection: fresh, zoomScale: zoom)
+    }
+
     private func handlePencilMoved(_ touch: UITouch, event: UIEvent?) {
         guard let pv = activePageView else { return }
         let coalesced = event?.coalescedTouches(for: touch) ?? [touch]
+
+        if toolState.tool == .lasso {
+            handleLassoMoved(touch, on: pv)
+            return
+        }
 
         if toolState.tool == .laser {
             let now = CACurrentMediaTime()
@@ -743,8 +1324,88 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         paintLive(on: pv)
     }
 
+    private func handleLassoMoved(_ touch: UITouch, on pv: PageCanvasView) {
+        guard var sel = lassoSelection, sel.pageKey == pv.pageKey else { return }
+        let raw = localPoint(of: touch, in: pv, prev: nil)
+        let pt = CGPoint(x: raw.x, y: raw.y)
+        let zoom = max(0.5, scrollView.zoomScale)
+
+        switch sel.mode {
+        case .drawing:
+            if let last = sel.poly.last, hypot(pt.x - last.x, pt.y - last.y) < 1.5 { return }
+            sel.poly.append(pt)
+        case .dragging:
+            sel.tx = pt.x - sel.startPoint.x
+            sel.ty = pt.y - sel.startPoint.y
+            sel.box = sel.origBox.offsetBy(dx: sel.tx, dy: sel.ty)
+        case .scaling:
+            let rawSx = (pt.x - sel.pivot.x) / sel.startDistX
+            let rawSy = (pt.y - sel.pivot.y) / sel.startDistY
+            let uni = max(0.15, min(6.0, (abs(rawSx) + abs(rawSy)) * 0.5))
+            sel.scale = uni
+            let nx0 = sel.pivot.x + (sel.origBox.minX - sel.pivot.x) * uni
+            let ny0 = sel.pivot.y + (sel.origBox.minY - sel.pivot.y) * uni
+            let nx1 = sel.pivot.x + (sel.origBox.maxX - sel.pivot.x) * uni
+            let ny1 = sel.pivot.y + (sel.origBox.maxY - sel.pivot.y) * uni
+            sel.box = CGRect(x: min(nx0, nx1), y: min(ny0, ny1), width: max(1, abs(nx1 - nx0)), height: max(1, abs(ny1 - ny0)))
+        case .rotating:
+            let ang = atan2(pt.y - sel.pivot.y, pt.x - sel.pivot.x)
+            sel.rotation = ang - sel.startAngle
+        case .none:
+            return
+        }
+        lassoSelection = sel
+        pv.updateLasso(selection: sel, zoomScale: zoom)
+    }
+
+    private func handleLassoEnded(on pv: PageCanvasView) {
+        guard var sel = lassoSelection, sel.pageKey == pv.pageKey else { return }
+        let mode = sel.mode
+        sel.mode = .none
+        lassoSelection = sel
+
+        switch mode {
+        case .drawing:
+            var pathLen: CGFloat = 0
+            if sel.poly.count >= 2 {
+                for i in 1..<sel.poly.count {
+                    pathLen += hypot(sel.poly[i].x - sel.poly[i - 1].x, sel.poly[i].y - sel.poly[i - 1].y)
+                }
+            }
+            if sel.poly.count < 3 || pathLen < 8.0 {
+                if let tapPt = sel.poly.first, lassoClipboard != nil {
+                    pasteLassoClipboard(on: pv, at: tapPt)
+                } else {
+                    clearLassoSelection(commitFirst: false)
+                }
+                return
+            }
+            let pageStrokes = inkDoc.pages[pv.pageKey] ?? []
+            let res = LassoMath.selectStrokes(in: pageStrokes, polygon: sel.poly)
+            if res.selected.isEmpty {
+                clearLassoSelection(commitFirst: false)
+                return
+            }
+            sel.strokes = res.selected
+            sel.origBox = res.box
+            sel.box = res.box
+            sel.pivot = CGPoint(x: res.box.midX, y: res.box.midY)
+            sel.tx = 0; sel.ty = 0; sel.scale = 1.0; sel.rotation = 0.0
+            lassoSelection = sel
+            pv.setHiddenStrokeIDs(sel.hiddenStrokeIDs)
+            pv.updateLasso(selection: sel, zoomScale: scrollView.zoomScale)
+            syncLassoUIState()
+            toolState.showToast("\(res.selected.count) stroke\(res.selected.count == 1 ? "" : "s") selected")
+
+        case .dragging, .scaling, .rotating:
+            commitLassoTransformIfNeeded()
+
+        case .none:
+            break
+        }
+    }
+
     private func appendLivePoint(_ pt: InkPoint, on pv: PageCanvasView) {
-        // Straight Highlighter mode
         if toolState.tool == .highlighter && toolState.hlStraight && snappedShape == nil {
             let start = activeStartPoint ?? CGPoint(x: pt.x, y: pt.y)
             activeStartPoint = start
@@ -760,7 +1421,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             return
         }
 
-        // Interactive resize/adjust after Hold-to-Shape snap
         if var shape = snappedShape {
             let tEnd = pt.t
             let tStart = max(0, tEnd - 0.04)
@@ -813,7 +1473,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
         activePoints.append(pt)
 
-        // Hold-to-Shape anchor check
         let holdRadius = 3.5 / max(0.5, scrollView.zoomScale)
         if let anchor = holdAnchor {
             if hypot(pt.x - anchor.x, pt.y - anchor.y) > holdRadius {
@@ -847,6 +1506,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
         guard let pv = activePageView else { return }
 
+        if toolState.tool == .lasso {
+            handleLassoEnded(on: pv)
+            return
+        }
+
         if toolState.tool == .laser {
             laserDown = false
             return
@@ -856,7 +1520,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             pv.clearLiveOverlay()
             let pieces = Array(activeErasePieces.values)
             if !activeEraseOriginals.isEmpty || !pieces.isEmpty, let key = activeErasePageKey {
-                pushUndo(UndoAction(pageKey: key, added: pieces, removed: activeEraseOriginals))
+                pushUndo(.strokes(pageKey: key, added: pieces, removed: activeEraseOriginals))
                 scheduleSave()
             }
             return
@@ -882,7 +1546,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         inkDoc.pages[pv.pageKey] = list
         pv.setStrokes(list)
 
-        // Two-step undo for smart shapes: Undo #1 unsnaps to raw stroke; Undo #2 removes stroke
         if let rawPts = rawPointsBeforeSnap, !rawPts.isEmpty, snappedShape != nil {
             let rawStroke = makeCommittedStroke(
                 points: rawPts,
@@ -893,17 +1556,19 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 straight: false,
                 smartShape: nil
             )
-            pushUndo(UndoAction(pageKey: pv.pageKey, added: [rawStroke], removed: []))
-            pushUndo(UndoAction(pageKey: pv.pageKey, added: [stroke], removed: [rawStroke]))
+            pushUndo(.strokes(pageKey: pv.pageKey, added: [rawStroke], removed: []))
+            pushUndo(.strokes(pageKey: pv.pageKey, added: [stroke], removed: [rawStroke]))
         } else {
-            pushUndo(UndoAction(pageKey: pv.pageKey, added: [stroke], removed: []))
+            pushUndo(.strokes(pageKey: pv.pageKey, added: [stroke], removed: []))
         }
         scheduleSave()
     }
 
     private func handlePencilResetFallback() {
         cancelHoldTimer()
-        activePageView?.clearLiveOverlay()
+        if let pv = activePageView, toolState.tool != .lasso {
+            pv.clearLiveOverlay()
+        }
         activePageView = nil
         activeSmoother = nil
         activeStartPoint = nil
@@ -967,7 +1632,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         )
     }
 
-    // MARK: - Eraser Engine (Stroke + Precise Pixel Eraser)
+    // MARK: - Eraser Engine
 
     private func noteErased(_ s: InkStroke, nowMs: Int64) {
         inkDoc.deleted[s.id] = nowMs
@@ -1061,7 +1726,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
-    // MARK: - Undo / Redo & Auto-Save
+    // MARK: - Unified Undo / Redo & Auto-Save
 
     private func pushUndo(_ action: UndoAction) {
         undoStack.append(action)
@@ -1071,61 +1736,74 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func performUndo() {
+        clearLassoSelection(commitFirst: false)
         guard let action = undoStack.popLast() else { return }
-        applyInverse(action)
+        applyUndo(action, isRedo: false)
         redoStack.append(action)
         syncUndoFlags()
         scheduleSave()
     }
 
     func performRedo() {
+        clearLassoSelection(commitFirst: false)
         guard let action = redoStack.popLast() else { return }
-        applyForward(action)
+        applyUndo(action, isRedo: true)
         undoStack.append(action)
         syncUndoFlags()
         scheduleSave()
     }
 
-    private func applyInverse(_ action: UndoAction) {
-        var list = inkDoc.pages[action.pageKey] ?? []
-        let addedIds = Set(action.added.map { $0.id })
+    private func applyUndo(_ action: UndoAction, isRedo: Bool) {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        if !addedIds.isEmpty {
-            list.removeAll { addedIds.contains($0.id) }
-            for id in addedIds { inkDoc.deleted[id] = nowMs }
-        }
-        for s in action.removed {
-            inkDoc.deleted.removeValue(forKey: s.id)
-            list.append(s)
-        }
-        list.sort { $0.t < $1.t }
-        updatePageStrokes(pageKey: action.pageKey, strokes: list)
-    }
+        switch action {
+        case let .strokes(pageKey, added, removed):
+            let toRemove = isRedo ? removed : added
+            let toAdd = isRedo ? added : removed
+            var list = inkDoc.pages[pageKey] ?? []
+            let remIds = Set(toRemove.map { $0.id })
+            if !remIds.isEmpty {
+                list.removeAll { remIds.contains($0.id) }
+                for id in remIds { inkDoc.deleted[id] = nowMs }
+            }
+            for s in toAdd {
+                inkDoc.deleted.removeValue(forKey: s.id)
+                list.append(s)
+            }
+            list.sort { $0.t < $1.t }
+            if list.isEmpty { inkDoc.pages.removeValue(forKey: pageKey) }
+            else { inkDoc.pages[pageKey] = list }
+            pageView(forKey: pageKey)?.setStrokes(list)
 
-    private func applyForward(_ action: UndoAction) {
-        var list = inkDoc.pages[action.pageKey] ?? []
-        let removedIds = Set(action.removed.map { $0.id })
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        if !removedIds.isEmpty {
-            list.removeAll { removedIds.contains($0.id) }
-            for id in removedIds { inkDoc.deleted[id] = nowMs }
-        }
-        for s in action.added {
-            inkDoc.deleted.removeValue(forKey: s.id)
-            list.append(s)
-        }
-        list.sort { $0.t < $1.t }
-        updatePageStrokes(pageKey: action.pageKey, strokes: list)
-    }
+        case let .addBlank(blank, strokes):
+            if isRedo {
+                inkDoc.deleted.removeValue(forKey: blank.id)
+                inkDoc.blanks[blank.id] = blank
+                if !strokes.isEmpty { inkDoc.pages[InkDocument.blankKey(blank.id)] = strokes }
+                rebuildPageViews(focusKey: InkDocument.blankKey(blank.id))
+            } else {
+                inkDoc.blanks.removeValue(forKey: blank.id)
+                inkDoc.pages.removeValue(forKey: InkDocument.blankKey(blank.id))
+                inkDoc.deleted[blank.id] = nowMs
+                rebuildPageViews(focusKey: nil)
+            }
 
-    private func updatePageStrokes(pageKey: String, strokes: [InkStroke]) {
-        if strokes.isEmpty {
-            inkDoc.pages.removeValue(forKey: pageKey)
-        } else {
-            inkDoc.pages[pageKey] = strokes
-        }
-        if let pv = pageViews.first(where: { $0.pageKey == pageKey }) {
-            pv.setStrokes(strokes)
+        case let .deleteBlank(blank, strokes):
+            if isRedo {
+                inkDoc.blanks.removeValue(forKey: blank.id)
+                inkDoc.pages.removeValue(forKey: InkDocument.blankKey(blank.id))
+                inkDoc.deleted[blank.id] = nowMs
+                rebuildPageViews(focusKey: nil)
+            } else {
+                inkDoc.deleted.removeValue(forKey: blank.id)
+                inkDoc.blanks[blank.id] = blank
+                if !strokes.isEmpty { inkDoc.pages[InkDocument.blankKey(blank.id)] = strokes }
+                rebuildPageViews(focusKey: InkDocument.blankKey(blank.id))
+            }
+
+        case let .setRemoved(pdfN, newRemoved):
+            let targetRemoved = isRedo ? newRemoved : !newRemoved
+            inkDoc.removed[String(pdfN)] = PageMark(on: targetRemoved, t: nowMs)
+            rebuildPageViews(focusKey: targetRemoved ? nil : String(pdfN))
         }
     }
 
@@ -1166,6 +1844,12 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 }
             }
         }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 

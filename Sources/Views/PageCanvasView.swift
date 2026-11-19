@@ -7,11 +7,12 @@ struct LaserPoint {
     let time: CFTimeInterval
 }
 
-/// Renders one PDF page bitmap + committed vector ink strokes + a 120Hz live overlay (pen, highlighter, eraser ring, laser trail).
+/// Renders one PageSlot (PDF page, duplicated PDF page, or paper template) + committed ink + 120Hz live overlay (stroke, eraser ring, laser, or lasso).
 final class PageCanvasView: UIView {
-    let pageIndex: Int
-    let pageKey: String
-    let pageSize: CGSize // PDF points (top-left origin)
+    let slot: PageSlot
+    var pageIndex: Int { slot.index }
+    var pageKey: String { slot.key }
+    var pageSize: CGSize { slot.size }
 
     private let pdfImageView = UIImageView()
     private let staticInkView = StaticInkView()
@@ -20,11 +21,9 @@ final class PageCanvasView: UIView {
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
 
-    init(pageIndex: Int, pageSize: CGSize) {
-        self.pageIndex = pageIndex
-        self.pageKey = String(pageIndex + 1)
-        self.pageSize = pageSize
-        super.init(frame: CGRect(origin: .zero, size: pageSize))
+    init(slot: PageSlot) {
+        self.slot = slot
+        super.init(frame: CGRect(origin: .zero, size: slot.size))
         backgroundColor = .white
         layer.cornerRadius = 3
         layer.masksToBounds = true
@@ -39,7 +38,7 @@ final class PageCanvasView: UIView {
         staticInkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         staticInkView.backgroundColor = .clear
         staticInkView.isOpaque = false
-        staticInkView.pageSize = pageSize
+        staticInkView.pageSize = slot.size
         addSubview(staticInkView)
 
         liveOverlayView.frame = bounds
@@ -53,8 +52,14 @@ final class PageCanvasView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func setStrokes(_ strokes: [InkStroke]) {
+    func setStrokes(_ strokes: [InkStroke], hiddenIDs: Set<String> = []) {
         staticInkView.strokes = strokes
+        staticInkView.hiddenStrokeIDs = hiddenIDs
+        staticInkView.setNeedsDisplay()
+    }
+
+    func setHiddenStrokeIDs(_ ids: Set<String>) {
+        staticInkView.hiddenStrokeIDs = ids
         staticInkView.setNeedsDisplay()
     }
 
@@ -97,6 +102,22 @@ final class PageCanvasView: UIView {
         liveOverlayView.setNeedsDisplay()
     }
 
+    func updateLasso(selection: LassoSelection?, zoomScale: CGFloat) {
+        guard let sel = selection else {
+            liveOverlayView.mode = .none
+            liveOverlayView.setNeedsDisplay()
+            return
+        }
+        if sel.mode == .drawing {
+            liveOverlayView.mode = .lassoDrawing(poly: sel.poly, zoomScale: zoomScale)
+        } else if !sel.strokes.isEmpty {
+            liveOverlayView.mode = .lassoSelected(selection: sel, zoomScale: zoomScale)
+        } else {
+            liveOverlayView.mode = .none
+        }
+        liveOverlayView.setNeedsDisplay()
+    }
+
     func clearLiveOverlay() {
         liveOverlayView.mode = .none
         liveOverlayView.setNeedsDisplay()
@@ -129,10 +150,10 @@ final class PageCanvasView: UIView {
         return box.size
     }
 
-    static func renderPage(_ page: PDFPage, pageSize: CGSize, zoomScale: CGFloat) -> UIImage {
+    static func renderSlotBackground(slot: PageSlot, pdfDoc: PDFDocument?, zoomScale: CGFloat, maxPixels: CGFloat = 6_000_000) -> UIImage {
+        let pageSize = slot.size
         let dpr = min(UIScreen.main.scale, 2.0)
-        let maxPixels: CGFloat = 6_000_000
-        let desiredScale = max(1.0, min(zoomScale * dpr, 3.0))
+        let desiredScale = max(0.35, min(zoomScale * dpr, 3.0))
         let rawPx = (pageSize.width * desiredScale) * (pageSize.height * desiredScale)
         let finalScale = rawPx > maxPixels ? desiredScale * sqrt(maxPixels / rawPx) : desiredScale
 
@@ -142,24 +163,27 @@ final class PageCanvasView: UIView {
         let renderer = UIGraphicsImageRenderer(size: pageSize, format: format)
         return renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
-            ctx.saveGState()
+            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx)
+        }
+    }
+
+    static func drawSlotBackground(slot: PageSlot, pdfDoc: PDFDocument?, in ctx: CGContext) {
+        ctx.saveGState()
+        if let pdfN = slot.effectivePDFPageNumber, let page = pdfDoc?.page(at: pdfN - 1) {
             UIColor.white.setFill()
-            ctx.fill(CGRect(origin: .zero, size: pageSize))
-            ctx.translateBy(x: 0, y: pageSize.height)
+            ctx.fill(CGRect(origin: .zero, size: slot.size))
+            ctx.translateBy(x: 0, y: slot.size.height)
             ctx.scaleBy(x: 1, y: -1)
             ctx.concatenate(page.transform(for: .cropBox))
             page.draw(with: .cropBox, to: ctx)
-            ctx.restoreGState()
+        } else {
+            slot.template.draw(in: ctx, size: slot.size)
         }
+        ctx.restoreGState()
     }
-}
 
-private final class StaticInkView: UIView {
-    var pageSize: CGSize = .zero
-    var strokes: [InkStroke] = []
-
-    override func draw(_ rect: CGRect) {
-        guard !strokes.isEmpty, let ctx = UIGraphicsGetCurrentContext() else { return }
+    static func drawStrokes(_ strokes: [InkStroke], in ctx: CGContext, clipRect: CGRect? = nil, hiddenIDs: Set<String> = []) {
+        guard !strokes.isEmpty else { return }
         ctx.saveGState()
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
@@ -169,9 +193,11 @@ private final class StaticInkView: UIView {
         ctx.setBlendMode(.multiply)
         ctx.setAlpha(0.42)
         for s in strokes where s.tool == "highlighter" {
-            let pad = CGFloat(s.size) * 1.5 + 4
-            let box = s.boundingBox().insetBy(dx: -pad, dy: -pad)
-            guard box.intersects(rect) else { continue }
+            if hiddenIDs.contains(s.id) { continue }
+            if let rect = clipRect {
+                let pad = CGFloat(s.size) * 1.5 + 4
+                guard s.boundingBox().insetBy(dx: -pad, dy: -pad).intersects(rect) else { continue }
+            }
             StrokeGeometry.drawCommittedStroke(s, in: ctx)
         }
         ctx.restoreGState()
@@ -180,12 +206,38 @@ private final class StaticInkView: UIView {
         ctx.setBlendMode(.normal)
         ctx.setAlpha(1.0)
         for s in strokes where s.tool != "highlighter" {
-            let pad = CGFloat(s.size) * 1.8 + 4
-            let box = s.boundingBox().insetBy(dx: -pad, dy: -pad)
-            guard box.intersects(rect) else { continue }
+            if hiddenIDs.contains(s.id) { continue }
+            if let rect = clipRect {
+                let pad = CGFloat(s.size) * 1.8 + 4
+                guard s.boundingBox().insetBy(dx: -pad, dy: -pad).intersects(rect) else { continue }
+            }
             StrokeGeometry.drawCommittedStroke(s, in: ctx)
         }
         ctx.restoreGState()
+    }
+
+    /// Renders a complete composite image (PDF/template + ink strokes) for thumbnails or PNG sharing.
+    static func renderCompositeImage(slot: PageSlot, pdfDoc: PDFDocument?, strokes: [InkStroke], scale: CGFloat) -> UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = max(0.25, scale)
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: slot.size, format: format)
+        return renderer.image { rendererCtx in
+            let ctx = rendererCtx.cgContext
+            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx)
+            drawStrokes(strokes, in: ctx)
+        }
+    }
+}
+
+private final class StaticInkView: UIView {
+    var pageSize: CGSize = .zero
+    var strokes: [InkStroke] = []
+    var hiddenStrokeIDs: Set<String> = []
+
+    override func draw(_ rect: CGRect) {
+        guard !strokes.isEmpty, let ctx = UIGraphicsGetCurrentContext() else { return }
+        PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs)
     }
 }
 
@@ -195,6 +247,8 @@ private final class LiveInkOverlayView: UIView {
         case stroke(points: [InkPoint], color: UIColor, size: CGFloat, tool: String, style: String, straight: Bool, isSmartShape: Bool)
         case eraserRing(center: CGPoint, radius: CGFloat, zoomScale: CGFloat)
         case laser(points: [LaserPoint], color: UIColor, showTrail: Bool, zoomScale: CGFloat, now: CFTimeInterval)
+        case lassoDrawing(poly: [CGPoint], zoomScale: CGFloat)
+        case lassoSelected(selection: LassoSelection, zoomScale: CGFloat)
     }
 
     var mode: Mode = .none
@@ -266,6 +320,78 @@ private final class LiveInkOverlayView: UIView {
                 ctx.fillEllipse(in: CGRect(x: tip.x - outerR, y: tip.y - outerR, width: outerR * 2, height: outerR * 2))
                 ctx.setFillColor(UIColor.white.cgColor)
                 ctx.fillEllipse(in: CGRect(x: tip.x - innerR, y: tip.y - innerR, width: innerR * 2, height: innerR * 2))
+            }
+            ctx.restoreGState()
+
+        case let .lassoDrawing(poly, zoomScale):
+            guard poly.count >= 2 else { return }
+            let sc = max(0.5, zoomScale)
+            ctx.saveGState()
+            let path = CGMutablePath()
+            path.move(to: poly[0])
+            for i in 1..<poly.count { path.addLine(to: poly[i]) }
+            ctx.addPath(path)
+            ctx.setFillColor(UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 0.09).cgColor)
+            ctx.fillPath()
+
+            ctx.addPath(path)
+            ctx.setStrokeColor(UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0).cgColor)
+            ctx.setLineWidth(1.8 / sc)
+            ctx.setLineDash(phase: 0, lengths: [6.0 / sc, 4.0 / sc])
+            ctx.strokePath()
+            ctx.restoreGState()
+
+        case let .lassoSelected(sel, zoomScale):
+            let sc = max(0.5, zoomScale)
+            // 1. Render transformed strokes live
+            ctx.saveGState()
+            ctx.translateBy(x: sel.pivot.x + sel.tx, y: sel.pivot.y + sel.ty)
+            if sel.rotation != 0 { ctx.rotate(by: sel.rotation) }
+            ctx.scaleBy(x: sel.scale, y: sel.scale)
+            ctx.translateBy(x: -sel.pivot.x, y: -sel.pivot.y)
+            PageCanvasView.drawStrokes(sel.strokes, in: ctx)
+            ctx.restoreGState()
+
+            // 2. Render selection dashed box + 4 scale handles + top rotation handle
+            let h = sel.handles(zoomScale: sc)
+            let accent = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0)
+            ctx.saveGState()
+            if sel.rotation != 0 {
+                ctx.translateBy(x: h.cx, y: h.cy)
+                ctx.rotate(by: sel.rotation)
+                ctx.translateBy(x: -h.cx, y: -h.cy)
+            }
+            let boxRect = CGRect(x: h.bx0, y: h.by0, width: h.bx1 - h.bx0, height: h.by1 - h.by0)
+            ctx.setFillColor(accent.withAlphaComponent(0.05).cgColor)
+            ctx.fill(boxRect)
+
+            ctx.setStrokeColor(accent.cgColor)
+            ctx.setLineWidth(1.6 / sc)
+            ctx.setLineDash(phase: 0, lengths: [5.0 / sc, 4.0 / sc])
+            ctx.stroke(boxRect)
+
+            // Rotation stem + handle
+            ctx.setLineDash(phase: 0, lengths: [])
+            ctx.move(to: CGPoint(x: h.cx, y: h.by0))
+            ctx.addLine(to: CGPoint(x: h.cx, y: h.rotY))
+            ctx.strokePath()
+
+            let rHandle = 5.4 / sc
+            let rotRect = CGRect(x: h.cx - rHandle, y: h.rotY - rHandle, width: rHandle * 2, height: rHandle * 2)
+            ctx.setFillColor(accent.cgColor)
+            ctx.fillEllipse(in: rotRect)
+            ctx.setStrokeColor(UIColor.white.cgColor)
+            ctx.setLineWidth(1.5 / sc)
+            ctx.strokeEllipse(in: rotRect)
+
+            // 4 corner scale handles
+            ctx.setFillColor(UIColor.white.cgColor)
+            ctx.setStrokeColor(accent.cgColor)
+            ctx.setLineWidth(1.8 / sc)
+            for c in h.corners {
+                let cr = CGRect(x: c.x - rHandle, y: c.y - rHandle, width: rHandle * 2, height: rHandle * 2)
+                ctx.fillEllipse(in: cr)
+                ctx.strokeEllipse(in: cr)
             }
             ctx.restoreGState()
         }

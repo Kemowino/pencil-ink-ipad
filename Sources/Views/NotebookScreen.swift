@@ -12,6 +12,7 @@ struct NotebookScreen: View {
     @StateObject private var toolState = NotebookToolState()
     @State private var controllerBox = PDFNotebookRepresentable.ControllerBox()
     @State private var activePopover: ToolPopoverKind? = nil
+    @State private var showPageOverview = false
     @State private var jumpPageInput: String = ""
 
     var body: some View {
@@ -23,11 +24,16 @@ struct NotebookScreen: View {
             )
             .ignoresSafeArea()
 
-            // Top Floating Toolbar + Toast
+            // Top Floating Toolbar + Lasso Action Bar + Toast + Bottom Page Pill
             VStack(spacing: 10) {
                 floatingDock
                     .padding(.top, 10)
                     .padding(.horizontal, 12)
+
+                if toolState.hasLassoSelection {
+                    lassoActionBar
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 if !toolState.toastMessage.isEmpty {
                     Text(toolState.toastMessage)
@@ -68,18 +74,32 @@ struct NotebookScreen: View {
                 .padding(.bottom, 12)
             }
             .animation(.easeOut(duration: 0.16), value: toolState.toastMessage)
+            .animation(.easeOut(duration: 0.16), value: toolState.hasLassoSelection)
         }
         .statusBar(hidden: false)
+        .sheet(isPresented: $showPageOverview) {
+            PageOverviewSheet(toolState: toolState, controllerBox: controllerBox)
+                .preferredColorScheme(.dark)
+        }
+    }
+
+    private func selectTool(_ t: DrawingTool) {
+        toolState.tool = t
+        controllerBox.vc?.onToolChanged(to: t)
     }
 
     private var floatingDock: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                // Group 1: Back + Undo / Redo
+                // Group 1: Back + Page Overview + Undo / Redo
                 HStack(spacing: 4) {
                     toolbarButton(systemName: "chevron.left", active: false) {
                         controllerBox.vc?.saveNow()
                         onClose()
+                    }
+                    toolbarButton(systemName: "square.grid.2x2", active: showPageOverview) {
+                        controllerBox.vc?.clearLassoSelection(commitFirst: true)
+                        showPageOverview = true
                     }
                     toolbarButton(systemName: "arrow.uturn.backward", active: false, disabled: !toolState.canUndo) {
                         controllerBox.vc?.performUndo()
@@ -93,11 +113,11 @@ struct NotebookScreen: View {
                 .background(Color.white.opacity(0.06))
                 .clipShape(Capsule())
 
-                // Group 2: Tools (tap an active tool again for its settings popover!)
+                // Group 2: Tools (Pen, Highlighter, Eraser, Lasso, Laser)
                 HStack(spacing: 4) {
                     toolbarButton(systemName: "pencil.tip", active: toolState.tool == .pen) {
                         if toolState.tool == .pen { activePopover = .pen }
-                        else { toolState.tool = .pen }
+                        else { selectTool(.pen) }
                     }
                     .popover(isPresented: Binding(
                         get: { activePopover == .pen },
@@ -111,7 +131,7 @@ struct NotebookScreen: View {
                         )
                     } action: {
                         if toolState.tool == .highlighter { activePopover = .highlighter }
-                        else { toolState.tool = .highlighter }
+                        else { selectTool(.highlighter) }
                     }
                     .popover(isPresented: Binding(
                         get: { activePopover == .highlighter },
@@ -120,12 +140,18 @@ struct NotebookScreen: View {
 
                     toolbarButton(systemName: "eraser", active: toolState.tool == .eraser) {
                         if toolState.tool == .eraser { activePopover = .eraser }
-                        else { toolState.tool = .eraser }
+                        else { selectTool(.eraser) }
                     }
                     .popover(isPresented: Binding(
                         get: { activePopover == .eraser },
                         set: { if !$0 { activePopover = nil } }
                     )) { eraserSettingsPopover }
+
+                    customToolbarButton(active: toolState.tool == .lasso, tint: .blue) {
+                        LassoToolIcon(isActive: toolState.tool == .lasso)
+                    } action: {
+                        selectTool(.lasso)
+                    }
 
                     customToolbarButton(active: toolState.tool == .laser, tint: .red) {
                         LaserToolIcon(
@@ -134,7 +160,7 @@ struct NotebookScreen: View {
                         )
                     } action: {
                         if toolState.tool == .laser { activePopover = .laser }
-                        else { toolState.tool = .laser }
+                        else { selectTool(.laser) }
                     }
                     .popover(isPresented: Binding(
                         get: { activePopover == .laser },
@@ -148,15 +174,130 @@ struct NotebookScreen: View {
 
                 // Group 3: Contextual Controls
                 contextualBar
+
+                // Group 4: Page Actions (Add Page, Bookmark, Document Options / Export)
+                HStack(spacing: 4) {
+                    Menu {
+                        ForEach(PaperTemplate.allCases) { tpl in
+                            Button {
+                                controllerBox.vc?.insertBlankPage(after: toolState.currentPage - 1, template: tpl)
+                            } label: {
+                                Label("Add \(tpl.title) Page", systemImage: "doc.badge.plus")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.88))
+                            .frame(width: 34, height: 34)
+                    }
+
+                    toolbarButton(
+                        systemName: toolState.isCurrentPageBookmarked ? "bookmark.fill" : "bookmark",
+                        active: toolState.isCurrentPageBookmarked,
+                        tint: .orange
+                    ) {
+                        controllerBox.vc?.toggleBookmarkForCurrentPage()
+                    }
+
+                    Menu {
+                        Button {
+                            controllerBox.vc?.exportCurrentPagePNG()
+                        } label: {
+                            Label("Share / Export Page as PNG", systemImage: "photo")
+                        }
+                        Button {
+                            controllerBox.vc?.exportAnnotatedPDF()
+                        } label: {
+                            Label("Export Full Annotated PDF", systemImage: "doc.richtext")
+                        }
+                        Divider()
+                        Button {
+                            controllerBox.vc?.duplicatePage(at: toolState.currentPage - 1)
+                        } label: {
+                            Label("Duplicate This Page", systemImage: "doc.on.doc")
+                        }
+                        Button {
+                            controllerBox.vc?.resetZoom()
+                        } label: {
+                            Label("Fit Page to Width", systemImage: "arrow.up.left.and.arrow.down.right")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            controllerBox.vc?.clearCurrentPageStrokes()
+                        } label: {
+                            Label("Clear Page Writing", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.88))
+                            .frame(width: 34, height: 34)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.06))
+                .clipShape(Capsule())
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
         }
         .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: UIScreen.main.bounds.width - 20)
         .background(Color(red: 0.10, green: 0.11, blue: 0.13).opacity(0.95))
         .clipShape(Capsule())
         .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
         .shadow(color: .black.opacity(0.42), radius: 14, y: 6)
+    }
+
+    // Floating Lasso Action Bar (appears whenever strokes are circled)
+    private var lassoActionBar: some View {
+        HStack(spacing: 8) {
+            ForEach(toolState.penColors, id: \.self) { hex in
+                Button {
+                    controllerBox.vc?.lassoRecolor(hex: hex)
+                } label: {
+                    Circle()
+                        .fill(Color(UIColor(hex: hex)))
+                        .frame(width: 20, height: 20)
+                        .overlay(Circle().stroke(Color.white.opacity(0.75), lineWidth: 1.5))
+                }
+            }
+            Divider().frame(height: 18).background(Color.white.opacity(0.22))
+            lassoPillButton("Duplicate") { controllerBox.vc?.lassoDuplicate() }
+            lassoPillButton("Copy") { controllerBox.vc?.lassoCopy() }
+            lassoPillButton("Cut") { controllerBox.vc?.lassoCut() }
+            lassoPillButton("Delete", danger: true) { controllerBox.vc?.lassoDelete() }
+            Button {
+                controllerBox.vc?.clearLassoSelection(commitFirst: true)
+            } label: {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 26, height: 26)
+                    .background(Color.blue)
+                    .clipShape(Circle())
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color(red: 0.10, green: 0.11, blue: 0.14).opacity(0.96))
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 1))
+        .shadow(color: .black.opacity(0.42), radius: 12, y: 5)
+    }
+
+    private func lassoPillButton(_ title: String, danger: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(danger ? Color(red: 1.0, green: 0.30, blue: 0.26) : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(danger ? Color.red.opacity(0.18) : Color.white.opacity(0.10))
+                .clipShape(Capsule())
+        }
     }
 
     @ViewBuilder
@@ -217,7 +358,7 @@ struct NotebookScreen: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 130)
+                .frame(width: 124)
 
                 ForEach(0..<toolState.eraserSizes.count, id: \.self) { idx in
                     sizeDot(size: toolState.eraserSizes[idx] / 6.0, selected: toolState.eraserSizeIndex == idx) {
@@ -229,6 +370,17 @@ struct NotebookScreen: View {
             .padding(.vertical, 4)
             .background(Color.white.opacity(0.08))
             .clipShape(Capsule())
+
+        case .lasso:
+            Text(toolState.hasLassoSelection
+                 ? "\(toolState.lassoSelectedCount) selected · drag, scale, or rotate"
+                 : (toolState.hasLassoClipboard ? "Circle strokes or tap to paste" : "Circle strokes to select"))
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundColor(.white.opacity(0.82))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.08))
+                .clipShape(Capsule())
 
         case .laser:
             HStack(spacing: 7) {
@@ -495,10 +647,8 @@ struct NotebookScreen: View {
     }
 }
 
+// MARK: - Custom Crisp Vector Tool Icons (Chisel Highlighter, Lasso, Laser Pointer)
 
-// MARK: - Custom Crisp Vector Tool Icons (Chisel Highlighter & Laser Pointer)
-
-/// Sleek angled chisel-tip highlighter icon (Goodnotes / Lucide style) with color highlight bar.
 private struct HighlighterToolIcon: View {
     let accentColor: Color
     let isActive: Bool
@@ -509,7 +659,6 @@ private struct HighlighterToolIcon: View {
             let h = size.height
             let strokeColor: Color = isActive ? .white : .white.opacity(0.88)
 
-            // Highlight swipe bar underneath tip
             var bar = Path()
             bar.move(to: CGPoint(x: w * 0.22, y: h * 0.78))
             bar.addLine(to: CGPoint(x: w * 0.76, y: h * 0.78))
@@ -519,7 +668,6 @@ private struct HighlighterToolIcon: View {
                 style: StrokeStyle(lineWidth: 2.6, lineCap: .round)
             )
 
-            // Angled chisel marker barrel
             var barrel = Path()
             barrel.move(to: CGPoint(x: w * 0.56, y: h * 0.22))
             barrel.addLine(to: CGPoint(x: w * 0.77, y: h * 0.43))
@@ -528,7 +676,6 @@ private struct HighlighterToolIcon: View {
             barrel.closeSubpath()
             ctx.stroke(barrel, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.65, lineCap: .round, lineJoin: .round))
 
-            // Chisel tip nib
             var nib = Path()
             nib.move(to: CGPoint(x: w * 0.27, y: h * 0.51))
             nib.addLine(to: CGPoint(x: w * 0.21, y: h * 0.67))
@@ -536,7 +683,6 @@ private struct HighlighterToolIcon: View {
             nib.addLine(to: CGPoint(x: w * 0.48, y: h * 0.72))
             ctx.stroke(nib, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.65, lineCap: .round, lineJoin: .round))
 
-            // Collar accent line
             var band = Path()
             band.move(to: CGPoint(x: w * 0.47, y: h * 0.31))
             band.addLine(to: CGPoint(x: w * 0.68, y: h * 0.52))
@@ -546,7 +692,37 @@ private struct HighlighterToolIcon: View {
     }
 }
 
-/// Crisp presentation laser pointer icon: glowing center beam dot with symmetrical laser rays.
+private struct LassoToolIcon: View {
+    let isActive: Bool
+
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width
+            let h = size.height
+            let strokeColor: Color = isActive ? .white : .white.opacity(0.88)
+
+            // Dashed lasso loop
+            let ovalRect = CGRect(x: w * 0.14, y: h * 0.14, width: w * 0.72, height: h * 0.54)
+            let oval = Path(ellipseIn: ovalRect)
+            ctx.stroke(
+                oval,
+                with: .color(strokeColor),
+                style: StrokeStyle(lineWidth: 1.65, lineCap: .round, dash: [3.2, 2.4])
+            )
+
+            // Knot ring + tail at bottom-left
+            let knot = Path(ellipseIn: CGRect(x: w * 0.22, y: h * 0.60, width: w * 0.16, height: h * 0.16))
+            ctx.stroke(knot, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.5))
+
+            var tail = Path()
+            tail.move(to: CGPoint(x: w * 0.30, y: h * 0.76))
+            tail.addQuadCurve(to: CGPoint(x: w * 0.40, y: h * 0.90), control: CGPoint(x: w * 0.28, y: h * 0.87))
+            ctx.stroke(tail, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+        }
+        .frame(width: 22, height: 22)
+    }
+}
+
 private struct LaserToolIcon: View {
     let laserColor: Color
     let isActive: Bool

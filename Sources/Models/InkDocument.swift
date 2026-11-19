@@ -2,56 +2,195 @@ import Foundation
 import CoreGraphics
 import UIKit
 
-/// Lossless JSON wrapper so unknown Obsidian Pencil Ink fields (blanks, bookmarks, Hobonichi metadata, etc.)
-/// are preserved untouched whenever the iPad app saves `.ink.json`.
-enum AnyCodable: Codable, Equatable {
-    case null
-    case bool(Bool)
-    case int(Int64)
-    case double(Double)
-    case string(String)
-    case array([AnyCodable])
-    case object([String: AnyCodable])
+enum PaperTemplate: String, CaseIterable, Identifiable, Codable {
+    case blank = "blank"
+    case lined = "lined"
+    case grid = "grid"
+    case dot = "dot"
+    case cornell = "cornell"
 
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if container.decodeNil() {
-            self = .null
-        } else if let v = try? container.decode(Bool.self) {
-            self = .bool(v)
-        } else if let v = try? container.decode(Int64.self) {
-            self = .int(v)
-        } else if let v = try? container.decode(Double.self) {
-            self = .double(v)
-        } else if let v = try? container.decode(String.self) {
-            self = .string(v)
-        } else if let v = try? container.decode([AnyCodable].self) {
-            self = .array(v)
-        } else if let v = try? container.decode([String: AnyCodable].self) {
-            self = .object(v)
-        } else {
-            self = .null
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .blank: return "Blank"
+        case .lined: return "Ruled"
+        case .grid: return "Grid"
+        case .dot: return "Dot Grid"
+        case .cornell: return "Cornell"
         }
     }
 
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
+    func draw(in ctx: CGContext, size: CGSize) {
+        let w = size.width
+        let h = size.height
+        ctx.saveGState()
+        UIColor.white.setFill()
+        ctx.fill(CGRect(origin: .zero, size: size))
+
         switch self {
-        case .null:
-            try container.encodeNil()
-        case .bool(let v):
-            try container.encode(v)
-        case .int(let v):
-            try container.encode(v)
-        case .double(let v):
-            try container.encode(v)
-        case .string(let v):
-            try container.encode(v)
-        case .array(let v):
-            try container.encode(v)
-        case .object(let v):
-            try container.encode(v)
+        case .blank:
+            break
+        case .lined:
+            ctx.setStrokeColor(UIColor(red: 0.75, green: 0.85, blue: 0.95, alpha: 1.0).cgColor)
+            ctx.setLineWidth(0.6)
+            var y: CGFloat = 62
+            while y <= h - 46 {
+                ctx.move(to: CGPoint(x: 40, y: y))
+                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+                y += 28
+            }
+            ctx.strokePath()
+
+        case .grid:
+            ctx.setStrokeColor(UIColor(red: 0.85, green: 0.88, blue: 0.92, alpha: 1.0).cgColor)
+            ctx.setLineWidth(0.5)
+            let step: CGFloat = 18.0
+            var x: CGFloat = 40
+            while x <= w - 40 {
+                ctx.move(to: CGPoint(x: x, y: 40))
+                ctx.addLine(to: CGPoint(x: x, y: h - 40))
+                x += step
+            }
+            var y: CGFloat = 40
+            while y <= h - 40 {
+                ctx.move(to: CGPoint(x: 40, y: y))
+                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+                y += step
+            }
+            ctx.strokePath()
+
+        case .dot:
+            ctx.setFillColor(UIColor(red: 0.68, green: 0.70, blue: 0.75, alpha: 1.0).cgColor)
+            let step: CGFloat = 18.0
+            var x: CGFloat = 40
+            while x <= w - 40 {
+                var y: CGFloat = 40
+                while y <= h - 40 {
+                    ctx.fillEllipse(in: CGRect(x: x - 0.85, y: y - 0.85, width: 1.7, height: 1.7))
+                    y += step
+                }
+                x += step
+            }
+
+        case .cornell:
+            ctx.setStrokeColor(UIColor(red: 0.75, green: 0.85, blue: 0.95, alpha: 1.0).cgColor)
+            ctx.setLineWidth(0.6)
+            var y: CGFloat = 108
+            while y <= h - 160 {
+                ctx.move(to: CGPoint(x: 175, y: y))
+                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+                y += 26
+            }
+            ctx.strokePath()
+
+            ctx.setStrokeColor(UIColor(red: 0.92, green: 0.56, blue: 0.56, alpha: 1.0).cgColor)
+            ctx.setLineWidth(0.9)
+            ctx.move(to: CGPoint(x: 40, y: 82))
+            ctx.addLine(to: CGPoint(x: w - 40, y: 82))
+            ctx.move(to: CGPoint(x: 175, y: 82))
+            ctx.addLine(to: CGPoint(x: 175, y: h - 140))
+            ctx.move(to: CGPoint(x: 40, y: h - 140))
+            ctx.addLine(to: CGPoint(x: w - 40, y: h - 140))
+            ctx.strokePath()
         }
+        ctx.restoreGState()
+    }
+}
+
+struct BlankPage: Codable, Equatable, Identifiable {
+    var id: String
+    var anchor: Int
+    var parent: String?
+    var ord: Int
+    var w: Double
+    var h: Double
+    var t: Int64
+    var src: Int?
+    var pattern: String?
+    var kind: String?
+    var monday: String?
+    var ym: String?
+    var title: String?
+    var tag: String?
+    var noteNum: Int?
+    var glossPage: Int?
+
+    init(
+        id: String,
+        anchor: Int,
+        parent: String? = nil,
+        ord: Int = 0,
+        w: Double = 595,
+        h: Double = 842,
+        t: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
+        src: Int? = nil,
+        pattern: String? = nil
+    ) {
+        self.id = id
+        self.anchor = anchor
+        self.parent = parent
+        self.ord = ord
+        self.w = w
+        self.h = h
+        self.t = t
+        self.src = src
+        self.pattern = pattern
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, anchor, parent, ord, w, h, t, src, pattern, kind, monday, ym, title, tag, noteNum, glossPage
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        anchor = (try? c.decode(Int.self, forKey: .anchor)) ?? 0
+        parent = try? c.decode(String.self, forKey: .parent)
+        ord = (try? c.decode(Int.self, forKey: .ord)) ?? 0
+        let rw = (try? c.decode(Double.self, forKey: .w)) ?? 595
+        let rh = (try? c.decode(Double.self, forKey: .h)) ?? 842
+        w = rw > 0 ? rw : 595
+        h = rh > 0 ? rh : 842
+        t = (try? c.decode(Int64.self, forKey: .t)) ?? 0
+        src = try? c.decode(Int.self, forKey: .src)
+        pattern = try? c.decode(String.self, forKey: .pattern)
+        kind = try? c.decode(String.self, forKey: .kind)
+        monday = try? c.decode(String.self, forKey: .monday)
+        ym = try? c.decode(String.self, forKey: .ym)
+        title = try? c.decode(String.self, forKey: .title)
+        tag = try? c.decode(String.self, forKey: .tag)
+        noteNum = try? c.decode(Int.self, forKey: .noteNum)
+        glossPage = try? c.decode(Int.self, forKey: .glossPage)
+    }
+}
+
+struct PageMark: Codable, Equatable {
+    var on: Bool
+    var t: Int64
+    var title: String?
+    var tag: String?
+
+    init(on: Bool, t: Int64 = Int64(Date().timeIntervalSince1970 * 1000), title: String? = nil, tag: String? = nil) {
+        self.on = on
+        self.t = t
+        self.title = title
+        self.tag = tag
+    }
+}
+
+struct PageSlot: Identifiable, Equatable {
+    let index: Int
+    let key: String       // "1" for PDF page 1, or "b:<blankId>" for inserted/duplicated page
+    let pdfN: Int?        // 1-based original PDF page
+    let srcN: Int?        // 1-based duplicated PDF page source
+    let blank: BlankPage?
+    let size: CGSize
+
+    var id: String { key }
+    var isAddedPage: Bool { blank != nil }
+    var effectivePDFPageNumber: Int? { pdfN ?? srcN }
+    var template: PaperTemplate {
+        PaperTemplate(rawValue: blank?.pattern ?? "blank") ?? .blank
     }
 }
 
@@ -109,21 +248,197 @@ struct InkDocument: Codable {
     var pages: [String: [InkStroke]]
     var deleted: [String: Int64]
     var updated: Int64
-    var blanks: [String: AnyCodable]?
-    var bookmarks: [String: AnyCodable]?
-    var removed: [String: AnyCodable]?
+    var blanks: [String: BlankPage]
+    var bookmarks: [String: PageMark]
+    var removed: [String: PageMark]
+
+    enum CodingKeys: String, CodingKey {
+        case version, name, pages, deleted, updated, blanks, bookmarks, removed
+    }
+
+    init(
+        version: Int = 1,
+        name: String = "",
+        pages: [String: [InkStroke]] = [:],
+        deleted: [String: Int64] = [:],
+        updated: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
+        blanks: [String: BlankPage] = [:],
+        bookmarks: [String: PageMark] = [:],
+        removed: [String: PageMark] = [:]
+    ) {
+        self.version = version
+        self.name = name
+        self.pages = pages
+        self.deleted = deleted
+        self.updated = updated
+        self.blanks = blanks
+        self.bookmarks = bookmarks
+        self.removed = removed
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = (try? c.decode(Int.self, forKey: .version)) ?? 1
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        pages = (try? c.decode([String: [InkStroke]].self, forKey: .pages)) ?? [:]
+        deleted = (try? c.decode([String: Int64].self, forKey: .deleted)) ?? [:]
+        updated = (try? c.decode(Int64.self, forKey: .updated)) ?? 0
+        blanks = (try? c.decode([String: BlankPage].self, forKey: .blanks)) ?? [:]
+        bookmarks = (try? c.decode([String: PageMark].self, forKey: .bookmarks)) ?? [:]
+        removed = (try? c.decode([String: PageMark].self, forKey: .removed)) ?? [:]
+    }
+
+    static func blankKey(_ id: String) -> String { "b:" + id }
 
     static func empty(name: String) -> InkDocument {
-        InkDocument(
-            version: 1,
-            name: name,
-            pages: [:],
-            deleted: [:],
-            updated: Int64(Date().timeIntervalSince1970 * 1000),
-            blanks: [:],
-            bookmarks: [:],
-            removed: [:]
-        )
+        InkDocument(name: name)
+    }
+
+    func isBookmarked(_ key: String) -> Bool {
+        bookmarks[key]?.on == true
+    }
+
+    func isRemoved(pdfN: Int) -> Bool {
+        removed[String(pdfN)]?.on == true
+    }
+
+    var removedCount: Int {
+        removed.values.filter { $0.on }.count
+    }
+
+    /// Exact port of Obsidian Pencil Ink's `layoutBlanks` tree-ordering algorithm.
+    mutating func layoutBlanks() {
+        guard !blanks.isEmpty else { return }
+
+        // Ensure legacy blanks without parent get chained under their anchor
+        var legacyGroups: [Int: [BlankPage]] = [:]
+        for b in blanks.values where b.parent == nil {
+            let a = max(0, b.anchor)
+            legacyGroups[a, default: []].append(b)
+        }
+        for (anchor, var grp) in legacyGroups {
+            grp.sort {
+                if $0.ord != $1.ord { return $0.ord < $1.ord }
+                if $0.t != $1.t { return $0.t < $1.t }
+                return $0.id < $1.id
+            }
+            var prev = anchor == 0 ? "0" : String(anchor)
+            for var b in grp {
+                b.anchor = anchor
+                b.parent = prev
+                blanks[b.id] = b
+                prev = InkDocument.blankKey(b.id)
+            }
+        }
+
+        let ids = Set(blanks.keys)
+        let rootOf: (Int) -> String = { $0 <= 0 ? "0" : String($0) }
+        var kids: [String: [BlankPage]] = [:]
+        for b in blanks.values {
+            let par = b.parent ?? rootOf(b.anchor)
+            let orphan = par.hasPrefix("b:") && !ids.contains(String(par.dropFirst(2)))
+            let key = orphan ? rootOf(b.anchor) : par
+            kids[key, default: []].append(b)
+        }
+
+        for key in kids.keys {
+            kids[key]?.sort { x, y in
+                let xHobo = (x.kind ?? "").hasPrefix("hobo-")
+                let yHobo = (y.kind ?? "").hasPrefix("hobo-")
+                if xHobo && yHobo {
+                    return x.t != y.t ? x.t < y.t : x.id < y.id
+                }
+                return x.t != y.t ? x.t > y.t : x.id > y.id
+            }
+        }
+
+        var visited = Set<String>()
+        var roots = Set<String>(["0"])
+        for b in blanks.values { roots.insert(rootOf(b.anchor)) }
+
+        for r in roots {
+            let anchor = (r == "0") ? 0 : (Int(r) ?? 0)
+            var seq = 0
+            var stack: [(list: [BlankPage], idx: Int)] = [(kids[r] ?? [], 0)]
+            while !stack.isEmpty {
+                let topIdx = stack.count - 1
+                if stack[topIdx].idx >= stack[topIdx].list.count {
+                    stack.removeLast()
+                    continue
+                }
+                let b = stack[topIdx].list[stack[topIdx].idx]
+                stack[topIdx].idx += 1
+                if visited.contains(b.id) { continue }
+                visited.insert(b.id)
+                if var stored = blanks[b.id] {
+                    stored.anchor = anchor
+                    stored.ord = seq
+                    blanks[b.id] = stored
+                    seq += 1
+                }
+                if let childList = kids[InkDocument.blankKey(b.id)], !childList.isEmpty {
+                    stack.append((childList, 0))
+                }
+            }
+        }
+    }
+
+    static func placeBlankTree(after slot: PageSlot?) -> (parent: String, anchor: Int, t: Int64) {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        guard let slot = slot else { return ("0", 0, now) }
+        if let blank = slot.blank {
+            return (blankKey(blank.id), blank.anchor, now)
+        }
+        let n = slot.pdfN ?? 0
+        return (n <= 0 ? "0" : String(n), max(0, n), now)
+    }
+
+    /// Builds the ordered list of visible page slots (original non-removed PDF pages + interleaved blank/duplicated pages).
+    mutating func buildPageSlots(pdfPageSizes: [CGSize], defaultSize: CGSize = CGSize(width: 595, height: 842)) -> [PageSlot] {
+        layoutBlanks()
+        let numPages = pdfPageSizes.count
+        var groups: [Int: [BlankPage]] = [:]
+        for b in blanks.values {
+            let a = max(0, min(numPages, b.anchor))
+            groups[a, default: []].append(b)
+        }
+        for k in groups.keys {
+            groups[k]?.sort { $0.ord != $1.ord ? $0.ord < $1.ord : $0.id < $1.id }
+        }
+
+        var out: [PageSlot] = []
+        func appendBlanks(for anchor: Int) {
+            for b in groups[anchor] ?? [] {
+                let sz = CGSize(width: b.w > 0 ? b.w : Double(defaultSize.width), height: b.h > 0 ? b.h : Double(defaultSize.height))
+                out.append(PageSlot(
+                    index: out.count,
+                    key: InkDocument.blankKey(b.id),
+                    pdfN: nil,
+                    srcN: b.src,
+                    blank: b,
+                    size: sz
+                ))
+            }
+        }
+
+        appendBlanks(for: 0)
+        if numPages > 0 {
+            for n in 1...numPages {
+                if !isRemoved(pdfN: n) {
+                    let sz = pdfPageSizes[n - 1]
+                    out.append(PageSlot(
+                        index: out.count,
+                        key: String(n),
+                        pdfN: n,
+                        srcN: nil,
+                        blank: nil,
+                        size: sz
+                    ))
+                }
+                appendBlanks(for: n)
+            }
+        }
+        return out
     }
 
     static func sidecarURL(for pdfURL: URL) -> URL {
