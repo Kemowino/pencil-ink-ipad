@@ -14,6 +14,7 @@ final class VaultManager: ObservableObject {
     @Published var vaultURL: URL?
     @Published var pdfs: [PDFItem] = []
     @Published var statusMessage: String = ""
+    @Published var isUsingLocalFallback: Bool = false
 
     private let bookmarkKey = "pencilink.vault.bookmark.v1"
     private var accessingRoot = false
@@ -33,11 +34,26 @@ final class VaultManager: ObservableObject {
         }
     }
 
+    func useLocalDocumentsFolder() {
+        stopAccessingVault()
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            statusMessage = "Could not locate app Documents folder."
+            return
+        }
+        isUsingLocalFallback = true
+        vaultURL = docs
+        statusMessage = "Using On My iPad → Pencil Ink folder."
+        refreshPDFList()
+    }
+
     func setVaultFolder(_ url: URL) {
         stopAccessingVault()
+        isUsingLocalFallback = false
         let started = url.startAccessingSecurityScopedResource()
         accessingRoot = started
         vaultURL = url
+        statusMessage = started ? "" : "Folder selected (note: iOS did not grant security-scoped access — if running in LiveContainer, enable Fix File Picker or install via SideStore)."
+
         do {
             let bookmark = try url.bookmarkData(
                 options: .minimalBookmark,
@@ -46,7 +62,7 @@ final class VaultManager: ObservableObject {
             )
             UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
         } catch {
-            statusMessage = "Could not save folder permission: \(error.localizedDescription)"
+            statusMessage = "Connected for this session, but bookmark save failed: \(error.localizedDescription)"
         }
         refreshPDFList()
     }
@@ -62,6 +78,7 @@ final class VaultManager: ObservableObject {
                 bookmarkDataIsStale: &stale
             )
             accessingRoot = url.startAccessingSecurityScopedResource()
+            isUsingLocalFallback = false
             vaultURL = url
             if stale {
                 setVaultFolder(url)
@@ -82,7 +99,10 @@ final class VaultManager: ObservableObject {
         let rootPath = root.path
         DispatchQueue.global(qos: .userInitiated).async {
             var found: [PDFItem] = []
-            if let enumerator = fm.enumerator(
+            var scanErr: String?
+            if !fm.isReadableFile(atPath: rootPath) {
+                scanErr = "Cannot read folder \"\(root.lastPathComponent)\". If using LiveContainer, enable 'Fix File Picker' in app settings or install directly in SideStore."
+            } else if let enumerator = fm.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles]
@@ -113,6 +133,9 @@ final class VaultManager: ObservableObject {
             found.sort { $0.modifiedAt > $1.modifiedAt }
             DispatchQueue.main.async {
                 self.pdfs = found
+                if let err = scanErr {
+                    self.statusMessage = err
+                }
             }
         }
     }

@@ -1,10 +1,15 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum ActivePickerMode {
+    case folder
+    case pdf
+}
+
 struct LibraryView: View {
     @EnvironmentObject var vault: VaultManager
-    @State private var showFolderPicker = false
-    @State private var showPDFPicker = false
+    @State private var showImporter = false
+    @State private var pickerMode: ActivePickerMode = .folder
     @State private var searchText = ""
     @State private var openedPDF: URL?
     @State private var standaloneScopedURL: URL?
@@ -17,6 +22,10 @@ struct LibraryView: View {
         return vault.pdfs.filter {
             $0.name.lowercased().contains(q) || $0.relativeFolder.lowercased().contains(q)
         }
+    }
+
+    private var allowedTypes: [UTType] {
+        pickerMode == .folder ? [.folder] : [.pdf]
     }
 
     var body: some View {
@@ -34,17 +43,28 @@ struct LibraryView: View {
                 libraryHome
             }
         }
-        .sheet(isPresented: $showFolderPicker) {
-            DocumentPicker(contentTypes: [.folder]) { url in
-                vault.setVaultFolder(url)
-            }
-        }
-        .sheet(isPresented: $showPDFPicker) {
-            DocumentPicker(contentTypes: [.pdf]) { url in
-                if url.startAccessingSecurityScopedResource() {
-                    standaloneScopedURL = url
+        .fileImporter(
+            isPresented: $showImporter,
+            allowedContentTypes: allowedTypes,
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                DispatchQueue.main.async {
+                    if pickerMode == .folder {
+                        vault.setVaultFolder(url)
+                    } else {
+                        if url.startAccessingSecurityScopedResource() {
+                            standaloneScopedURL = url
+                        }
+                        openedPDF = url
+                    }
                 }
-                openedPDF = url
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    vault.statusMessage = "File picker error: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -52,6 +72,26 @@ struct LibraryView: View {
     private var libraryHome: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if !vault.statusMessage.isEmpty {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundColor(.orange)
+                        Text(vault.statusMessage)
+                            .font(.caption)
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Button {
+                            vault.statusMessage = ""
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.bold())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color.orange.opacity(0.14))
+                }
+
                 if vault.vaultURL == nil {
                     emptyVaultView
                 } else if filteredPDFs.isEmpty {
@@ -65,6 +105,17 @@ struct LibraryView: View {
                         Text(vault.vaultURL?.lastPathComponent ?? "")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                        if vault.isUsingLocalFallback {
+                            Text("Drop PDFs into On My iPad → Pencil Ink in the Files app, then pull down to refresh.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 36)
+                        }
+                        Button("Refresh") {
+                            vault.refreshPDFList()
+                        }
+                        .buttonStyle(.bordered)
                         Spacer()
                     }
                 } else {
@@ -118,12 +169,14 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
-                        showPDFPicker = true
+                        pickerMode = .pdf
+                        showImporter = true
                     } label: {
                         Label("Open PDF", systemImage: "doc.badge.plus")
                     }
                     Button {
-                        showFolderPicker = true
+                        pickerMode = .folder
+                        showImporter = true
                     } label: {
                         Label("Vault Folder", systemImage: "folder.badge.gearshape")
                     }
@@ -133,7 +186,7 @@ struct LibraryView: View {
     }
 
     private var emptyVaultView: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 16) {
             Spacer()
             Image(systemName: "books.vertical.fill")
                 .font(.system(size: 56))
@@ -146,48 +199,27 @@ struct LibraryView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 36)
             Button {
-                showFolderPicker = true
+                pickerMode = .folder
+                showImporter = true
             } label: {
                 Text("Choose Vault Folder")
                     .font(.headline)
                     .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
             Button("Or Open a Single PDF") {
-                showPDFPicker = true
+                pickerMode = .pdf
+                showImporter = true
             }
             .font(.subheadline)
+            Button("Use Local App Folder (On My iPad → Pencil Ink)") {
+                vault.useLocalDocumentsFolder()
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
             .padding(.top, 4)
             Spacer()
-        }
-    }
-}
-
-struct DocumentPicker: UIViewControllerRepresentable {
-    let contentTypes: [UTType]
-    let onPick: (URL) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
-    }
-
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: (URL) -> Void
-        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first {
-                onPick(url)
-            }
         }
     }
 }

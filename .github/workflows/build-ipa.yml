@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-ipa:
     runs-on: macos-latest
@@ -40,9 +43,24 @@ jobs:
           zip -r -9 PencilInkNative.ipa Payload
           ls -lh PencilInkNative.ipa
 
-      - name: Upload .ipa artifact
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: PencilInkNative-IPA
           path: PencilInkNative.ipa
           retention-days: 30
+
+      - name: Publish IPA to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          TAG="v${VER:-0.1.1}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" PencilInkNative.ipa --clobber
+          else
+            gh release create "$TAG" PencilInkNative.ipa \
+              --title "Pencil Ink Native $TAG" \
+              --notes "Automated iPadOS build ($TAG). Tap PencilInkNative.ipa below to download directly on your iPad." \
+              --latest
+          fi

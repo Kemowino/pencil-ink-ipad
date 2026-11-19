@@ -130,8 +130,18 @@ struct InkDocument: Codable {
 
     static func load(for pdfURL: URL) -> InkDocument {
         let url = sidecarURL(for: pdfURL)
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
+        var loadedData: Data?
+        var coordError: NSError?
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { coordURL in
+            if FileManager.default.fileExists(atPath: coordURL.path) {
+                loadedData = try? Data(contentsOf: coordURL)
+            }
+        }
+        if loadedData == nil, FileManager.default.fileExists(atPath: url.path) {
+            loadedData = try? Data(contentsOf: url)
+        }
+        guard let data = loadedData,
               let decoded = try? JSONDecoder().decode(InkDocument.self, from: data) else {
             return .empty(name: pdfURL.lastPathComponent)
         }
@@ -144,7 +154,19 @@ struct InkDocument: Codable {
         let encoder = JSONEncoder()
         let data = try encoder.encode(copy)
         let url = InkDocument.sidecarURL(for: pdfURL)
-        try data.write(to: url, options: .atomic)
+        var coordError: NSError?
+        var writeError: Error?
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordError) { coordURL in
+            do {
+                try data.write(to: coordURL, options: .atomic)
+            } catch {
+                writeError = error
+            }
+        }
+        if let err = writeError ?? coordError {
+            throw err
+        }
     }
 }
 
