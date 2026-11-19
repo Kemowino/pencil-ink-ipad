@@ -240,6 +240,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     private let renderQueue = DispatchQueue(label: "com.pencilink.pdfrender", qos: .userInitiated)
     private var renderingKeys = Set<String>()
+    private var layoutGeneration: Int = 0
+    private var isRebuildingPages: Bool = false
     private var baseFitScale: CGFloat = 1.0
     private var didInitialLayout = false
     private var lastLayoutWidth: CGFloat = 0
@@ -481,10 +483,30 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func rebuildPageViews(focusKey: String?) {
-        let prevZoom = scrollView.zoomScale
+        let wasLaidOut = didInitialLayout
+        let prevZoom = wasLaidOut ? scrollView.zoomScale : 1.0
         let keepKey = focusKey ?? pageSlots[safe: toolState.currentPage - 1]?.key
 
+        // Snapshot existing rendered PDF bitmaps so unchanged pages never flash blank!
+        var preservedBitmaps: [String: (image: UIImage, zoom: CGFloat)] = [:]
+        for pv in pageViews {
+            if !pv.isTemplateOnly, pv.isRendered, let img = pv.renderedImage {
+                preservedBitmaps[pv.pageKey] = (img, pv.renderedZoomScale)
+            }
+        }
+
+        isRebuildingPages = true
+        layoutGeneration += 1
         renderingKeys.removeAll()
+
+        // Reset UIScrollView zoom cleanly to 1.0 BEFORE resizing documentContainer so UIKit
+        // guarantees documentContainer.frame.origin == (0, 0) and contentSize stays 100% in sync!
+        if wasLaidOut && abs(scrollView.zoomScale - 1.0) > 0.0001 {
+            scrollView.minimumZoomScale = min(scrollView.minimumZoomScale, 1.0)
+            scrollView.maximumZoomScale = max(scrollView.maximumZoomScale, 1.0)
+            scrollView.setZoomScale(1.0, animated: false)
+        }
+
         for pv in pageViews { pv.removeFromSuperview() }
         pageViews.removeAll()
         pageFrames.removeAll()
@@ -511,6 +533,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
                 pv.setStrokes(strokes)
             }
+            if let cached = preservedBitmaps[slot.key] {
+                pv.applyRenderedImage(cached.image, zoomScale: cached.zoom)
+            } else if pv.isTemplateOnly {
+                pv.refreshVectorScale(for: prevZoom)
+            }
             documentContainer.addSubview(pv)
             pageViews.append(pv)
             pageFrames.append(frame)
@@ -518,22 +545,26 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
 
         let totalH = max(200, y - gap + bottomPad)
-        let savedTransform = documentContainer.transform
         documentContainer.transform = .identity
         documentContainer.frame = CGRect(x: 0, y: 0, width: containerW, height: totalH)
-        documentContainer.transform = savedTransform
-        if didInitialLayout && prevZoom > 0.1 {
-            scrollView.contentSize = CGSize(width: containerW * prevZoom, height: totalH * prevZoom)
+        scrollView.contentSize = CGSize(width: containerW, height: totalH)
+
+        if wasLaidOut && view.bounds.width > 0 {
+            let fit = view.bounds.width / max(1, containerW)
+            baseFitScale = fit
+            scrollView.minimumZoomScale = fit * 0.6
+            scrollView.maximumZoomScale = fit * 6.0
+            let clampedZoom = max(scrollView.minimumZoomScale, min(scrollView.maximumZoomScale, prevZoom))
+            scrollView.setZoomScale(clampedZoom, animated: false)
             centerContentIfNeeded()
-        } else {
-            scrollView.contentSize = documentContainer.frame.size
         }
 
+        isRebuildingPages = false
         syncDocumentMetadataToUI()
 
-        if didInitialLayout {
+        if wasLaidOut {
             if let fk = keepKey, let targetIdx = pageSlots.firstIndex(where: { $0.key == fk }) {
-                jumpToPage(targetIdx + 1, animated: focusKey != nil)
+                jumpToPage(targetIdx + 1, animated: false)
             } else {
                 updateCurrentPageLabel()
                 updateVisiblePages(forceSharp: true)
@@ -581,15 +612,18 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        guard !isRebuildingPages else { return }
         centerContentIfNeeded()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard !isRebuildingPages else { return }
         updateCurrentPageLabel()
         updateVisiblePages(forceSharp: false)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        guard !isRebuildingPages else { return }
         centerContentIfNeeded()
         updateVisiblePages(forceSharp: true)
         if let sel = lassoSelection, let pv = pageView(forKey: sel.pageKey) {
@@ -598,6 +632,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard !isRebuildingPages else { return }
+        updateVisiblePages(forceSharp: true)
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        guard !isRebuildingPages else { return }
+        updateCurrentPageLabel()
         updateVisiblePages(forceSharp: true)
     }
 
@@ -621,7 +662,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func updateVisiblePages(forceSharp: Bool) {
-        guard !pageViews.isEmpty else { return }
+        guard !isRebuildingPages, !pageViews.isEmpty else { return }
         let zoom = max(0.1, scrollView.zoomScale)
         let visibleInDoc = CGRect(
             x: scrollView.contentOffset.x / zoom,
@@ -632,9 +673,16 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let renderZone = visibleInDoc.insetBy(dx: 0, dy: -visibleInDoc.height * 1.2)
         let keepZone = visibleInDoc.insetBy(dx: 0, dy: -visibleInDoc.height * 3.0)
         let doc = pdfDoc
+        let gen = layoutGeneration
 
         for (idx, pv) in pageViews.enumerated() {
             let f = pageFrames[idx]
+            if pv.isTemplateOnly {
+                if f.intersects(renderZone) {
+                    pv.refreshVectorScale(for: zoom)
+                }
+                continue
+            }
             if !f.intersects(keepZone) {
                 if pv.isRendered && pv !== activePageView {
                     pv.evictBitmap()
@@ -648,11 +696,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             let slot = pv.slot
             let targetZoom = zoom
             renderQueue.async { [weak self, weak pv] in
-                guard let self, let pv else { return }
                 let img = PageCanvasView.renderSlotBackground(slot: slot, pdfDoc: doc, zoomScale: targetZoom)
                 DispatchQueue.main.async {
+                    guard let self, self.layoutGeneration == gen else { return }
                     self.renderingKeys.remove(slot.key)
-                    pv.applyRenderedImage(img, zoomScale: targetZoom)
+                    pv?.applyRenderedImage(img, zoomScale: targetZoom)
                 }
             }
         }

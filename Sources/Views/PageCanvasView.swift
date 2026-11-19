@@ -14,25 +14,38 @@ final class PageCanvasView: UIView {
     var pageKey: String { slot.key }
     var pageSize: CGSize { slot.size }
 
+    private let templateView: TemplatePaperView?
     private let pdfImageView = UIImageView()
     private let staticInkView = StaticInkView()
     private let liveOverlayView = LiveInkOverlayView()
 
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
+    var isTemplateOnly: Bool { slot.effectivePDFPageNumber == nil }
+    var renderedImage: UIImage? { pdfImageView.image }
 
     init(slot: PageSlot) {
         self.slot = slot
+        let tplView: TemplatePaperView? = (slot.effectivePDFPageNumber == nil) ? TemplatePaperView(template: slot.template) : nil
+        self.templateView = tplView
         super.init(frame: CGRect(origin: .zero, size: slot.size))
         backgroundColor = .white
         layer.cornerRadius = 3
         layer.masksToBounds = true
         isUserInteractionEnabled = false
 
-        pdfImageView.frame = bounds
-        pdfImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        pdfImageView.contentMode = .scaleToFill
-        addSubview(pdfImageView)
+        if let tv = tplView {
+            tv.frame = bounds
+            tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(tv)
+            isRendered = true
+            renderedZoomScale = 1.0
+        } else {
+            pdfImageView.frame = bounds
+            pdfImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            pdfImageView.contentMode = .scaleToFill
+            addSubview(pdfImageView)
+        }
 
         staticInkView.frame = bounds
         staticInkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -124,18 +137,33 @@ final class PageCanvasView: UIView {
     }
 
     func applyRenderedImage(_ image: UIImage, zoomScale: CGFloat) {
-        pdfImageView.image = image
+        if !isTemplateOnly {
+            pdfImageView.image = image
+        }
         renderedZoomScale = zoomScale
         isRendered = true
+        refreshVectorScale(for: zoomScale)
+    }
+
+    func refreshVectorScale(for zoomScale: CGFloat) {
         let targetScale = min(UIScreen.main.scale * max(1.0, zoomScale), 3.0)
         if abs(staticInkView.contentScaleFactor - targetScale) > 0.25 {
             staticInkView.contentScaleFactor = targetScale
             staticInkView.setNeedsDisplay()
             liveOverlayView.contentScaleFactor = min(UIScreen.main.scale * max(1.0, zoomScale), 2.5)
         }
+        if let tv = templateView, abs(tv.contentScaleFactor - targetScale) > 0.25 {
+            tv.contentScaleFactor = targetScale
+            tv.setNeedsDisplay()
+        }
+        if isTemplateOnly {
+            renderedZoomScale = zoomScale
+            isRendered = true
+        }
     }
 
     func evictBitmap() {
+        guard !isTemplateOnly else { return }
         pdfImageView.image = nil
         renderedZoomScale = 0
         isRendered = false
@@ -395,5 +423,27 @@ private final class LiveInkOverlayView: UIView {
             }
             ctx.restoreGState()
         }
+    }
+}
+
+
+private final class TemplatePaperView: UIView {
+    let template: PaperTemplate
+
+    init(template: PaperTemplate) {
+        self.template = template
+        super.init(frame: .zero)
+        isOpaque = true
+        backgroundColor = .white
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        template.draw(in: ctx, size: bounds.size)
     }
 }

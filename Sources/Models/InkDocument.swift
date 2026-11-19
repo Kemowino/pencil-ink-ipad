@@ -24,73 +24,81 @@ enum PaperTemplate: String, CaseIterable, Identifiable, Codable {
         let w = size.width
         let h = size.height
         ctx.saveGState()
-        UIColor.white.setFill()
+        ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
         ctx.fill(CGRect(origin: .zero, size: size))
 
         switch self {
         case .blank:
             break
+
         case .lined:
-            ctx.setStrokeColor(UIColor(red: 0.75, green: 0.85, blue: 0.95, alpha: 1.0).cgColor)
-            ctx.setLineWidth(0.6)
-            var y: CGFloat = 62
-            while y <= h - 46 {
-                ctx.move(to: CGPoint(x: 40, y: y))
-                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+            ctx.setStrokeColor(red: 0.65, green: 0.78, blue: 0.92, alpha: 1.0)
+            ctx.setLineWidth(0.8)
+            var y: CGFloat = 68
+            while y <= h - 42 {
+                ctx.move(to: CGPoint(x: 36, y: y))
+                ctx.addLine(to: CGPoint(x: w - 36, y: y))
                 y += 28
             }
             ctx.strokePath()
+            // Subtle vertical margin rule
+            ctx.setStrokeColor(red: 0.94, green: 0.66, blue: 0.66, alpha: 0.75)
+            ctx.setLineWidth(0.9)
+            ctx.move(to: CGPoint(x: 78, y: 36))
+            ctx.addLine(to: CGPoint(x: 78, y: h - 36))
+            ctx.strokePath()
 
         case .grid:
-            ctx.setStrokeColor(UIColor(red: 0.85, green: 0.88, blue: 0.92, alpha: 1.0).cgColor)
-            ctx.setLineWidth(0.5)
+            ctx.setStrokeColor(red: 0.78, green: 0.82, blue: 0.88, alpha: 1.0)
+            ctx.setLineWidth(0.65)
             let step: CGFloat = 18.0
-            var x: CGFloat = 40
-            while x <= w - 40 {
-                ctx.move(to: CGPoint(x: x, y: 40))
-                ctx.addLine(to: CGPoint(x: x, y: h - 40))
+            var x: CGFloat = 36
+            while x <= w - 36 {
+                ctx.move(to: CGPoint(x: x, y: 36))
+                ctx.addLine(to: CGPoint(x: x, y: h - 36))
                 x += step
             }
-            var y: CGFloat = 40
-            while y <= h - 40 {
-                ctx.move(to: CGPoint(x: 40, y: y))
-                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+            var y: CGFloat = 36
+            while y <= h - 36 {
+                ctx.move(to: CGPoint(x: 36, y: y))
+                ctx.addLine(to: CGPoint(x: w - 36, y: y))
                 y += step
             }
             ctx.strokePath()
 
         case .dot:
-            ctx.setFillColor(UIColor(red: 0.68, green: 0.70, blue: 0.75, alpha: 1.0).cgColor)
+            ctx.setFillColor(red: 0.54, green: 0.58, blue: 0.65, alpha: 1.0)
             let step: CGFloat = 18.0
-            var x: CGFloat = 40
-            while x <= w - 40 {
-                var y: CGFloat = 40
-                while y <= h - 40 {
-                    ctx.fillEllipse(in: CGRect(x: x - 0.85, y: y - 0.85, width: 1.7, height: 1.7))
+            let r: CGFloat = 1.25
+            var x: CGFloat = 36
+            while x <= w - 36 {
+                var y: CGFloat = 36
+                while y <= h - 36 {
+                    ctx.fillEllipse(in: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2))
                     y += step
                 }
                 x += step
             }
 
         case .cornell:
-            ctx.setStrokeColor(UIColor(red: 0.75, green: 0.85, blue: 0.95, alpha: 1.0).cgColor)
-            ctx.setLineWidth(0.6)
-            var y: CGFloat = 108
-            while y <= h - 160 {
+            ctx.setStrokeColor(red: 0.65, green: 0.78, blue: 0.92, alpha: 1.0)
+            ctx.setLineWidth(0.75)
+            var y: CGFloat = 112
+            while y <= h - 155 {
                 ctx.move(to: CGPoint(x: 175, y: y))
-                ctx.addLine(to: CGPoint(x: w - 40, y: y))
+                ctx.addLine(to: CGPoint(x: w - 36, y: y))
                 y += 26
             }
             ctx.strokePath()
 
-            ctx.setStrokeColor(UIColor(red: 0.92, green: 0.56, blue: 0.56, alpha: 1.0).cgColor)
-            ctx.setLineWidth(0.9)
-            ctx.move(to: CGPoint(x: 40, y: 82))
-            ctx.addLine(to: CGPoint(x: w - 40, y: 82))
-            ctx.move(to: CGPoint(x: 175, y: 82))
+            ctx.setStrokeColor(red: 0.89, green: 0.48, blue: 0.48, alpha: 1.0)
+            ctx.setLineWidth(1.1)
+            ctx.move(to: CGPoint(x: 36, y: 84))
+            ctx.addLine(to: CGPoint(x: w - 36, y: 84))
+            ctx.move(to: CGPoint(x: 175, y: 84))
             ctx.addLine(to: CGPoint(x: 175, y: h - 140))
-            ctx.move(to: CGPoint(x: 40, y: h - 140))
-            ctx.addLine(to: CGPoint(x: w - 40, y: h - 140))
+            ctx.move(to: CGPoint(x: 36, y: h - 140))
+            ctx.addLine(to: CGPoint(x: w - 36, y: h - 140))
             ctx.strokePath()
         }
         ctx.restoreGState()
