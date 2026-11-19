@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-struct DriveFileMeta: Codable {
+struct DriveFileMeta: Codable, Sendable {
     let id: String
     let name: String
     let mimeType: String?
@@ -12,7 +12,7 @@ struct DriveFileMeta: Codable {
     let trashed: Bool?
 }
 
-struct DriveConfig: Codable {
+struct DriveConfig: Codable, Sendable {
     var clientId: String = ""
     var clientSecret: String = ""
     var accessToken: String = ""

@@ -12,6 +12,12 @@ private enum LibraryTab: String, CaseIterable {
     case journals = "Journals"
 }
 
+private struct BreadcrumbItem: Identifiable {
+    let name: String
+    let path: String
+    var id: String { path }
+}
+
 struct LibraryView: View {
     @EnvironmentObject var vault: VaultManager
     @EnvironmentObject var syncManager: DriveSyncManager
@@ -71,13 +77,13 @@ struct LibraryView: View {
         }
     }
 
-    private var breadcrumbParts: [(name: String, path: String)] {
+    private var breadcrumbParts: [BreadcrumbItem] {
         if currentFolder.isEmpty { return [] }
         let parts = currentFolder.split(separator: "/").map(String.init)
         var acc = ""
         return parts.map { seg in
             acc = acc.isEmpty ? seg : "\(acc)/\(seg)"
-            return (seg, acc)
+            return BreadcrumbItem(name: seg, path: acc)
         }
     }
 
@@ -215,7 +221,7 @@ struct LibraryView: View {
                                     Button("Documents") { currentFolder = "" }
                                         .font(.subheadline.weight(.semibold))
                                         .foregroundColor(.blue)
-                                    ForEach(breadcrumbParts, id: \.path) { crumb in
+                                    ForEach(breadcrumbParts) { crumb in
                                         Image(systemName: "chevron.right")
                                             .font(.caption2)
                                             .foregroundColor(.secondary)

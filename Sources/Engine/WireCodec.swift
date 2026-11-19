@@ -320,7 +320,7 @@ enum WireCodec {
 
     private static func streamInflateRawDeflate(_ payload: Data) throws -> Data {
         var output = Data()
-        let filter = try OutputFilter(.decompress, using: .zlib) { chunk in
+        let filter = try OutputFilter(.decompress, using: .zlib) { (chunk: Data?) in
             if let chunk = chunk { output.append(chunk) }
         }
         let pageSize = 32_768

@@ -977,7 +977,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             if let n = b.noteNum, n > maxNum { maxNum = n }
         }
         let nextNum = maxNum + 1
-        let id = "hn-\(nextNum)-\(Int(Date().timeIntervalSince1970 % 10000))"
+        let id = "hn-\(nextNum)-\(Int(Date().timeIntervalSince1970) % 10000)"
         var b = BlankPage(
             id: id,
             anchor: 2,

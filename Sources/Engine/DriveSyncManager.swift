@@ -15,7 +15,7 @@ struct BookSyncSnapshot: Codable {
     var removed: [String: PageMark] = [:]
 }
 
-struct RemoteLogEntry: Codable {
+struct RemoteLogEntry: Codable, Sendable {
     var key: String?
     var strokes: [InkStroke]?
     var blanks: [BlankPage]?

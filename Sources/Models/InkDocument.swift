@@ -105,7 +105,7 @@ enum PaperTemplate: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-struct BlankPage: Codable, Equatable, Identifiable {
+struct BlankPage: Codable, Equatable, Identifiable, Sendable {
     var id: String
     var anchor: Int
     var parent: String?
@@ -172,7 +172,7 @@ struct BlankPage: Codable, Equatable, Identifiable {
     }
 }
 
-struct PageMark: Codable, Equatable {
+struct PageMark: Codable, Equatable, Sendable {
     var on: Bool
     var t: Int64
     var title: String?
@@ -233,7 +233,7 @@ struct InkPoint: Equatable {
     var t: Double
 }
 
-struct InkStroke: Codable, Identifiable, Equatable {
+struct InkStroke: Codable, Identifiable, Equatable, Sendable {
     var id: String
     var t: Int64
     var tool: String          // "pen" | "highlighter"
