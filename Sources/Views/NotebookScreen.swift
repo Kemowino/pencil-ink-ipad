@@ -104,7 +104,12 @@ struct NotebookScreen: View {
                         set: { if !$0 { activePopover = nil } }
                     )) { penSettingsPopover }
 
-                    toolbarButton(systemName: "highlighter", active: toolState.tool == .highlighter) {
+                    customToolbarButton(active: toolState.tool == .highlighter, tint: .blue) {
+                        HighlighterToolIcon(
+                            accentColor: Color(UIColor(hex: toolState.activeHlColorHex)),
+                            isActive: toolState.tool == .highlighter
+                        )
+                    } action: {
                         if toolState.tool == .highlighter { activePopover = .highlighter }
                         else { toolState.tool = .highlighter }
                     }
@@ -122,7 +127,12 @@ struct NotebookScreen: View {
                         set: { if !$0 { activePopover = nil } }
                     )) { eraserSettingsPopover }
 
-                    toolbarButton(systemName: "sparkles", active: toolState.tool == .laser, tint: .red) {
+                    customToolbarButton(active: toolState.tool == .laser, tint: .red) {
+                        LaserToolIcon(
+                            laserColor: Color(UIColor(hex: toolState.laserColorHex)),
+                            isActive: toolState.tool == .laser
+                        )
+                    } action: {
                         if toolState.tool == .laser { activePopover = .laser }
                         else { toolState.tool = .laser }
                     }
@@ -130,15 +140,6 @@ struct NotebookScreen: View {
                         get: { activePopover == .laser },
                         set: { if !$0 { activePopover = nil } }
                     )) { laserSettingsPopover }
-
-                    toolbarButton(
-                        systemName: toolState.twoFingerScrollLock ? "lock.fill" : "hand.draw",
-                        active: toolState.twoFingerScrollLock,
-                        tint: .orange
-                    ) {
-                        toolState.twoFingerScrollLock.toggle()
-                        toolState.showToast(toolState.twoFingerScrollLock ? "2-Finger Scroll Lock ON" : "1-Finger Scroll ON")
-                    }
                 }
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
@@ -464,6 +465,20 @@ struct NotebookScreen: View {
         }
     }
 
+    private func customToolbarButton<Content: View>(
+        active: Bool,
+        tint: Color = .blue,
+        @ViewBuilder icon: () -> Content,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            icon()
+                .frame(width: 34, height: 34)
+                .background(active ? tint : Color.clear)
+                .clipShape(Circle())
+        }
+    }
+
     private func sizeDot(size: Double, selected: Bool, action: @escaping () -> Void) -> some View {
         let dotDiameter = max(4, min(14, size * 2.3))
         return Button(action: action) {
@@ -477,5 +492,98 @@ struct NotebookScreen: View {
                     .frame(width: dotDiameter, height: dotDiameter)
             }
         }
+    }
+}
+
+
+// MARK: - Custom Crisp Vector Tool Icons (Chisel Highlighter & Laser Pointer)
+
+/// Sleek angled chisel-tip highlighter icon (Goodnotes / Lucide style) with color highlight bar.
+private struct HighlighterToolIcon: View {
+    let accentColor: Color
+    let isActive: Bool
+
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width
+            let h = size.height
+            let strokeColor: Color = isActive ? .white : .white.opacity(0.88)
+
+            // Highlight swipe bar underneath tip
+            var bar = Path()
+            bar.move(to: CGPoint(x: w * 0.22, y: h * 0.78))
+            bar.addLine(to: CGPoint(x: w * 0.76, y: h * 0.78))
+            ctx.stroke(
+                bar,
+                with: .color(isActive ? Color.white.opacity(0.65) : accentColor.opacity(0.85)),
+                style: StrokeStyle(lineWidth: 2.6, lineCap: .round)
+            )
+
+            // Angled chisel marker barrel
+            var barrel = Path()
+            barrel.move(to: CGPoint(x: w * 0.56, y: h * 0.22))
+            barrel.addLine(to: CGPoint(x: w * 0.77, y: h * 0.43))
+            barrel.addLine(to: CGPoint(x: w * 0.48, y: h * 0.72))
+            barrel.addLine(to: CGPoint(x: w * 0.27, y: h * 0.51))
+            barrel.closeSubpath()
+            ctx.stroke(barrel, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.65, lineCap: .round, lineJoin: .round))
+
+            // Chisel tip nib
+            var nib = Path()
+            nib.move(to: CGPoint(x: w * 0.27, y: h * 0.51))
+            nib.addLine(to: CGPoint(x: w * 0.21, y: h * 0.67))
+            nib.addLine(to: CGPoint(x: w * 0.34, y: h * 0.72))
+            nib.addLine(to: CGPoint(x: w * 0.48, y: h * 0.72))
+            ctx.stroke(nib, with: .color(strokeColor), style: StrokeStyle(lineWidth: 1.65, lineCap: .round, lineJoin: .round))
+
+            // Collar accent line
+            var band = Path()
+            band.move(to: CGPoint(x: w * 0.47, y: h * 0.31))
+            band.addLine(to: CGPoint(x: w * 0.68, y: h * 0.52))
+            ctx.stroke(band, with: .color(strokeColor.opacity(0.7)), style: StrokeStyle(lineWidth: 1.3, lineCap: .round))
+        }
+        .frame(width: 22, height: 22)
+    }
+}
+
+/// Crisp presentation laser pointer icon: glowing center beam dot with symmetrical laser rays.
+private struct LaserToolIcon: View {
+    let laserColor: Color
+    let isActive: Bool
+
+    var body: some View {
+        Canvas { ctx, size in
+            let cx = size.width * 0.5
+            let cy = size.height * 0.5
+            let rayColor: Color = isActive ? .white : .white.opacity(0.86)
+            let dotColor: Color = isActive ? .white : laserColor
+
+            let angles: [CGFloat] = [0, 45, 90, 135, 180, 225, 270, 315]
+            for deg in angles {
+                let rad = deg * .pi / 180.0
+                let isCardinal = Int(deg) % 90 == 0
+                let rIn: CGFloat = isCardinal ? 5.2 : 5.4
+                let rOut: CGFloat = isCardinal ? 8.6 : 7.8
+                var ray = Path()
+                ray.move(to: CGPoint(x: cx + cos(rad) * rIn, y: cy + sin(rad) * rIn))
+                ray.addLine(to: CGPoint(x: cx + cos(rad) * rOut, y: cy + sin(rad) * rOut))
+                ctx.stroke(
+                    ray,
+                    with: .color(rayColor.opacity(isCardinal ? 0.95 : 0.72)),
+                    style: StrokeStyle(lineWidth: isCardinal ? 1.65 : 1.4, lineCap: .round)
+                )
+            }
+
+            if !isActive {
+                let haloR: CGFloat = 4.2
+                let halo = Path(ellipseIn: CGRect(x: cx - haloR, y: cy - haloR, width: haloR * 2, height: haloR * 2))
+                ctx.fill(halo, with: .color(laserColor.opacity(0.32)))
+            }
+
+            let coreR: CGFloat = 2.8
+            let core = Path(ellipseIn: CGRect(x: cx - coreR, y: cy - coreR, width: coreR * 2, height: coreR * 2))
+            ctx.fill(core, with: .color(dotColor))
+        }
+        .frame(width: 22, height: 22)
     }
 }

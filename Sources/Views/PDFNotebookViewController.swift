@@ -61,7 +61,6 @@ final class NotebookToolState: ObservableObject {
     @Published var laserTrail: Bool = true { didSet { persist() } }
     let laserColors: [String] = ["#ff3b30", "#0a84ff", "#30d158", "#ff9f0a"]
 
-    @Published var twoFingerScrollLock: Bool = false { didSet { persist() } }
     @Published var canUndo: Bool = false
     @Published var canRedo: Bool = false
     @Published var currentPage: Int = 1
@@ -124,7 +123,7 @@ final class NotebookToolState: ObservableObject {
         var eraseHlOnly: Bool
         var laserColorHex: String
         var laserTrail: Bool
-        var twoFingerScrollLock: Bool
+        var twoFingerScrollLock: Bool?
     }
 
     private func loadPrefs() {
@@ -150,7 +149,6 @@ final class NotebookToolState: ObservableObject {
         eraseHlOnly = p.eraseHlOnly
         laserColorHex = p.laserColorHex
         laserTrail = p.laserTrail
-        twoFingerScrollLock = p.twoFingerScrollLock
     }
 
     private func persist() {
@@ -174,7 +172,7 @@ final class NotebookToolState: ObservableObject {
             eraseHlOnly: eraseHlOnly,
             laserColorHex: laserColorHex,
             laserTrail: laserTrail,
-            twoFingerScrollLock: twoFingerScrollLock
+            twoFingerScrollLock: false
         )
         if let data = try? JSONEncoder().encode(p) {
             UserDefaults.standard.set(data, forKey: prefsKey)
@@ -194,6 +192,21 @@ private final class DisplayLinkProxy: NSObject {
     @objc func tick() { owner?.onLaserTick() }
 }
 
+/// Custom UIScrollView that keeps `isScrollEnabled = true` permanently and cleanly
+/// ignores finger pan/pinch ONLY while the stylus tip is actively writing.
+private final class InkScrollView: UIScrollView {
+    var isPencilWriting: (() -> Bool)?
+
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        if gestureRecognizer === panGestureRecognizer || gestureRecognizer === pinchGestureRecognizer {
+            if isPencilWriting?() == true {
+                return false
+            }
+        }
+        return super.gestureRecognizerShouldBegin(gestureRecognizer)
+    }
+}
+
 final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     let pdfURL: URL
     let toolState: NotebookToolState
@@ -203,7 +216,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var pageViews: [PageCanvasView] = []
     private var pageFrames: [CGRect] = []
 
-    private let scrollView = UIScrollView()
+    private let scrollView = InkScrollView()
     private let documentContainer = UIView()
     private let pencilRecognizer = PencilDrawingGestureRecognizer()
 
@@ -305,29 +318,43 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func setupScrollView() {
-        scrollView.frame = view.bounds
-        scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.backgroundColor = .clear
         scrollView.delegate = self
+        scrollView.isScrollEnabled = true
+        scrollView.alwaysBounceVertical = true
         scrollView.minimumZoomScale = 0.5
         scrollView.maximumZoomScale = 6.0
         scrollView.bouncesZoom = true
         scrollView.delaysContentTouches = false
-        scrollView.canCancelContentTouches = false
+        scrollView.canCancelContentTouches = true
         scrollView.contentInsetAdjustmentBehavior = .never
-        // NATIVE UIKIT HARDWARE SPLIT:
-        // Fingers (.direct) scroll & pinch natively with Apple's capacitive palm rejection.
-        // Pencil (.pencil) NEVER triggers scrolling!
+        scrollView.isPencilWriting = { [weak self] in
+            guard let self else { return false }
+            return self.activePageView != nil || self.laserDown
+        }
+
+        // NATIVE UIKIT 1-FINGER SCROLL + 2-FINGER PINCH-ZOOM (Fingers ONLY; Pencil NEVER scrolls!)
         scrollView.panGestureRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        scrollView.panGestureRecognizer.minimumNumberOfTouches = 1
+        scrollView.panGestureRecognizer.maximumNumberOfTouches = 1
         scrollView.pinchGestureRecognizer?.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        applyScrollLockSetting()
         view.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
 
         documentContainer.backgroundColor = .clear
         documentContainer.isMultipleTouchEnabled = true
         scrollView.addSubview(documentContainer)
 
+        // Attach hardware Pencil recognizer to scrollView (Apple Drawing App pattern)
         pencilRecognizer.pencilOnly = true
+        pencilRecognizer.delegate = self
         pencilRecognizer.onPencilBegan = { [weak self] touch, event in
             self?.handlePencilBegan(touch, event: event)
         }
@@ -340,7 +367,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         pencilRecognizer.onPencilCancelled = { [weak self] touch, event in
             self?.handlePencilEnded(touch, event: event)
         }
-        documentContainer.addGestureRecognizer(pencilRecognizer)
+        pencilRecognizer.onPencilReset = { [weak self] in
+            self?.handlePencilResetFallback()
+        }
+        scrollView.addGestureRecognizer(pencilRecognizer)
     }
 
     private func setupTapUndoGestures() {
@@ -349,6 +379,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         twoFingerTap.numberOfTapsRequired = 1
         twoFingerTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         twoFingerTap.cancelsTouchesInView = false
+        twoFingerTap.delaysTouchesBegan = false
+        twoFingerTap.delaysTouchesEnded = false
         twoFingerTap.delegate = self
 
         let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(handleThreeFingerTap))
@@ -356,6 +388,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         threeFingerTap.numberOfTapsRequired = 1
         threeFingerTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         threeFingerTap.cancelsTouchesInView = false
+        threeFingerTap.delaysTouchesBegan = false
+        threeFingerTap.delaysTouchesEnded = false
         threeFingerTap.delegate = self
 
         twoFingerTap.require(toFail: threeFingerTap)
@@ -384,10 +418,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             performRedo()
             toolState.showToast("Redo")
         }
-    }
-
-    func applyScrollLockSetting() {
-        scrollView.panGestureRecognizer.minimumNumberOfTouches = toolState.twoFingerScrollLock ? 2 : 1
     }
 
     func jumpToPage(_ pageNumber: Int, animated: Bool = true) {
@@ -613,7 +643,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func handlePencilBegan(_ touch: UITouch, event: UIEvent?) {
-        scrollView.isScrollEnabled = false
         cancelHoldTimer()
         snappedShape = nil
         rawPointsBeforeSnap = nil
@@ -802,7 +831,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         lastPencilUpTime = CACurrentMediaTime()
 
         defer {
-            scrollView.isScrollEnabled = true
             activePageView = nil
             activeSmoother = nil
             activeStartPoint = nil
@@ -871,6 +899,24 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             pushUndo(UndoAction(pageKey: pv.pageKey, added: [stroke], removed: []))
         }
         scheduleSave()
+    }
+
+    private func handlePencilResetFallback() {
+        cancelHoldTimer()
+        activePageView?.clearLiveOverlay()
+        activePageView = nil
+        activeSmoother = nil
+        activeStartPoint = nil
+        holdAnchor = nil
+        snappedShape = nil
+        rawPointsBeforeSnap = nil
+        shapeSnapTipPoint = nil
+        activePoints.removeAll(keepingCapacity: true)
+        activeErasePageKey = nil
+        activeEraseOriginals = []
+        activeErasePieces = [:]
+        activeEraseLastPoint = nil
+        laserDown = false
     }
 
     private func makeCommittedStroke(
@@ -1125,7 +1171,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
 struct PDFNotebookRepresentable: UIViewControllerRepresentable {
     let pdfURL: URL
-    @ObservedObject var toolState: NotebookToolState
+    let toolState: NotebookToolState
     let controllerBox: ControllerBox
 
     final class ControllerBox {
@@ -1140,6 +1186,5 @@ struct PDFNotebookRepresentable: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PDFNotebookViewController, context: Context) {
         controllerBox.vc = uiViewController
-        uiViewController.applyScrollLockSetting()
     }
 }
