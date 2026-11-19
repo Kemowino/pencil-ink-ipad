@@ -150,6 +150,15 @@ struct DriveSyncSettingsSheet: View {
                             .foregroundColor(syncManager.config.isConnected ? .green : .secondary)
                             .fontWeight(.semibold)
                     }
+                    if let vName = vault.vaultURL?.lastPathComponent {
+                        HStack {
+                            Text("Active Vault Root")
+                            Spacer()
+                            Text(vName)
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+                        }
+                    }
                     if !syncManager.config.deviceLabel.isEmpty {
                         HStack {
                             Text("iPad Device ID")

@@ -33,6 +33,7 @@ final class VaultManager: ObservableObject {
     private let bookmarkKey = "pencilink.vault.bookmark.v1"
     private let coverColorsKey = "pencilink.native.coverColors.v1"
     private let journalPathsKey = "pencilink.native.journalPaths.v1"
+    private var scopedRootURL: URL?
     private var accessingRoot = false
     private let thumbCache = NSCache<NSString, UIImage>()
     private let thumbQueue = DispatchQueue(label: "com.pencilink.coverthumbs", qos: .utility)
@@ -95,10 +96,46 @@ final class VaultManager: ObservableObject {
     }
 
     private func stopAccessingVault() {
-        if accessingRoot, let url = vaultURL {
+        if accessingRoot, let url = scopedRootURL ?? vaultURL {
             url.stopAccessingSecurityScopedResource()
             accessingRoot = false
         }
+        scopedRootURL = nil
+    }
+
+    /// If the user selected the parent `Obsidian` container folder on iPad instead of
+    /// stepping into the vault folder (e.g. `My Notes`), automatically resolve the inner
+    /// Obsidian vault root so vault-relative paths match MacBook/Windows 1:1.
+    private func resolveEffectiveVaultRoot(from selected: URL) -> URL {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: selected.appendingPathComponent(".obsidian").path) {
+            return selected
+        }
+        guard let children = try? fm.contentsOfDirectory(
+            at: selected,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return selected
+        }
+        let subdirs = children.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        }
+        let vaults = subdirs.filter {
+            fm.fileExists(atPath: $0.appendingPathComponent(".obsidian").path)
+        }
+        if vaults.count == 1 {
+            return vaults[0]
+        }
+        // Fallback when `.obsidian` is hidden by a file provider: if user picked the `Obsidian`
+        // container folder and it contains a single vault folder (e.g. `My Notes`), step into it.
+        if selected.lastPathComponent.lowercased() == "obsidian", subdirs.count == 1 {
+            let hasDirectPDFs = children.contains { $0.pathExtension.lowercased() == "pdf" }
+            if !hasDirectPDFs {
+                return subdirs[0]
+            }
+        }
+        return selected
     }
 
     func useLocalDocumentsFolder() {
@@ -108,6 +145,7 @@ final class VaultManager: ObservableObject {
             return
         }
         isUsingLocalFallback = true
+        scopedRootURL = docs
         vaultURL = docs
         statusMessage = "Using On My iPad → Pencil Ink folder."
         refreshPDFList()
@@ -118,7 +156,8 @@ final class VaultManager: ObservableObject {
         isUsingLocalFallback = false
         let started = url.startAccessingSecurityScopedResource()
         accessingRoot = started
-        vaultURL = url
+        scopedRootURL = url
+        vaultURL = resolveEffectiveVaultRoot(from: url)
         statusMessage = started ? "" : "Folder selected (if running in LiveContainer, enable Fix File Picker or install via SideStore)."
 
         do {
@@ -146,7 +185,8 @@ final class VaultManager: ObservableObject {
             )
             accessingRoot = url.startAccessingSecurityScopedResource()
             isUsingLocalFallback = false
-            vaultURL = url
+            scopedRootURL = url
+            vaultURL = resolveEffectiveVaultRoot(from: url)
             if stale {
                 setVaultFolder(url)
             } else {

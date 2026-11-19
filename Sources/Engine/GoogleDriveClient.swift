@@ -62,6 +62,7 @@ actor GoogleDriveClient {
 
     private var rootFolderIDCache: (spec: String, id: String)?
     private var dirIDCache: [String: String] = [:]
+    private var metaCache: [String: DriveFileMeta] = [:]
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -70,7 +71,7 @@ actor GoogleDriveClient {
         cfg.timeoutIntervalForResource = 90
         return URLSession(configuration: cfg)
     }()
-    private let onConfigUpdated: @Sendable (DriveConfig) -> Void
+    private var onConfigUpdated: @Sendable (DriveConfig) -> Void
 
     init(config: DriveConfig, onConfigUpdated: @escaping @Sendable (DriveConfig) -> Void) {
         self.config = config
@@ -82,7 +83,20 @@ actor GoogleDriveClient {
             rootFolderIDCache = nil
             dirIDCache.removeAll()
         }
-        self.config = newConfig
+        var merged = newConfig
+        // Never overwrite a fresher refreshed access token with a stale cached one!
+        if !config.refreshToken.isEmpty,
+           merged.refreshToken == config.refreshToken,
+           !config.accessToken.isEmpty,
+           config.expiresAt > merged.expiresAt {
+            merged.accessToken = config.accessToken
+            merged.expiresAt = config.expiresAt
+        }
+        self.config = merged
+    }
+
+    func setOnConfigUpdated(_ handler: @escaping @Sendable (DriveConfig) -> Void) {
+        self.onConfigUpdated = handler
     }
 
     func getTransferTotals() -> (up: Int64, down: Int64) {
@@ -304,11 +318,55 @@ actor GoogleDriveClient {
         return currentParent
     }
 
+    func getFile(id: String) async throws -> DriveFileMeta? {
+        if let cached = metaCache[id] { return cached }
+        let url = URL(string: "\(Self.apiBase)/files/\(id)?fields=\(Self.fields)")!
+        let (data, status) = try await authedRequest(url: url, method: "GET")
+        if status == 404 { return nil }
+        guard status >= 200 && status < 300 else {
+            throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+        }
+        let meta = try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        metaCache[id] = meta
+        return meta
+    }
+
     func findChildren(parentID: String, name: String, mimeType: String? = nil) async throws -> [DriveFileMeta] {
         let escName = escapeQuery(name)
         var q = "'\(parentID)' in parents and name = '\(escName)' and trashed=false"
         if let m = mimeType { q += " and mimeType = '\(m)'" }
-        return try await listQuery(q)
+        let results = try await listQuery(q)
+        for f in results { metaCache[f.id] = f }
+        return results
+    }
+
+    /// Searches Google Drive for any non-trashed folders with the exact name (e.g. `Book.pdf.ink.d`).
+    func findFoldersNamed(_ name: String) async throws -> [DriveFileMeta] {
+        let escName = escapeQuery(name)
+        let q = "name = '\(escName)' and mimeType = '\(Self.folderMime)' and trashed=false"
+        let results = try await listQuery(q)
+        for f in results { metaCache[f.id] = f }
+        return results
+    }
+
+    /// Walks up `parents` to verify a folder lives inside `rootID`, returning its relative path under `rootID` (or `nil` if outside).
+    func resolvePathUnderRoot(folder: DriveFileMeta, rootID: String) async throws -> String? {
+        if folder.id == rootID { return "" }
+        var segments: [String] = [folder.name]
+        var curParent = folder.parents?.first
+        var hops = 0
+        while let pid = curParent, hops < 12 {
+            if pid == rootID {
+                return segments.reversed().joined(separator: "/")
+            }
+            guard let parentMeta = try await getFile(id: pid), parentMeta.trashed != true else {
+                return nil
+            }
+            segments.append(parentMeta.name)
+            curParent = parentMeta.parents?.first
+            hops += 1
+        }
+        return nil
     }
 
     func listChildren(parentIDs: [String]) async throws -> [DriveFileMeta] {

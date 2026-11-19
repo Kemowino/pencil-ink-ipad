@@ -108,9 +108,18 @@ final class DriveSyncManager: ObservableObject {
     private let client: GoogleDriveClient
     private var logStates: [String: BookLogState] = [:]
     private var logSeen: [String: [String: RemoteLogEntry]] = [:]
+    private struct PendingFollowup {
+        let pdfURL: URL
+        let relativePath: String
+        let localDocProvider: () -> InkDocument
+        let onMerged: (InkDocument) -> Void
+    }
+
     private var folderCheckAt: [String: Date] = [:]
     private var extraFolderCache: [String: [String]] = [:]
-    private var activeSyncTasks: [String: Task<(InkDocument, Bool), Error>] = [:]
+    private var resolvedPathCache: [String: String] = [:]
+    private var activeSyncTasks: [String: Task<(InkDocument, Bool, Bool), Error>] = [:]
+    private var pendingFollowups: [String: PendingFollowup] = [:]
     private var debounceTimers: [String: DispatchWorkItem] = [:]
 
     init() {
@@ -126,14 +135,25 @@ final class DriveSyncManager: ObservableObject {
         }
         self.config = loaded
         self.client = GoogleDriveClient(config: loaded) { updated in
-            Task { @MainActor in
-                if let encoded = try? JSONEncoder().encode(updated) {
-                    UserDefaults.standard.set(encoded, forKey: "pencilink.native.drive.config.v1")
-                }
+            if let encoded = try? JSONEncoder().encode(updated) {
+                UserDefaults.standard.set(encoded, forKey: "pencilink.native.drive.config.v1")
             }
         }
         self.visualState = loaded.isConnected ? .ok : .disconnected
         self.statusText = loaded.isConnected ? "Synced" : "Not Connected"
+        Task { [weak self] in
+            guard let self else { return }
+            await self.client.setOnConfigUpdated { [weak self] updated in
+                if let encoded = try? JSONEncoder().encode(updated) {
+                    UserDefaults.standard.set(encoded, forKey: "pencilink.native.drive.config.v1")
+                }
+                Task { @MainActor [weak self] in
+                    guard let self, self.config.refreshToken == updated.refreshToken else { return }
+                    self.config.accessToken = updated.accessToken
+                    self.config.expiresAt = updated.expiresAt
+                }
+            }
+        }
     }
 
     private static func generateDeviceLabel() -> String {
@@ -235,6 +255,7 @@ final class DriveSyncManager: ObservableObject {
         lastError = ""
         folderCheckAt.removeAll()
         extraFolderCache.removeAll()
+        resolvedPathCache.removeAll()
         saveConfig()
         if config.isConnected {
             visualState = .ok
@@ -303,11 +324,21 @@ final class DriveSyncManager: ObservableObject {
         onMerged: @escaping (InkDocument) -> Void
     ) {
         guard config.isConnected, config.autoSync else { return }
-        let key = relativePath
-        debounceTimers[key]?.cancel()
+        let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
+        debounceTimers[inkRelPath]?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.debounceTimers.removeValue(forKey: key)
+            self.debounceTimers.removeValue(forKey: inkRelPath)
+            // If a background poll is already in flight, queue an immediate follow-up push so strokes NEVER wait!
+            if self.activeSyncTasks[inkRelPath] != nil {
+                self.pendingFollowups[inkRelPath] = PendingFollowup(
+                    pdfURL: pdfURL,
+                    relativePath: relativePath,
+                    localDocProvider: localDocProvider,
+                    onMerged: onMerged
+                )
+                return
+            }
             let localDoc = localDocProvider()
             Task { @MainActor in
                 if let (merged, changed) = await self.syncBook(
@@ -320,9 +351,9 @@ final class DriveSyncManager: ObservableObject {
                 }
             }
         }
-        debounceTimers[key] = item
-        // Fast 0.55s debounce so strokes leave the iPad in <1 second!
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: item)
+        debounceTimers[inkRelPath] = item
+        // Fast 0.45s debounce so strokes leave the iPad in <1 second!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: item)
     }
 
     func syncBook(
@@ -334,7 +365,10 @@ final class DriveSyncManager: ObservableObject {
         guard config.isConnected else { return nil }
         let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
         if let running = activeSyncTasks[inkRelPath] {
-            return try? await running.value
+            if let res = try? await running.value {
+                return (res.0, res.1)
+            }
+            return nil
         }
 
         visualState = .syncing
@@ -342,7 +376,7 @@ final class DriveSyncManager: ObservableObject {
         statusText = "Syncing \(activeBookName)…"
 
         let currentCfg = config
-        let task = Task<(InkDocument, Bool), Error> { [weak self] in
+        let task = Task<(InkDocument, Bool, Bool), Error> { [weak self] in
             guard let self else { throw DriveClientError.notConnected }
             await self.client.updateConfig(currentCfg)
             return try await self.performBookSync(
@@ -360,7 +394,9 @@ final class DriveSyncManager: ObservableObject {
             let totals = await client.getTransferTotals()
             sessionBytesUp = totals.up
             sessionBytesDown = totals.down
-            sessionBooksSynced += 1
+            if result.2 {
+                sessionBooksSynced += 1
+            }
             lastSyncedAt = Date()
             lastError = ""
             if activeSyncTasks.isEmpty {
@@ -368,9 +404,24 @@ final class DriveSyncManager: ObservableObject {
                 visualState = .ok
                 statusText = "Synced"
             }
-            return result
+            // If new strokes arrived while this sync was in flight, push them immediately!
+            if let next = pendingFollowups.removeValue(forKey: inkRelPath) {
+                Task { @MainActor in
+                    let latestDoc = next.localDocProvider()
+                    if let (merged, changed) = await self.syncBook(
+                        pdfURL: next.pdfURL,
+                        relativePath: next.relativePath,
+                        localDoc: latestDoc,
+                        forceFolderScan: false
+                    ), changed {
+                        next.onMerged(merged)
+                    }
+                }
+            }
+            return (result.0, result.1)
         } catch {
             activeSyncTasks.removeValue(forKey: inkRelPath)
+            pendingFollowups.removeValue(forKey: inkRelPath)
             lastError = error.localizedDescription
             activeBookName = ""
             if let de = error as? DriveClientError, de.isFatalAuth {
@@ -416,56 +467,111 @@ final class DriveSyncManager: ObservableObject {
         inkRelPath: String,
         localDoc: InkDocument,
         forceFolderScan: Bool
-    ) async throws -> (InkDocument, Bool) {
-        let dir = (inkRelPath as NSString).deletingLastPathComponent
+    ) async throws -> (InkDocument, Bool, Bool) {
+        let rawDir = (inkRelPath as NSString).deletingLastPathComponent
+        let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
         let fileName = (inkRelPath as NSString).lastPathComponent
         let folderName = fileName.hasSuffix(".json")
             ? String(fileName.dropLast(5)) + ".d"
             : fileName + ".d"
+        let expectedDrivePath = dir.isEmpty ? folderName : "\(dir)/\(folderName)"
 
         var st = loadLogState(for: inkRelPath)
         var seen = logSeen[inkRelPath] ?? [:]
 
-        // 1. Resolve ALL matching `<Book.pdf.ink.d>` folders on Drive (prevents split-folder one-way sync!)
+        // 1. Smart Folder Discovery under Drive sync root:
+        //    Finds ALL `<Book.pdf.ink.d>` folders under `rootID` — automatically matching MacBook's
+        //    existing folder even if the iPad vault root had an extra parent folder (like `My Notes/`)!
         let needFolderScan = forceFolderScan
             || st.folderId.isEmpty
             || (folderCheckAt[inkRelPath].map { Date().timeIntervalSince($0) > 25 } ?? true)
 
         var folderID = st.folderId
         var extraFolderIDs = extraFolderCache[inkRelPath] ?? []
+        var resolvedPath = resolvedPathCache[inkRelPath] ?? expectedDrivePath
+        var preloadedListing: [DriveFileMeta]? = nil
 
         if needFolderScan {
-            let parentID = try await client.ensureRemoteDir(relativeDir: dir)
-            let folders = try await client.findChildren(
-                parentID: parentID,
-                name: folderName,
-                mimeType: GoogleDriveClient.folderMime
-            ).sorted { $0.id < $1.id }
+            let rootID = try await client.resolveRootFolderID()
+            let allNamed = try await client.findFoldersNamed(folderName)
+            var byPath: [String: [DriveFileMeta]] = [:]
+            for f in allNamed {
+                if let rel = try await client.resolvePathUnderRoot(folder: f, rootID: rootID) {
+                    byPath[rel, default: []].append(f)
+                }
+            }
+            for k in byPath.keys {
+                byPath[k]?.sort { $0.id < $1.id }
+            }
 
-            if let first = folders.first {
-                // Always adopt the smallest-ID folder as canonical primary (matching Obsidian!)
+            var chosenPath: String? = nil
+            var chosenFolders: [DriveFileMeta] = []
+
+            if byPath.count == 1, let only = byPath.first {
+                // Only one matching book folder exists under Drive root -> ALWAYS use it!
+                chosenPath = only.key
+                chosenFolders = only.value
+            } else if byPath.count > 1 {
+                // Multiple paths exist (e.g. MacBook's `Anesthesia/...` AND a stray `My Notes/Anesthesia/...`).
+                // Pick the path that actually has remote shards from another device, preferring exact match on tie!
+                var bestPath = ""
+                var bestScore = -1
+                var bestListing: [DriveFileMeta]? = nil
+                for (path, group) in byPath {
+                    let ids = group.map { $0.id }
+                    let kids = try await client.listChildren(parentIDs: ids)
+                    let remoteShards = kids.filter { $0.name.hasPrefix("log_") && !$0.name.hasPrefix("log_\(st.label)_") }.count
+                    let exactBonus = (path == expectedDrivePath) ? 2 : 0
+                    let shorterBonus = (path.count < expectedDrivePath.count && expectedDrivePath.hasSuffix("/" + path)) ? 1 : 0
+                    let score = remoteShards * 100 + exactBonus + shorterBonus
+                    if score > bestScore {
+                        bestScore = score
+                        bestPath = path
+                        chosenFolders = group
+                        bestListing = kids
+                    }
+                }
+                chosenPath = bestPath
+                preloadedListing = bestListing
+            }
+
+            if let first = chosenFolders.first {
                 if !folderID.isEmpty && folderID != first.id {
-                    // Reset our own uploaded file IDs if primary folder changed so dirty files upload to canonical folder
+                    // Switched from an isolated/stray folder to the real MacBook folder!
+                    // Re-upload our own local strokes & marks into the canonical folder cleanly.
                     st.ids.removeAll()
+                    seen.removeAll()
+                    st.seenMd5.removeAll()
                     for key in st.own.keys { st.markDirty(BookLogState.pageFile(label: st.label, key: key)) }
                     if !st.erased.isEmpty { st.markDirty(BookLogState.eraseFile(label: st.label)) }
                     if !st.ownBlanks.isEmpty { st.markDirty(BookLogState.blanksFile(label: st.label)) }
                     if !st.ownBookmarks.isEmpty || !st.ownRemoved.isEmpty { st.markDirty(BookLogState.marksFile(label: st.label)) }
                 }
                 folderID = first.id
-                extraFolderIDs = folders.dropFirst().map { $0.id }
+                extraFolderIDs = chosenFolders.dropFirst().map { $0.id }
+                resolvedPath = chosenPath ?? expectedDrivePath
             } else {
+                // Brand new book never synced before -> create at expectedDrivePath
+                let parentID = try await client.ensureRemoteDir(relativeDir: dir)
                 let made = try await client.createFolder(name: folderName, parentID: parentID)
                 folderID = made.id
                 extraFolderIDs = []
+                resolvedPath = expectedDrivePath
             }
+
             st.folderId = folderID
             extraFolderCache[inkRelPath] = extraFolderIDs
+            resolvedPathCache[inkRelPath] = resolvedPath
             folderCheckAt[inkRelPath] = Date()
         }
 
         let allFolderIDs = [folderID] + extraFolderIDs
-        let listing = try await client.listChildren(parentIDs: allFolderIDs)
+        let listing: [DriveFileMeta]
+        if let pre = preloadedListing {
+            listing = pre
+        } else {
+            listing = try await client.listChildren(parentIDs: allFolderIDs)
+        }
         let hadFormat = listing.contains { $0.name == "format.json" }
 
         // Map our own existing log files inside canonical primary folder & flag duplicates
@@ -643,18 +749,20 @@ final class DriveSyncManager: ObservableObject {
         logSeen[inkRelPath] = seen
         saveLogState(st, for: inkRelPath)
 
+        let uploadedCount = dirtyFiles.count
+        let ownCount = st.ids.count
         let remoteCount = remoteGroups.count
-        let folderCount = allFolderIDs.count
-        let diagPath = dir.isEmpty ? folderName : "\(dir)/\(folderName)"
-        lastDiagnostic = "\(diagPath) · \(folderCount) folder\(folderCount == 1 ? "" : "s") · \(remoteCount) remote shard\(remoteCount == 1 ? "" : "s")"
+        let didTransfer = (downloadedCount > 0 || uploadedCount > 0)
+        lastDiagnostic = "\(resolvedPath) · \(remoteCount) remote · \(ownCount) own"
             + (downloadedCount > 0 ? " (↓\(downloadedCount))" : "")
+            + (uploadedCount > 0 ? " (↑\(uploadedCount))" : "")
             + (parseFailures > 0 ? " · ⚠️ \(parseFailures) decode err" : "")
 
         let changedLocally = !sameContent(merged, localDoc)
         if changedLocally {
             try? merged.save(for: pdfURL)
         }
-        return (merged, changedLocally)
+        return (merged, changedLocally, didTransfer)
     }
 
     // MARK: - CRDT Helpers
