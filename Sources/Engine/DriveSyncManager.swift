@@ -222,6 +222,106 @@ final class DriveSyncManager: ObservableObject {
         }
     }
 
+
+    // MARK: - Device Key Codec (100% Compatible with Obsidian Pencil Ink `PENCIL-INK-DEVICE:...`)
+
+    static let deviceKeyPrefix = "PENCIL-INK-DEVICE:"
+
+    private struct DeviceKeyPayload: Codable {
+        var v: Int?
+        var clientId: String
+        var clientSecret: String
+        var refreshToken: String?
+        var accessToken: String?
+        var expiresAt: Double?
+        var driveFolder: String?
+    }
+
+    func encodeDeviceKey() -> String? {
+        let cid = config.clientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let csec = config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cid.isEmpty, !csec.isEmpty else { return nil }
+        let payload = DeviceKeyPayload(
+            v: 1,
+            clientId: cid,
+            clientSecret: csec,
+            refreshToken: config.refreshToken.trimmingCharacters(in: .whitespacesAndNewlines),
+            accessToken: config.accessToken.trimmingCharacters(in: .whitespacesAndNewlines),
+            expiresAt: config.expiresAt,
+            driveFolder: config.driveFolder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Obsidian Vault"
+                : config.driveFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard let jsonData = try? JSONEncoder().encode(payload) else { return nil }
+        return Self.deviceKeyPrefix + jsonData.base64EncodedString()
+    }
+
+    /// Parses and applies an Obsidian Pencil Ink Device Key (`PENCIL-INK-DEVICE:...`).
+    /// Returns `(success, message)`.
+    func applyDeviceKey(_ raw: String) -> (ok: Bool, message: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix(Self.deviceKeyPrefix) else {
+            return (false, "Invalid Device Key. Make sure it starts with PENCIL-INK-DEVICE:")
+        }
+        let b64 = String(trimmed.dropFirst(Self.deviceKeyPrefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
+              let parsed = try? JSONDecoder().decode(DeviceKeyPayload.self, from: data) else {
+            return (false, "Could not decode Device Key. Copy the entire key again from Obsidian.")
+        }
+        let cid = parsed.clientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let csec = parsed.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cid.isEmpty, !csec.isEmpty else {
+            return (false, "Device Key is missing Client ID or Client Secret.")
+        }
+
+        config.clientId = cid
+        config.clientSecret = csec
+        if let rt = parsed.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines), !rt.isEmpty {
+            config.refreshToken = rt
+            config.accessToken = (parsed.accessToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            config.expiresAt = parsed.expiresAt ?? 0
+        }
+        if let df = parsed.driveFolder?.trimmingCharacters(in: .whitespacesAndNewlines), !df.isEmpty {
+            config.driveFolder = df
+        }
+        lastError = ""
+        saveConfig()
+        if config.isConnected {
+            visualState = .ok
+            statusText = "Connected"
+            return (true, "Device linked & Google Drive connected! Folder: \(config.driveFolder)")
+        } else {
+            return (true, "Google app credentials imported! Tap Open Google Sign-In below to finish connecting.")
+        }
+    }
+
+    func verifyDriveConnection() async -> (ok: Bool, message: String) {
+        guard config.isConnected else {
+            return (false, "Not signed in to Google Drive yet.")
+        }
+        await client.updateConfig(config)
+        visualState = .syncing
+        statusText = "Checking Drive…"
+        do {
+            _ = try await client.resolveRootFolderID()
+            lastError = ""
+            visualState = .ok
+            statusText = "Synced"
+            return (true, "Connected to Google Drive folder \"\(config.driveFolder)\"!")
+        } catch {
+            lastError = error.localizedDescription
+            if let de = error as? DriveClientError, de.isFatalAuth {
+                visualState = .disconnected
+                statusText = "Sign-In Expired"
+            } else {
+                visualState = .error
+                statusText = "Sync Error"
+            }
+            return (false, "Connection check failed: \(error.localizedDescription)")
+        }
+    }
+
     func beginOAuth() -> (url: URL, verifier: String)? {
         saveConfig()
         guard !config.clientId.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
@@ -281,8 +381,10 @@ final class DriveSyncManager: ObservableObject {
         activeBookName = pdfURL.deletingPathExtension().lastPathComponent
         statusText = "Syncing \(activeBookName)…"
 
+        let currentCfg = config
         let task = Task<(InkDocument, Bool), Error> { [weak self] in
             guard let self else { throw DriveClientError.notConnected }
+            await self.client.updateConfig(currentCfg)
             return try await self.performBookSync(pdfURL: pdfURL, inkRelPath: inkRelPath, localDoc: localDoc)
         }
         activeSyncTasks[inkRelPath] = task

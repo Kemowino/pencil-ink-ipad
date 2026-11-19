@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SyncStatusDotButton: View {
     @ObservedObject var syncManager: DriveSyncManager
@@ -120,9 +121,12 @@ struct DriveSyncSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
 
+    @State private var manualDeviceKey: String = ""
+    @State private var showManualKeyField: Bool = false
     @State private var authVerifier: String = ""
     @State private var pastedRedirect: String = ""
     @State private var feedbackMessage: String = ""
+    @State private var feedbackIsError: Bool = false
     @State private var isFinishingAuth = false
 
     var body: some View {
@@ -160,12 +164,127 @@ struct DriveSyncSettingsSheet: View {
                     }
                 }
 
-                Section(header: Text("Quick Setup (Recommended)"), footer: Text("Reads your existing Google Drive credentials & login directly from Obsidian Pencil Ink in your vault so you don't have to re-type anything.")) {
+                // 1-Tap Device Key Linking (Exact match to Obsidian Pencil Ink's PENCIL-INK-DEVICE: key!)
+                Section(
+                    header: Text("Link Device (Copy / Paste Device Key)"),
+                    footer: Text("In Obsidian on your Mac, PC, or iPad, open Pencil Ink settings and tap Copy Device Key. Then tap Paste Device Key here for instant 1-tap sign-in.")
+                ) {
                     Button {
-                        feedbackMessage = syncManager.importFromObsidianVault(vault.vaultURL)
+                        if let clip = UIPasteboard.general.string, !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            let res = syncManager.applyDeviceKey(clip)
+                            feedbackMessage = res.message
+                            feedbackIsError = !res.ok
+                            if res.ok && syncManager.config.isConnected {
+                                showManualKeyField = false
+                                Task {
+                                    let check = await syncManager.verifyDriveConnection()
+                                    feedbackMessage = check.message
+                                    feedbackIsError = !check.ok
+                                }
+                            } else if !res.ok {
+                                showManualKeyField = true
+                            }
+                        } else {
+                            showManualKeyField = true
+                            feedbackMessage = "Clipboard didn't contain a Device Key — paste it into the box below."
+                            feedbackIsError = false
+                        }
                     } label: {
-                        Label("Import Setup from Obsidian Vault", systemImage: "square.and.arrow.down.on.square")
+                        Label("Paste Device Key from Clipboard", systemImage: "doc.on.clipboard")
                             .fontWeight(.semibold)
+                    }
+
+                    Button {
+                        showManualKeyField.toggle()
+                    } label: {
+                        Label(showManualKeyField ? "Hide Manual Key Box" : "Enter Device Key Manually…", systemImage: "keyboard")
+                            .foregroundColor(.secondary)
+                    }
+
+                    if showManualKeyField {
+                        TextField("PENCIL-INK-DEVICE:...", text: $manualDeviceKey, axis: .vertical)
+                            .lineLimit(2...5)
+                            .font(.system(size: 12, design: .monospaced))
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+
+                        Button {
+                            let res = syncManager.applyDeviceKey(manualDeviceKey)
+                            feedbackMessage = res.message
+                            feedbackIsError = !res.ok
+                            if res.ok {
+                                manualDeviceKey = ""
+                                if syncManager.config.isConnected {
+                                    showManualKeyField = false
+                                    Task {
+                                        let check = await syncManager.verifyDriveConnection()
+                                        feedbackMessage = check.message
+                                        feedbackIsError = !check.ok
+                                    }
+                                }
+                            }
+                        } label: {
+                            Text("Apply Device Key & Connect")
+                                .fontWeight(.semibold)
+                        }
+                        .disabled(manualDeviceKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+
+                    Button {
+                        if let key = syncManager.encodeDeviceKey() {
+                            UIPasteboard.general.string = key
+                            feedbackMessage = syncManager.config.isConnected
+                                ? "Device Key copied! Paste it into Pencil Ink settings on another device."
+                                : "App Credentials Key copied to clipboard."
+                            feedbackIsError = false
+                        } else {
+                            feedbackMessage = "Connect Google Drive or enter Client ID & Secret before copying a Device Key."
+                            feedbackIsError = true
+                        }
+                    } label: {
+                        Label("Copy Device Key", systemImage: "key.fill")
+                    }
+                }
+
+                if !feedbackMessage.isEmpty {
+                    Section {
+                        Text(feedbackMessage)
+                            .font(.subheadline)
+                            .foregroundColor(feedbackIsError ? .red : .green)
+                    }
+                }
+
+                if syncManager.config.isConnected {
+                    Section("Sync Actions") {
+                        Button {
+                            Task {
+                                let check = await syncManager.verifyDriveConnection()
+                                feedbackMessage = check.message
+                                feedbackIsError = !check.ok
+                            }
+                        } label: {
+                            Label("Test Google Drive Connection", systemImage: "checkmark.icloud")
+                        }
+                        .disabled(syncManager.visualState == .syncing)
+
+                        Button {
+                            Task {
+                                await syncManager.syncAllAnnotatedBooks(vault: vault)
+                                feedbackMessage = "Finished syncing annotated PDFs."
+                                feedbackIsError = false
+                            }
+                        } label: {
+                            Label("Sync All Annotated Books Now", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(syncManager.visualState == .syncing)
+
+                        Button(role: .destructive) {
+                            syncManager.disconnect()
+                            feedbackMessage = "Disconnected from Google Drive."
+                            feedbackIsError = false
+                        } label: {
+                            Label("Disconnect Google Drive", systemImage: "xmark.circle")
+                        }
                     }
                 }
 
@@ -182,14 +301,19 @@ struct DriveSyncSettingsSheet: View {
                 }
 
                 if !syncManager.config.isConnected {
-                    Section(header: Text("Sign In with Google"), footer: Text("1. Tap Open Google Sign-In and approve access.\n2. Safari will show 'can't connect to 127.0.0.1' — that is expected.\n3. Copy the full address from Safari's URL bar, paste it below, and tap Finish Sign-In.")) {
+                    Section(
+                        header: Text("Or Sign In Manually with Google"),
+                        footer: Text("1. Tap Open Google Sign-In and approve access.\n2. Copy the 127.0.0.1 address from Safari, paste it below, and tap Finish Sign-In.")
+                    ) {
                         Button {
                             if let auth = syncManager.beginOAuth() {
                                 authVerifier = auth.verifier
                                 feedbackMessage = "Browser opened. Approve access, then copy the 127.0.0.1 URL and paste it below."
+                                feedbackIsError = false
                                 openURL(auth.url)
                             } else {
-                                feedbackMessage = "Enter your OAuth Client ID (or tap Import from Obsidian Vault) first."
+                                feedbackMessage = "Enter your OAuth Client ID (or paste a Device Key above) first."
+                                feedbackIsError = true
                             }
                         } label: {
                             Label("Open Google Sign-In", systemImage: "safari")
@@ -206,10 +330,12 @@ struct DriveSyncSettingsSheet: View {
                                     do {
                                         try await syncManager.finishOAuth(pasted: pastedRedirect, verifier: authVerifier)
                                         feedbackMessage = "Connected to Google Drive!"
+                                        feedbackIsError = false
                                         authVerifier = ""
                                         pastedRedirect = ""
                                     } catch {
                                         feedbackMessage = error.localizedDescription
+                                        feedbackIsError = true
                                     }
                                     isFinishingAuth = false
                                 }
@@ -219,33 +345,6 @@ struct DriveSyncSettingsSheet: View {
                             }
                             .disabled(isFinishingAuth || pastedRedirect.trimmingCharacters(in: .whitespaces).isEmpty)
                         }
-                    }
-                } else {
-                    Section("Sync Actions") {
-                        Button {
-                            Task {
-                                await syncManager.syncAllAnnotatedBooks(vault: vault)
-                                feedbackMessage = "Finished syncing annotated PDFs."
-                            }
-                        } label: {
-                            Label("Sync All Annotated Books Now", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                        .disabled(syncManager.visualState == .syncing)
-
-                        Button(role: .destructive) {
-                            syncManager.disconnect()
-                            feedbackMessage = "Disconnected from Google Drive."
-                        } label: {
-                            Label("Disconnect Google Drive", systemImage: "xmark.circle")
-                        }
-                    }
-                }
-
-                if !feedbackMessage.isEmpty {
-                    Section {
-                        Text(feedbackMessage)
-                            .font(.subheadline)
-                            .foregroundColor(.blue)
                     }
                 }
             }
