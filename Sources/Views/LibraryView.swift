@@ -8,10 +8,13 @@ private enum ActivePickerMode {
 
 struct LibraryView: View {
     @EnvironmentObject var vault: VaultManager
+    @EnvironmentObject var syncManager: DriveSyncManager
     @State private var showImporter = false
+    @State private var showSyncSettings = false
     @State private var pickerMode: ActivePickerMode = .folder
     @State private var searchText = ""
     @State private var openedPDF: URL?
+    @State private var openedRelativePath: String = ""
     @State private var standaloneScopedURL: URL?
 
     private var filteredPDFs: [PDFItem] {
@@ -28,20 +31,36 @@ struct LibraryView: View {
         pickerMode == .folder ? [.folder] : [.pdf]
     }
 
+    private func relativeVaultPath(for url: URL) -> String {
+        if let rootPath = vault.vaultURL?.path, url.path.hasPrefix(rootPath) {
+            return String(url.path.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
+        return url.lastPathComponent
+    }
+
     var body: some View {
         Group {
             if let pdf = openedPDF {
-                NotebookScreen(pdfURL: pdf) {
-                    if let single = standaloneScopedURL, single == pdf {
-                        single.stopAccessingSecurityScopedResource()
-                        standaloneScopedURL = nil
+                NotebookScreen(
+                    pdfURL: pdf,
+                    relativePath: openedRelativePath,
+                    onClose: {
+                        if let single = standaloneScopedURL, single == pdf {
+                            single.stopAccessingSecurityScopedResource()
+                            standaloneScopedURL = nil
+                        }
+                        openedPDF = nil
+                        openedRelativePath = ""
+                        vault.refreshPDFList()
                     }
-                    openedPDF = nil
-                    vault.refreshPDFList()
-                }
+                )
             } else {
                 libraryHome
             }
+        }
+        .sheet(isPresented: $showSyncSettings) {
+            DriveSyncSettingsSheet(syncManager: syncManager, vault: vault)
+                .preferredColorScheme(.dark)
         }
         .fileImporter(
             isPresented: $showImporter,
@@ -58,6 +77,7 @@ struct LibraryView: View {
                         if url.startAccessingSecurityScopedResource() {
                             standaloneScopedURL = url
                         }
+                        openedRelativePath = relativeVaultPath(for: url)
                         openedPDF = url
                     }
                 }
@@ -121,6 +141,7 @@ struct LibraryView: View {
                 } else {
                     List(filteredPDFs) { item in
                         Button {
+                            openedRelativePath = relativeVaultPath(for: item.url)
                             openedPDF = item.url
                         } label: {
                             HStack(spacing: 14) {
@@ -161,6 +182,9 @@ struct LibraryView: View {
                     .listStyle(.insetGrouped)
                     .refreshable {
                         vault.refreshPDFList()
+                        if syncManager.config.isConnected {
+                            await syncManager.syncAllAnnotatedBooks(vault: vault)
+                        }
                     }
                 }
             }
@@ -168,6 +192,9 @@ struct LibraryView: View {
             .searchable(text: $searchText, prompt: "Search PDFs in vault")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    SyncStatusDotButton(syncManager: syncManager) {
+                        showSyncSettings = true
+                    }
                     Button {
                         pickerMode = .pdf
                         showImporter = true
@@ -193,7 +220,7 @@ struct LibraryView: View {
                 .foregroundColor(.blue)
             Text("Connect Your Obsidian Vault")
                 .font(.title2.bold())
-            Text("Pick your Obsidian vault folder once. Pencil Ink opens your PDFs in-place and saves strokes directly into the same .ink.json files Obsidian uses.")
+            Text("Pick your Obsidian vault folder once. Pencil Ink opens your PDFs in-place and syncs strokes directly with Obsidian & Google Drive.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)

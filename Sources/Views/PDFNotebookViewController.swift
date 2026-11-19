@@ -225,7 +225,9 @@ private final class InkScrollView: UIScrollView {
 
 final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     let pdfURL: URL
+    let relativePath: String
     let toolState: NotebookToolState
+    let syncManager: DriveSyncManager?
 
     private var pdfDoc: PDFDocument?
     private var pdfPageSizes: [CGSize] = []
@@ -277,20 +279,26 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var laserDown = false
     private var laserDisplayLink: CADisplayLink?
 
-    // Undo / Redo + debounced save
+    // Undo / Redo + debounced save + live Drive poll
     private var undoStack: [UndoAction] = []
     private var redoStack: [UndoAction] = []
     private var saveWorkItem: DispatchWorkItem?
     private var isDirty = false
+    private var syncPollTimer: Timer?
+    private var pendingRemoteDoc: InkDocument?
 
     private var lastPageStorageKey: String {
         "pencilink.lastpage." + pdfURL.lastPathComponent
     }
 
-    init(pdfURL: URL, toolState: NotebookToolState) {
+    init(pdfURL: URL, relativePath: String, toolState: NotebookToolState, syncManager: DriveSyncManager?) {
         self.pdfURL = pdfURL
+        self.relativePath = relativePath
         self.toolState = toolState
-        self.inkDoc = InkDocument.load(for: pdfURL)
+        self.syncManager = syncManager
+        var loaded = InkDocument.load(for: pdfURL)
+        if loaded.name.isEmpty { loaded.name = relativePath }
+        self.inkDoc = loaded
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -300,6 +308,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     deinit {
         stopLaserLoop()
+        syncPollTimer?.invalidate()
     }
 
     override func viewDidLoad() {
@@ -308,6 +317,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         setupScrollView()
         setupTapUndoGestures()
         loadPDF()
+        startLiveDriveSync()
     }
 
     override func viewDidLayoutSubviews() {
@@ -336,10 +346,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        syncPollTimer?.invalidate()
+        syncPollTimer = nil
         cancelHoldTimer()
         clearLassoSelection(commitFirst: true)
         stopLaserLoop()
         saveNow()
+        syncNowWithDrive(silent: true)
     }
 
     private func setupScrollView() {
@@ -1539,6 +1552,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
         defer {
             activePageView = nil
+            flushPendingRemoteDoc()
             activeSmoother = nil
             activeStartPoint = nil
             holdAnchor = nil
@@ -1873,21 +1887,97 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: item)
     }
 
+    func startLiveDriveSync() {
+        syncPollTimer?.invalidate()
+        guard let sm = syncManager, sm.config.isConnected else { return }
+        // Pull latest remote deltas right when opening the book
+        syncNowWithDrive(silent: true)
+        // Poll Google Drive every 10s while the book is open (yielding if writing)
+        syncPollTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.activePageView == nil, !self.laserDown,
+                      let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else { return }
+                self.syncNowWithDrive(silent: true)
+            }
+        }
+    }
+
+    func syncNowWithDrive(silent: Bool = false) {
+        guard let sm = syncManager else { return }
+        let snap = inkDoc
+        let url = pdfURL
+        let rel = relativePath
+        Task { @MainActor in
+            guard sm.config.isConnected else { return }
+            if let (merged, changed) = await sm.syncBook(pdfURL: url, relativePath: rel, localDoc: snap) {
+                if changed {
+                    self.applyRemoteMergedDocument(merged)
+                    if !silent { self.toolState.showToast("Synced remote updates") }
+                } else if !silent {
+                    self.toolState.showToast("Up to date with Google Drive")
+                }
+            }
+        }
+    }
+
+    private func flushPendingRemoteDoc() {
+        guard activePageView == nil, !laserDown, let pending = pendingRemoteDoc else { return }
+        pendingRemoteDoc = nil
+        applyRemoteMergedDocument(pending)
+    }
+
+    private func applyRemoteMergedDocument(_ merged: InkDocument) {
+        if activePageView != nil || laserDown {
+            pendingRemoteDoc = merged
+            return
+        }
+        let structureChanged = (inkDoc.blanks != merged.blanks || inkDoc.removed != merged.removed)
+        let oldPages = inkDoc.pages
+        inkDoc = merged
+
+        if structureChanged {
+            clearLassoSelection(commitFirst: false)
+            rebuildPageViews(focusKey: nil)
+        } else {
+            let hidden = lassoSelection?.hiddenStrokeIDs ?? []
+            for pv in pageViews {
+                let newStrokes = inkDoc.pages[pv.pageKey] ?? []
+                let oldStrokes = oldPages[pv.pageKey] ?? []
+                if newStrokes.count != oldStrokes.count || Set(newStrokes.map { $0.id }) != Set(oldStrokes.map { $0.id }) {
+                    pv.setStrokes(newStrokes, hiddenIDs: (lassoSelection?.pageKey == pv.pageKey) ? hidden : [])
+                }
+            }
+            syncDocumentMetadataToUI()
+        }
+    }
+
     func saveNow() {
         saveWorkItem?.cancel()
         saveWorkItem = nil
         guard isDirty else { return }
         isDirty = false
-        let snapshot = inkDoc
+        var snapshot = inkDoc
+        snapshot.name = relativePath
         let targetURL = pdfURL
+        let rel = relativePath
         DispatchQueue.global(qos: .utility).async { [weak self] in
             do {
                 try snapshot.save(for: targetURL)
-                DispatchQueue.main.async {
-                    self?.toolState.saveStatus = "Saved"
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.toolState.saveStatus = "Saved"
+                    if let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync {
+                        sm.scheduleBookSync(
+                            pdfURL: targetURL,
+                            relativePath: rel,
+                            localDocProvider: { [weak self] in self?.inkDoc ?? snapshot },
+                            onMerged: { [weak self] merged in self?.applyRemoteMergedDocument(merged) }
+                        )
+                    }
                 }
             } catch {
-                DispatchQueue.main.async {
+                Task { @MainActor [weak self] in
                     self?.toolState.saveStatus = "Save error"
                 }
             }
@@ -1903,7 +1993,9 @@ private extension Array {
 
 struct PDFNotebookRepresentable: UIViewControllerRepresentable {
     let pdfURL: URL
+    let relativePath: String
     let toolState: NotebookToolState
+    let syncManager: DriveSyncManager
     let controllerBox: ControllerBox
 
     final class ControllerBox {
@@ -1911,7 +2003,12 @@ struct PDFNotebookRepresentable: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> PDFNotebookViewController {
-        let vc = PDFNotebookViewController(pdfURL: pdfURL, toolState: toolState)
+        let vc = PDFNotebookViewController(
+            pdfURL: pdfURL,
+            relativePath: relativePath,
+            toolState: toolState,
+            syncManager: syncManager
+        )
         controllerBox.vc = vc
         return vc
     }

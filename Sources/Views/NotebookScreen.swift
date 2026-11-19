@@ -1,25 +1,31 @@
 import SwiftUI
 
 private enum ToolPopoverKind: Int, Identifiable {
-    case pen, highlighter, eraser, laser, jumpPage
+    case pen, highlighter, eraser, laser, jumpPage, sync
     var id: Int { rawValue }
 }
 
 struct NotebookScreen: View {
     let pdfURL: URL
+    let relativePath: String
     let onClose: () -> Void
 
+    @EnvironmentObject var vault: VaultManager
+    @EnvironmentObject var syncManager: DriveSyncManager
     @StateObject private var toolState = NotebookToolState()
     @State private var controllerBox = PDFNotebookRepresentable.ControllerBox()
     @State private var activePopover: ToolPopoverKind? = nil
     @State private var showPageOverview = false
+    @State private var showSyncSettings = false
     @State private var jumpPageInput: String = ""
 
     var body: some View {
         ZStack {
             PDFNotebookRepresentable(
                 pdfURL: pdfURL,
+                relativePath: relativePath,
                 toolState: toolState,
+                syncManager: syncManager,
                 controllerBox: controllerBox
             )
             .ignoresSafeArea()
@@ -80,6 +86,13 @@ struct NotebookScreen: View {
         .sheet(isPresented: $showPageOverview) {
             PageOverviewSheet(toolState: toolState, controllerBox: controllerBox)
                 .preferredColorScheme(.dark)
+        }
+        .sheet(isPresented: $showSyncSettings) {
+            DriveSyncSettingsSheet(syncManager: syncManager, vault: vault)
+                .preferredColorScheme(.dark)
+                .onDisappear {
+                    controllerBox.vc?.startLiveDriveSync()
+                }
         }
     }
 
@@ -233,6 +246,26 @@ struct NotebookScreen: View {
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.white.opacity(0.88))
                             .frame(width: 34, height: 34)
+                    }
+
+                    SyncStatusDotButton(syncManager: syncManager) {
+                        activePopover = .sync
+                    }
+                    .popover(isPresented: Binding(
+                        get: { activePopover == .sync },
+                        set: { if !$0 { activePopover = nil } }
+                    )) {
+                        SyncStatusPopoverView(
+                            syncManager: syncManager,
+                            onSyncNow: {
+                                controllerBox.vc?.saveNow()
+                                controllerBox.vc?.syncNowWithDrive(silent: false)
+                            },
+                            onOpenSettings: {
+                                activePopover = nil
+                                showSyncSettings = true
+                            }
+                        )
                     }
                 }
                 .padding(.horizontal, 6)

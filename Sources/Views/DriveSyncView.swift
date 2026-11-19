@@ -1,0 +1,265 @@
+import SwiftUI
+
+struct SyncStatusDotButton: View {
+    @ObservedObject var syncManager: DriveSyncManager
+    let action: () -> Void
+    @State private var pulse = false
+
+    private var dotColor: Color {
+        switch syncManager.visualState {
+        case .ok: return Color(red: 0.19, green: 0.82, blue: 0.35)
+        case .syncing: return Color(red: 0.04, green: 0.52, blue: 1.0)
+        case .error: return Color(red: 1.0, green: 0.27, blue: 0.23)
+        case .disconnected: return Color(white: 0.56)
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(dotColor.opacity(0.24))
+                    .frame(width: 22, height: 22)
+                    .scaleEffect(syncManager.visualState == .syncing && pulse ? 1.18 : 0.92)
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 11, height: 11)
+            }
+            .frame(width: 34, height: 34)
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+}
+
+struct SyncStatusPopoverView: View {
+    @ObservedObject var syncManager: DriveSyncManager
+    let onSyncNow: () -> Void
+    let onOpenSettings: () -> Void
+
+    private var dotColor: Color {
+        switch syncManager.visualState {
+        case .ok: return .green
+        case .syncing: return .blue
+        case .error: return .red
+        case .disconnected: return .gray
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Circle().fill(dotColor).frame(width: 10, height: 10)
+                Text(syncManager.statusText)
+                    .font(.headline)
+                Spacer()
+                Text(syncManager.config.driveFolder)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                row("Uploaded this session", syncManager.formatBytes(syncManager.sessionBytesUp))
+                row("Downloaded this session", syncManager.formatBytes(syncManager.sessionBytesDown))
+                row("Books synced", "\(syncManager.sessionBooksSynced)")
+                if let last = syncManager.lastSyncedAt {
+                    row("Last synced", last.formatted(date: .omitted, time: .standard))
+                }
+            }
+
+            if !syncManager.lastError.isEmpty {
+                Text(syncManager.lastError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
+            HStack(spacing: 8) {
+                if syncManager.config.isConnected {
+                    Button {
+                        onSyncNow()
+                    } label: {
+                        Text(syncManager.visualState == .syncing ? "Syncing…" : "Sync Now")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(syncManager.visualState == .syncing)
+                }
+                Button("Settings") {
+                    onOpenSettings()
+                }
+                .buttonStyle(.bordered)
+                .frame(maxWidth: syncManager.config.isConnected ? nil : .infinity)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k).font(.caption).foregroundColor(.secondary)
+            Spacer()
+            Text(v).font(.caption.weight(.semibold))
+        }
+    }
+}
+
+struct DriveSyncSettingsSheet: View {
+    @ObservedObject var syncManager: DriveSyncManager
+    @ObservedObject var vault: VaultManager
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
+
+    @State private var authVerifier: String = ""
+    @State private var pastedRedirect: String = ""
+    @State private var feedbackMessage: String = ""
+    @State private var isFinishingAuth = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Connection Status") {
+                    HStack {
+                        Text("Status")
+                        Spacer()
+                        Text(syncManager.config.isConnected ? syncManager.statusText : "Not Connected")
+                            .foregroundColor(syncManager.config.isConnected ? .green : .secondary)
+                            .fontWeight(.semibold)
+                    }
+                    if !syncManager.config.deviceLabel.isEmpty {
+                        HStack {
+                            Text("iPad Device ID")
+                            Spacer()
+                            Text(syncManager.config.deviceLabel)
+                                .font(.caption.monospaced())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if let last = syncManager.lastSyncedAt {
+                        HStack {
+                            Text("Last Synced")
+                            Spacer()
+                            Text(last.formatted(date: .abbreviated, time: .shortened))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if !syncManager.lastError.isEmpty {
+                        Text(syncManager.lastError)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                }
+
+                Section(header: Text("Quick Setup (Recommended)"), footer: Text("Reads your existing Google Drive credentials & login directly from Obsidian Pencil Ink in your vault so you don't have to re-type anything.")) {
+                    Button {
+                        feedbackMessage = syncManager.importFromObsidianVault(vault.vaultURL)
+                    } label: {
+                        Label("Import Setup from Obsidian Vault", systemImage: "square.and.arrow.down.on.square")
+                            .fontWeight(.semibold)
+                    }
+                }
+
+                Section("Google Drive Configuration") {
+                    TextField("Google Drive Folder", text: $syncManager.config.driveFolder)
+                        .autocorrectionDisabled()
+                    TextField("OAuth Client ID", text: $syncManager.config.clientId)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    SecureField("OAuth Client Secret", text: $syncManager.config.clientSecret)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Toggle("Auto-Sync Handwriting Deltas", isOn: $syncManager.config.autoSync)
+                }
+
+                if !syncManager.config.isConnected {
+                    Section(header: Text("Sign In with Google"), footer: Text("1. Tap Open Google Sign-In and approve access.\n2. Safari will show 'can't connect to 127.0.0.1' — that is expected.\n3. Copy the full address from Safari's URL bar, paste it below, and tap Finish Sign-In.")) {
+                        Button {
+                            if let auth = syncManager.beginOAuth() {
+                                authVerifier = auth.verifier
+                                feedbackMessage = "Browser opened. Approve access, then copy the 127.0.0.1 URL and paste it below."
+                                openURL(auth.url)
+                            } else {
+                                feedbackMessage = "Enter your OAuth Client ID (or tap Import from Obsidian Vault) first."
+                            }
+                        } label: {
+                            Label("Open Google Sign-In", systemImage: "safari")
+                                .fontWeight(.semibold)
+                        }
+
+                        if !authVerifier.isEmpty {
+                            TextField("Paste http://127.0.0.1:8765/?code=... here", text: $pastedRedirect)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                            Button {
+                                isFinishingAuth = true
+                                Task {
+                                    do {
+                                        try await syncManager.finishOAuth(pasted: pastedRedirect, verifier: authVerifier)
+                                        feedbackMessage = "Connected to Google Drive!"
+                                        authVerifier = ""
+                                        pastedRedirect = ""
+                                    } catch {
+                                        feedbackMessage = error.localizedDescription
+                                    }
+                                    isFinishingAuth = false
+                                }
+                            } label: {
+                                Text(isFinishingAuth ? "Connecting…" : "Finish Sign-In")
+                                    .fontWeight(.semibold)
+                            }
+                            .disabled(isFinishingAuth || pastedRedirect.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }
+                    }
+                } else {
+                    Section("Sync Actions") {
+                        Button {
+                            Task {
+                                await syncManager.syncAllAnnotatedBooks(vault: vault)
+                                feedbackMessage = "Finished syncing annotated PDFs."
+                            }
+                        } label: {
+                            Label("Sync All Annotated Books Now", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(syncManager.visualState == .syncing)
+
+                        Button(role: .destructive) {
+                            syncManager.disconnect()
+                            feedbackMessage = "Disconnected from Google Drive."
+                        } label: {
+                            Label("Disconnect Google Drive", systemImage: "xmark.circle")
+                        }
+                    }
+                }
+
+                if !feedbackMessage.isEmpty {
+                    Section {
+                        Text(feedbackMessage)
+                            .font(.subheadline)
+                            .foregroundColor(.blue)
+                    }
+                }
+            }
+            .navigationTitle("Google Drive Sync")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        syncManager.saveConfig()
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+        }
+    }
+}
