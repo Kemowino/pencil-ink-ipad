@@ -161,6 +161,13 @@ final class TabManager: ObservableObject {
         }
     }
 
+    /// Flushes any dirty strokes/text boxes on an open tab synchronously before renaming its file on disk.
+    func prepareForRename(relativePath: String) {
+        if let tab = tabs.first(where: { $0.relativePath == relativePath }) {
+            tab.controllerBox.vc?.saveSynchronouslyBeforeRename()
+        }
+    }
+
     func handleRenamedDocument(oldRelativePath: String, newURL: URL, newRelativePath: String, newTitle: String) {
         guard let idx = tabs.firstIndex(where: { $0.relativePath == oldRelativePath }) else { return }
         let oldTab = tabs[idx]

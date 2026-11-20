@@ -40,6 +40,7 @@ struct NotebookScreen: View {
     @EnvironmentObject var palette: ToolPaletteStore
     @ObservedObject private var toolState: NotebookToolState
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var activePopover: ToolPopoverKind? = nil
     @State private var showPageOverview = false
@@ -77,6 +78,34 @@ struct NotebookScreen: View {
     private var hairlineColor: Color {
         colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.10)
     }
+
+    #if targetEnvironment(macCatalyst)
+    private let primaryBarHeight: CGFloat = 54
+    private let primaryIconFont: CGFloat = 20
+    private let primaryIconFrame: CGFloat = 44
+    private let docTitleFont: CGFloat = 17
+    private var topToolBarHeight: CGFloat { settings.compactToolbar ? 50 : 58 }
+    private var sideRailWidth: CGFloat { settings.compactToolbar ? 58 : 66 }
+    private let toolSlotFrame: CGFloat = 44
+    private let toolIconCanvas: CGFloat = 26
+    private let swatchInnerSize: CGFloat = 26
+    private let swatchRingSize: CGFloat = 33
+    private let swatchHitFrame: CGFloat = 36
+    private let pagePillFont: CGFloat = 13.5
+    #else
+    private let primaryBarHeight: CGFloat = 44
+    private var primaryIconFont: CGFloat { horizontalSizeClass == .compact ? 15.0 : 16.5 }
+    private var primaryIconFrame: CGFloat { horizontalSizeClass == .compact ? 30 : 36 }
+    private var docTitleFont: CGFloat { horizontalSizeClass == .compact ? 13.0 : 14.0 }
+    private var topToolBarHeight: CGFloat { settings.compactToolbar ? 42 : 48 }
+    private var sideRailWidth: CGFloat { settings.compactToolbar ? 48 : 54 }
+    private let toolSlotFrame: CGFloat = 36
+    private let toolIconCanvas: CGFloat = 22
+    private let swatchInnerSize: CGFloat = 22
+    private let swatchRingSize: CGFloat = 28
+    private let swatchHitFrame: CGFloat = 30
+    private let pagePillFont: CGFloat = 11.5
+    #endif
 
     var body: some View {
         VStack(spacing: 0) {
@@ -164,7 +193,7 @@ struct NotebookScreen: View {
         }
         .onChange(of: settings.hiddenTools) { _ in
             if !settings.isToolVisible(toolState.tool),
-               let fallback = DrawingTool.allCases.first(where: { settings.isToolVisible($0) }) {
+               let fallback = settings.orderedVisibleTools.first {
                 selectTool(fallback)
             }
         }
@@ -249,15 +278,15 @@ struct NotebookScreen: View {
                     HStack(spacing: 5) {
                         if toolState.isHobonichi && !toolState.currentSlotLabel.isEmpty {
                             Text(toolState.currentSlotLabel)
-                                .font(.system(size: 11.5, weight: .semibold))
+                                .font(.system(size: pagePillFont, weight: .semibold))
                             Text("·")
                                 .opacity(0.55)
                             Text("\(toolState.currentPage)/\(toolState.totalPages)")
-                                .font(.system(size: 11.5, weight: .medium))
+                                .font(.system(size: pagePillFont, weight: .medium))
                                 .monospacedDigit()
                         } else {
                             Text("Page \(toolState.currentPage) of \(toolState.totalPages)")
-                                .font(.system(size: 11.5, weight: .semibold))
+                                .font(.system(size: pagePillFont, weight: .semibold))
                                 .monospacedDigit()
                         }
                         if toolState.saveStatus != "Saved" {
@@ -349,9 +378,9 @@ struct NotebookScreen: View {
                     }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 16.5, weight: .regular))
+                        .font(.system(size: primaryIconFont, weight: .regular))
                         .foregroundColor(.primary.opacity(0.84))
-                        .frame(width: 36, height: 36)
+                        .frame(width: primaryIconFrame, height: primaryIconFrame)
                 }
             }
 
@@ -375,11 +404,11 @@ struct NotebookScreen: View {
             } label: {
                 HStack(spacing: 4) {
                     Text(tab.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: docTitleFont, weight: .semibold))
                         .foregroundColor(.primary)
                         .lineLimit(1)
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 9.5, weight: .semibold))
+                        .font(.system(size: docTitleFont * 0.68, weight: .semibold))
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: 280)
@@ -422,9 +451,9 @@ struct NotebookScreen: View {
                     }
                 } label: {
                     Image(systemName: "doc.badge.plus")
-                        .font(.system(size: 16.5, weight: .regular))
+                        .font(.system(size: primaryIconFont, weight: .regular))
                         .foregroundColor(.primary.opacity(0.84))
-                        .frame(width: 36, height: 36)
+                        .frame(width: primaryIconFrame, height: primaryIconFrame)
                 }
 
                 SyncStatusDotButton(syncManager: syncManager) {
@@ -517,14 +546,14 @@ struct NotebookScreen: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis")
-                        .font(.system(size: 16.5, weight: .medium))
+                        .font(.system(size: primaryIconFont, weight: .medium))
                         .foregroundColor(.primary.opacity(0.84))
-                        .frame(width: 36, height: 36)
+                        .frame(width: primaryIconFrame, height: primaryIconFrame)
                 }
             }
         }
-        .padding(.horizontal, 10)
-        .frame(height: 44)
+        .padding(.horizontal, 12)
+        .frame(height: primaryBarHeight)
         .background(primaryBarBg)
     }
 
@@ -557,7 +586,7 @@ struct NotebookScreen: View {
                 .frame(minWidth: geo.size.width, minHeight: geo.size.height)
             }
         }
-        .frame(height: settings.compactToolbar ? 42 : 48)
+        .frame(height: topToolBarHeight)
         .background(secondaryBarBg)
     }
 
@@ -581,7 +610,7 @@ struct NotebookScreen: View {
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
         }
-        .frame(width: settings.compactToolbar ? 48 : 54)
+        .frame(width: sideRailWidth)
         .background(secondaryBarBg)
     }
 
@@ -589,21 +618,29 @@ struct NotebookScreen: View {
 
     @ViewBuilder
     private var enabledToolButtons: some View {
-        if settings.isToolVisible(.hand) {
+        ForEach(settings.orderedVisibleTools) { tool in
+            toolButtonView(for: tool)
+        }
+    }
+
+    @ViewBuilder
+    private func toolButtonView(for tool: DrawingTool) -> some View {
+        switch tool {
+        case .hand:
             toolSlotButton(active: toolState.tool == .hand, accent: .blue) {
                 GoodnotesHandIcon(isActive: toolState.tool == .hand, isDark: colorScheme == .dark)
             } action: {
                 selectTool(.hand)
             }
-        }
 
-        if settings.isToolVisible(.pen) {
+        case .pen:
             toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
                 GoodnotesPenIcon(
                     inkColor: Color(UIColor(hex: palette.activePenColorHex)),
                     isActive: toolState.tool == .pen,
                     isDark: colorScheme == .dark
                 )
+                .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 if toolState.tool == .pen { activePopover = .pen }
                 else { selectTool(.pen) }
@@ -612,11 +649,11 @@ struct NotebookScreen: View {
                 get: { activePopover == .pen },
                 set: { if !$0 { activePopover = nil } }
             )) { penSettingsPopover }
-        }
 
-        if settings.isToolVisible(.eraser) {
+        case .eraser:
             toolSlotButton(active: toolState.tool == .eraser, accent: .blue) {
                 GoodnotesEraserIcon(isActive: toolState.tool == .eraser, isDark: colorScheme == .dark)
+                    .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 if toolState.tool == .eraser { activePopover = .eraser }
                 else { selectTool(.eraser) }
@@ -625,15 +662,15 @@ struct NotebookScreen: View {
                 get: { activePopover == .eraser },
                 set: { if !$0 { activePopover = nil } }
             )) { eraserSettingsPopover }
-        }
 
-        if settings.isToolVisible(.highlighter) {
+        case .highlighter:
             toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
                 GoodnotesHighlighterIcon(
                     accentColor: Color(UIColor(hex: palette.activeHlColorHex)),
                     isActive: toolState.tool == .highlighter,
                     isDark: colorScheme == .dark
                 )
+                .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 if toolState.tool == .highlighter { activePopover = .highlighter }
                 else { selectTool(.highlighter) }
@@ -642,19 +679,19 @@ struct NotebookScreen: View {
                 get: { activePopover == .highlighter },
                 set: { if !$0 { activePopover = nil } }
             )) { highlighterSettingsPopover }
-        }
 
-        if settings.isToolVisible(.lasso) {
+        case .lasso:
             toolSlotButton(active: toolState.tool == .lasso, accent: .blue) {
                 GoodnotesLassoIcon(isActive: toolState.tool == .lasso, isDark: colorScheme == .dark)
+                    .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 selectTool(.lasso)
             }
-        }
 
-        if settings.isToolVisible(.text) {
+        case .text:
             toolSlotButton(active: toolState.tool == .text, accent: .blue) {
                 GoodnotesTextIcon(isActive: toolState.tool == .text, isDark: colorScheme == .dark)
+                    .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 if toolState.tool == .text { activePopover = .text }
                 else { selectTool(.text) }
@@ -663,15 +700,15 @@ struct NotebookScreen: View {
                 get: { activePopover == .text },
                 set: { if !$0 { activePopover = nil } }
             )) { textSettingsPopover }
-        }
 
-        if settings.isToolVisible(.laser) {
+        case .laser:
             toolSlotButton(active: toolState.tool == .laser, accent: .red) {
                 GoodnotesLaserIcon(
                     laserColor: Color(UIColor(hex: palette.activeLaserColorHex)),
                     isActive: toolState.tool == .laser,
                     isDark: colorScheme == .dark
                 )
+                .frame(width: toolIconCanvas, height: toolIconCanvas)
             } action: {
                 if toolState.tool == .laser { activePopover = .laser }
                 else { selectTool(.laser) }
@@ -1675,13 +1712,13 @@ struct NotebookScreen: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
-                .font(.system(size: 16.5, weight: .regular))
+                .font(.system(size: primaryIconFont, weight: .regular))
                 .foregroundColor(
                     disabled
                         ? .primary.opacity(0.24)
                         : (tint ?? .primary.opacity(0.84))
                 )
-                .frame(width: 36, height: 36)
+                .frame(width: primaryIconFrame, height: primaryIconFrame)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1696,7 +1733,7 @@ struct NotebookScreen: View {
     ) -> some View {
         Button(action: action) {
             icon()
-                .frame(width: 36, height: 36)
+                .frame(width: toolSlotFrame, height: toolSlotFrame)
                 .background(
                     Circle()
                         .fill(
@@ -1718,7 +1755,7 @@ struct NotebookScreen: View {
             ZStack {
                 Circle()
                     .fill(Color(UIColor(hex: hex)))
-                    .frame(width: 22, height: 22)
+                    .frame(width: swatchInnerSize, height: swatchInnerSize)
                     .overlay(
                         Circle()
                             .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
@@ -1726,10 +1763,10 @@ struct NotebookScreen: View {
                 if selected {
                     Circle()
                         .stroke(Color.accentColor, lineWidth: 2.2)
-                        .frame(width: 28, height: 28)
+                        .frame(width: swatchRingSize, height: swatchRingSize)
                 }
             }
-            .frame(width: 30, height: 30)
+            .frame(width: swatchHitFrame, height: swatchHitFrame)
         }
         .buttonStyle(.plain)
     }
@@ -1744,22 +1781,32 @@ private struct GoodnotesThicknessCircleButton: View {
 
     @Environment(\.colorScheme) private var colorScheme
 
+    #if targetEnvironment(macCatalyst)
+    private let ringSize: CGFloat = 34
+    private let hitSize: CGFloat = 36
+    private let dotScale: CGFloat = 1.15
+    #else
+    private let ringSize: CGFloat = 30
+    private let hitSize: CGFloat = 32
+    private let dotScale: CGFloat = 1.0
+    #endif
+
     var body: some View {
         Button(action: action) {
             ZStack {
                 Circle()
                     .fill(selected ? Color.accentColor.opacity(0.16) : Color.clear)
-                    .frame(width: 30, height: 30)
+                    .frame(width: ringSize, height: ringSize)
                 if selected {
                     Circle()
                         .stroke(Color.accentColor.opacity(0.75), lineWidth: 1.5)
-                        .frame(width: 30, height: 30)
+                        .frame(width: ringSize, height: ringSize)
                 }
                 Circle()
                     .fill(selected ? Color.accentColor : (colorScheme == .dark ? Color.white.opacity(0.84) : Color(white: 0.22)))
-                    .frame(width: diameter, height: diameter)
+                    .frame(width: diameter * dotScale, height: diameter * dotScale)
             }
-            .frame(width: 32, height: 32)
+            .frame(width: hitSize, height: hitSize)
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -1772,9 +1819,15 @@ private struct GoodnotesHandIcon: View {
     let isActive: Bool
     let isDark: Bool
 
+    #if targetEnvironment(macCatalyst)
+    private let iconSize: CGFloat = 20
+    #else
+    private let iconSize: CGFloat = 16.5
+    #endif
+
     var body: some View {
         Image(systemName: isActive ? "hand.raised.fill" : "hand.raised")
-            .font(.system(size: 16.5, weight: .regular))
+            .font(.system(size: iconSize, weight: .regular))
             .foregroundColor(isActive ? (isDark ? .white : .blue) : (isDark ? .white.opacity(0.86) : Color(white: 0.22)))
     }
 }
@@ -1808,7 +1861,6 @@ private struct GoodnotesPenIcon: View {
             nib.addLine(to: CGPoint(x: w * 0.44, y: h * 0.76))
             ctx.stroke(nib, with: .color(stroke), style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round))
         }
-        .frame(width: 22, height: 22)
     }
 }
 
@@ -1841,7 +1893,6 @@ private struct GoodnotesEraserIcon: View {
             line.addLine(to: CGPoint(x: w * 0.84, y: h * 0.82))
             ctx.stroke(line, with: .color(stroke.opacity(0.55)), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
         }
-        .frame(width: 22, height: 22)
     }
 }
 
@@ -1875,7 +1926,6 @@ private struct GoodnotesHighlighterIcon: View {
             nib.addLine(to: CGPoint(x: w * 0.48, y: h * 0.72))
             ctx.stroke(nib, with: .color(stroke), style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round))
         }
-        .frame(width: 22, height: 22)
     }
 }
 
@@ -1899,7 +1949,6 @@ private struct GoodnotesLassoIcon: View {
             tail.addQuadCurve(to: CGPoint(x: w * 0.40, y: h * 0.90), control: CGPoint(x: w * 0.28, y: h * 0.87))
             ctx.stroke(tail, with: .color(stroke), style: StrokeStyle(lineWidth: 1.55, lineCap: .round))
         }
-        .frame(width: 22, height: 22)
     }
 }
 
@@ -1931,7 +1980,6 @@ private struct GoodnotesTextIcon: View {
             tBase.addLine(to: CGPoint(x: w * 0.58, y: h * 0.70))
             ctx.stroke(tBase, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
         }
-        .frame(width: 22, height: 22)
     }
 }
 
@@ -1962,6 +2010,5 @@ private struct GoodnotesLaserIcon: View {
             let core = Path(ellipseIn: CGRect(x: cx - coreR, y: cy - coreR, width: coreR * 2, height: coreR * 2))
             ctx.fill(core, with: .color(dot))
         }
-        .frame(width: 22, height: 22)
     }
 }

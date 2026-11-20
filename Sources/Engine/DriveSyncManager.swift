@@ -154,8 +154,12 @@ final class DriveSyncManager: ObservableObject {
     @Published var sessionBytesDown: Int64 = 0
     @Published var sessionBooksSynced: Int = 0
     @Published var activeBookName: String = ""
+    @Published var syncProgressText: String = ""
+    @Published var isSyncingVault: Bool = false
 
     private let configKey = "pencilink.native.drive.config.v1"
+    private var lastVaultSyncAt: Date? = nil
+    private var activeVaultSyncTask: Task<(downloadedPDFs: Int, uploadedPDFs: Int, syncedBooks: Int), Never>? = nil
     private let client: GoogleDriveClient
     private var logStates: [String: BookLogState] = [:]
     private var logSeen: [String: [String: RemoteLogEntry]] = [:]
@@ -432,7 +436,6 @@ final class DriveSyncManager: ObservableObject {
         pendingFollowups.removeValue(forKey: oldInk)
 
         let oldStateURL = logStateURL(for: oldInk)
-        let newStateURL = logStateURL(for: newInk)
         var migratedState = logStates.removeValue(forKey: oldInk)
         if migratedState == nil,
            let data = try? Data(contentsOf: oldStateURL),
@@ -624,28 +627,290 @@ final class DriveSyncManager: ObservableObject {
     }
 
     func syncAllAnnotatedBooks(vault: VaultManager) async {
-        guard config.isConnected, let root = vault.vaultURL else { return }
-        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
-        let annotated = vault.pdfs.filter { $0.hasInk }
-        guard !annotated.isEmpty else {
-            lastSyncedAt = Date()
-            visualState = .ok
-            statusText = "Synced"
-            return
-        }
-        for item in annotated {
-            let itemPath = item.url.standardizedFileURL.resolvingSymlinksInPath().path
-            let rel: String
-            if itemPath.hasPrefix(rootPath) {
-                rel = String(itemPath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            } else {
-                rel = item.url.lastPathComponent
+        _ = await syncVault(vault: vault, force: true)
+    }
+
+    /// Uploads a newly created or imported local PDF (plus its initial `.ink.json` if present, e.g. Hobonichi journal)
+    /// to Google Drive immediately so other devices (iPhone/iPad/Mac) automatically download it.
+    func uploadNewBookToDrive(pdfURL: URL, relativePath: String) {
+        guard config.isConnected, config.autoSync, config.syncPDFs else { return }
+        let currentCfg = config
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.client.updateConfig(currentCfg)
+            let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let rawDir = (cleanRel as NSString).deletingLastPathComponent
+            let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
+            let fileName = (cleanRel as NSString).lastPathComponent
+            do {
+                self.visualState = .syncing
+                self.syncProgressText = "Uploading \(fileName)…"
+                self.statusText = "Uploading…"
+                let parentID = try await self.client.ensureRemoteDir(relativeDir: dir)
+                let existing = try await self.client.findChildren(parentID: parentID, name: fileName)
+                if existing.isEmpty {
+                    _ = try await self.client.uploadPDFFile(fileURL: pdfURL, name: fileName, parentID: parentID)
+                }
+                let sidecar = InkDocument.sidecarURL(for: pdfURL)
+                if FileManager.default.fileExists(atPath: sidecar.path) {
+                    let local = InkDocument.load(for: pdfURL)
+                    _ = await self.syncBook(pdfURL: pdfURL, relativePath: cleanRel, localDoc: local, forceFolderScan: true)
+                }
+                let totals = await self.client.getTransferTotals()
+                self.sessionBytesUp = totals.up
+                self.sessionBytesDown = totals.down
+                self.lastSyncedAt = Date()
+                self.lastError = ""
+                self.syncProgressText = ""
+                self.visualState = .ok
+                self.statusText = "Synced"
+            } catch {
+                self.syncProgressText = ""
+                self.lastError = error.localizedDescription
+                self.visualState = .error
+                self.statusText = "Sync Error"
             }
-            let local = InkDocument.load(for: item.url)
-            if let (merged, changed) = await syncBook(pdfURL: item.url, relativePath: rel, localDoc: local, forceFolderScan: true), changed {
-                try? merged.save(for: item.url)
+        }
+    }
+
+    /// Full Bidirectional Vault Sync (Global across iPhone/LiveContainer, iPad, and Mac):
+    /// 1. Scans the Google Drive sync root folder for ALL `.pdf` files and `.ink.d` annotation folders.
+    /// 2. Downloads any remote PDFs missing locally (streaming to disk, smallest first for instant UI feedback).
+    /// 3. Uploads any local PDFs missing on Google Drive (when `config.syncPDFs` is enabled).
+    /// 4. Syncs `.ink.d` & `txt_*.json` annotations for EVERY book that has EITHER local ink OR remote annotations!
+    @discardableResult
+    func syncVault(
+        vault: VaultManager,
+        force: Bool = false
+    ) async -> (downloadedPDFs: Int, uploadedPDFs: Int, syncedBooks: Int) {
+        guard config.isConnected, vault.vaultURL != nil else {
+            return (0, 0, 0)
+        }
+        if !force {
+            guard config.autoSync, AppSettings.shared.syncMode == .smart else {
+                return (0, 0, 0)
+            }
+            if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < 20.0 {
+                return (0, 0, 0)
             }
         }
+        if let existingTask = activeVaultSyncTask {
+            return await existingTask.value
+        }
+
+        let task = Task<(downloadedPDFs: Int, uploadedPDFs: Int, syncedBooks: Int), Never> { @MainActor [weak self] in
+            guard let self else { return (0, 0, 0) }
+            self.isSyncingVault = true
+            self.visualState = .syncing
+            self.statusText = "Scanning Drive…"
+            self.syncProgressText = "Checking Google Drive for new PDFs & notes…"
+            self.lastError = ""
+            defer {
+                self.isSyncingVault = false
+                self.syncProgressText = ""
+                self.lastVaultSyncAt = Date()
+            }
+
+            var downloadedCount = 0
+            var uploadedCount = 0
+            var syncedAnnotationsCount = 0
+
+            do {
+                await self.client.updateConfig(self.config)
+                let rootID = try await self.client.resolveRootFolderID()
+                let tree = try await self.client.listVaultTree(rootID: rootID)
+                await vault.refreshPDFListAsync()
+
+                // Smart vault-root prefix alignment (handles Drive having `My Notes/Folder/Book.pdf`
+                // while local vault root is `My Notes/`, or vice versa!)
+                let alignment = self.detectRootPrefixAlignment(localPDFs: vault.pdfs, remotePDFs: tree.pdfs)
+
+                func remoteToLocalRel(_ remoteRel: String) -> String {
+                    let trimmed = remoteRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    if !alignment.remoteStripPrefix.isEmpty && trimmed.lowercased().hasPrefix(alignment.remoteStripPrefix.lowercased()) {
+                        return String(trimmed.dropFirst(alignment.remoteStripPrefix.count))
+                    }
+                    if !alignment.localExtraPrefix.isEmpty {
+                        return alignment.localExtraPrefix + trimmed
+                    }
+                    return trimmed
+                }
+
+                func localToRemoteRel(_ localRel: String) -> String {
+                    let trimmed = localRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    if !alignment.localExtraPrefix.isEmpty && trimmed.lowercased().hasPrefix(alignment.localExtraPrefix.lowercased()) {
+                        return String(trimmed.dropFirst(alignment.localExtraPrefix.count))
+                    }
+                    if !alignment.remoteStripPrefix.isEmpty {
+                        return alignment.remoteStripPrefix + trimmed
+                    }
+                    return trimmed
+                }
+
+                // 1. Download any PDFs on Google Drive that are missing locally!
+                if self.config.syncPDFs {
+                    var localLowerSet = Set(vault.pdfs.map { $0.relativePath.lowercased() })
+                    let missingRemote = tree.pdfs
+                        .filter { !localLowerSet.contains(remoteToLocalRel($0.relativePath).lowercased()) }
+                        .sorted { $0.sizeBytes < $1.sizeBytes }
+
+                    let isoFull = ISO8601DateFormatter()
+                    isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    let isoBasic = ISO8601DateFormatter()
+
+                    for (idx, remote) in missingRemote.enumerated() {
+                        let localRel = remoteToLocalRel(remote.relativePath)
+                        let sizeLabel = remote.sizeBytes > 0 ? " (\(self.formatBytes(remote.sizeBytes)))" : ""
+                        self.syncProgressText = "Downloading PDF \(idx + 1)/\(missingRemote.count): \(remote.meta.name)\(sizeLabel)…"
+                        self.statusText = "Downloading \(idx + 1)/\(missingRemote.count)…"
+                        do {
+                            let tempFile = try await self.client.downloadToFile(fileID: remote.meta.id)
+                            let modDate: Date? = remote.meta.modifiedTime.flatMap {
+                                isoFull.date(from: $0) ?? isoBasic.date(from: $0)
+                            }
+                            _ = try vault.installDownloadedPDF(from: tempFile, relativePath: localRel, modifiedAt: modDate)
+                            localLowerSet.insert(localRel.lowercased())
+                            downloadedCount += 1
+                            await vault.refreshPDFListAsync()
+                        } catch {
+                            self.lastError = "Failed downloading \(remote.meta.name): \(error.localizedDescription)"
+                        }
+                    }
+
+                    // 2. Upload any local PDFs that do not exist on Google Drive yet!
+                    let remoteLowerSet = Set(tree.pdfs.map { $0.relativePath.lowercased() })
+                    let missingOnDrive = vault.pdfs.filter { item in
+                        let remRel = localToRemoteRel(item.relativePath)
+                        return !remoteLowerSet.contains(remRel.lowercased())
+                    }
+
+                    for (idx, item) in missingOnDrive.enumerated() {
+                        let remRel = localToRemoteRel(item.relativePath)
+                        let rawDir = (remRel as NSString).deletingLastPathComponent
+                        let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
+                        let fileName = (remRel as NSString).lastPathComponent
+                        self.syncProgressText = "Uploading PDF \(idx + 1)/\(missingOnDrive.count): \(fileName)…"
+                        self.statusText = "Uploading \(idx + 1)/\(missingOnDrive.count)…"
+                        do {
+                            vault.ensureSecurityScopeActive()
+                            let parentID = try await self.client.ensureRemoteDir(relativeDir: dir)
+                            let doubleCheck = try await self.client.findChildren(parentID: parentID, name: fileName)
+                            if doubleCheck.isEmpty {
+                                _ = try await self.client.uploadPDFFile(fileURL: item.url, name: fileName, parentID: parentID)
+                                uploadedCount += 1
+                            }
+                        } catch {
+                            self.lastError = "Failed uploading \(fileName): \(error.localizedDescription)"
+                        }
+                    }
+                }
+
+                // 3. Sync annotations for EVERY local book that EITHER has local ink OR has a remote `.ink.d` folder!
+                let remoteAnnotatedLower = Set(tree.annotatedPDFPaths.map { remoteToLocalRel($0).lowercased() })
+                let remoteAnnotatedNames = Set(tree.annotatedPDFPaths.map { ($0 as NSString).lastPathComponent.lowercased() })
+                let booksToSync = vault.pdfs.filter { item in
+                    item.hasInk
+                        || remoteAnnotatedLower.contains(item.relativePath.lowercased())
+                        || remoteAnnotatedNames.contains(item.url.lastPathComponent.lowercased())
+                }
+
+                for (idx, item) in booksToSync.enumerated() {
+                    self.syncProgressText = "Syncing notes \(idx + 1)/\(booksToSync.count): \(item.name)…"
+                    let local = InkDocument.load(for: item.url)
+                    if let (merged, changed) = await self.syncBook(
+                        pdfURL: item.url,
+                        relativePath: item.relativePath,
+                        localDoc: local,
+                        forceFolderScan: force || downloadedCount > 0
+                    ) {
+                        if changed {
+                            try? merged.save(for: item.url)
+                        }
+                        syncedAnnotationsCount += 1
+                    }
+                }
+
+                if downloadedCount > 0 || syncedAnnotationsCount > 0 {
+                    await vault.refreshPDFListAsync()
+                }
+
+                let totals = await self.client.getTransferTotals()
+                self.sessionBytesUp = totals.up
+                self.sessionBytesDown = totals.down
+                self.lastSyncedAt = Date()
+                if self.lastError.isEmpty {
+                    self.visualState = .ok
+                    self.statusText = "Synced"
+                } else {
+                    self.visualState = .error
+                    self.statusText = "Sync Error"
+                }
+                self.lastDiagnostic = "Vault: \(tree.pdfs.count) on Drive · ↓\(downloadedCount) new PDFs · ↑\(uploadedCount) uploaded · \(syncedAnnotationsCount) notes synced"
+            } catch {
+                self.lastError = error.localizedDescription
+                if let de = error as? DriveClientError, de.isFatalAuth {
+                    self.visualState = .disconnected
+                    self.statusText = "Sign-In Expired"
+                } else {
+                    self.visualState = .error
+                    self.statusText = "Sync Error"
+                }
+            }
+            return (downloadedCount, uploadedCount, syncedAnnotationsCount)
+        }
+
+        activeVaultSyncTask = task
+        let res = await task.value
+        activeVaultSyncTask = nil
+        return res
+    }
+
+    /// Detects if the Drive folder has one extra wrapper directory (or local does) by comparing existing local PDFs with Drive PDFs.
+    private func detectRootPrefixAlignment(
+        localPDFs: [PDFItem],
+        remotePDFs: [RemotePDFFile]
+    ) -> (remoteStripPrefix: String, localExtraPrefix: String) {
+        guard !localPDFs.isEmpty, !remotePDFs.isEmpty else { return ("", "") }
+        let localSet = Set(localPDFs.map { $0.relativePath.lowercased() })
+        let remoteSet = Set(remotePDFs.map { $0.relativePath.lowercased() })
+
+        if !localSet.isDisjoint(with: remoteSet) {
+            return ("", "")
+        }
+
+        var remotePrefixVotes: [String: Int] = [:]
+        for rem in remotePDFs {
+            let rLow = rem.relativePath.lowercased()
+            for loc in localPDFs {
+                let lLow = loc.relativePath.lowercased()
+                if rLow.hasSuffix("/" + lLow) {
+                    let prefLen = rem.relativePath.count - loc.relativePath.count
+                    let pref = String(rem.relativePath.prefix(prefLen))
+                    remotePrefixVotes[pref, default: 0] += 1
+                }
+            }
+        }
+        if let best = remotePrefixVotes.max(by: { $0.value < $1.value }), best.value > 0 {
+            return (best.key, "")
+        }
+
+        var localPrefixVotes: [String: Int] = [:]
+        for loc in localPDFs {
+            let lLow = loc.relativePath.lowercased()
+            for rem in remotePDFs {
+                let rLow = rem.relativePath.lowercased()
+                if lLow.hasSuffix("/" + rLow) {
+                    let prefLen = loc.relativePath.count - rem.relativePath.count
+                    let pref = String(loc.relativePath.prefix(prefLen))
+                    localPrefixVotes[pref, default: 0] += 1
+                }
+            }
+        }
+        if let best = localPrefixVotes.max(by: { $0.value < $1.value }), best.value > 0 {
+            return ("", best.key)
+        }
+
+        return ("", "")
     }
 
     // MARK: - Core Bidirectional CRDT Sync (Exact Match to Obsidian `src/logs.ts` & `src/sync.ts`)
@@ -867,12 +1132,18 @@ final class DriveSyncManager: ObservableObject {
             recordLocalChanges(st: &st, local: localDoc, nowMs: nowMs, remoteView: remoteView)
         }
 
-        // Prune any of our own strokes that a remote device erased
+        // Prune any of our own strokes & text boxes that a remote device erased
         if let rv = remoteView {
             for key in Array(st.own.keys) {
                 if let ss = st.own[key], ss.contains(where: { rv.deleted[$0.id] != nil }) {
                     st.own[key] = ss.filter { rv.deleted[$0.id] == nil }
                     st.markDirty(BookLogState.pageFile(label: st.label, key: key))
+                }
+            }
+            for key in Array(st.ownTexts.keys) {
+                if let tbs = st.ownTexts[key], tbs.contains(where: { rv.deleted[$0.id] != nil }) {
+                    st.ownTexts[key] = tbs.filter { rv.deleted[$0.id] == nil }
+                    st.markDirty(BookLogState.textsFile(label: st.label))
                 }
             }
         }

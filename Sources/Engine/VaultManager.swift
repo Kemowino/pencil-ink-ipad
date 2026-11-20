@@ -31,9 +31,47 @@ final class VaultManager: ObservableObject {
     @Published var journalPaths: Set<String> = []
     @Published var favoritePaths: Set<String> = []
     @Published var recentPaths: [String] = []
+    @Published var lastSavedVaultName: String = ""
 
     private let bookmarkKey = "pencilink.vault.bookmark.v1"
+    private let useLocalVaultKey = "pencilink.vault.useLocal.v1"
+    private let lastVaultPathKey = "pencilink.vault.lastPath.v1"
+    private let lastVaultNameKey = "pencilink.vault.lastName.v1"
     private let coverColorsKey = "pencilink.native.coverColors.v1"
+
+    /// True when executing as a guest app inside LiveContainer on iOS/iPadOS.
+    static var isRunningInLiveContainer: Bool {
+        #if targetEnvironment(macCatalyst)
+        return false
+        #else
+        let env = ProcessInfo.processInfo.environment
+        if env["LC_HOME_PATH"] != nil || env["LC_GLOBAL_TWEAK_FOLDER"] != nil {
+            return true
+        }
+        let bundlePath = Bundle.main.bundlePath.lowercased()
+        let homePath = NSHomeDirectory().lowercased()
+        if bundlePath.contains("livecontainer") || homePath.contains("livecontainer") {
+            return true
+        }
+        // LiveContainer loads guest bundles from inside `/Documents/Applications/`
+        if bundlePath.contains("/documents/applications/") {
+            return true
+        }
+        return false
+        #endif
+    }
+
+    static var localFolderDisplayName: String {
+        #if targetEnvironment(macCatalyst)
+        return "Local App Folder"
+        #else
+        if isRunningInLiveContainer {
+            return "LiveContainer App Folder"
+        }
+        let device = UIDevice.current.userInterfaceIdiom == .pad ? "On My iPad" : "On My iPhone"
+        return "\(device) → Pencil Ink"
+        #endif
+    }
     private let journalPathsKey = "pencilink.native.journalPaths.v1"
     private let favoritePathsKey = "pencilink.native.favoritePaths.v1"
     private let recentPathsKey = "pencilink.native.recentPaths.v1"
@@ -182,21 +220,39 @@ final class VaultManager: ObservableObject {
             statusMessage = "Could not locate app Documents folder."
             return
         }
+        try? FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
         isUsingLocalFallback = true
         scopedRootURL = docs
         vaultURL = docs
-        statusMessage = "Using On My iPad → Pencil Ink folder."
+        lastSavedVaultName = Self.localFolderDisplayName
+        UserDefaults.standard.set(true, forKey: useLocalVaultKey)
+        UserDefaults.standard.removeObject(forKey: bookmarkKey)
+        UserDefaults.standard.set(docs.path, forKey: lastVaultPathKey)
+        UserDefaults.standard.set(Self.localFolderDisplayName, forKey: lastVaultNameKey)
+        statusMessage = ""
         refreshPDFList()
     }
 
     func setVaultFolder(_ url: URL) {
         stopAccessingVault()
         isUsingLocalFallback = false
+        UserDefaults.standard.set(false, forKey: useLocalVaultKey)
         let started = url.startAccessingSecurityScopedResource()
         accessingRoot = started
         scopedRootURL = url
-        vaultURL = resolveEffectiveVaultRoot(from: url)
-        statusMessage = started ? "" : "Folder selected (if running in LiveContainer, enable Fix File Picker or install via SideStore)."
+        let effective = resolveEffectiveVaultRoot(from: url)
+        vaultURL = effective
+        lastSavedVaultName = effective.lastPathComponent
+        UserDefaults.standard.set(effective.path, forKey: lastVaultPathKey)
+        UserDefaults.standard.set(effective.lastPathComponent, forKey: lastVaultNameKey)
+
+        if started || FileManager.default.isReadableFile(atPath: effective.path) {
+            statusMessage = ""
+        } else if Self.isRunningInLiveContainer {
+            statusMessage = "Folder selected in LiveContainer. If files don't load, long-press Pencil Ink in LiveContainer → Settings → enable \"Fix File Picker\" (or tap Use LiveContainer App Folder + Google Drive Sync)."
+        } else {
+            statusMessage = "Folder selected, waiting for read permission."
+        }
 
         do {
             let bookmark = try url.bookmarkData(
@@ -206,39 +262,93 @@ final class VaultManager: ObservableObject {
             )
             UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
         } catch {
-            statusMessage = "Connected for this session, but bookmark save failed: \(error.localizedDescription)"
+            if Self.isRunningInLiveContainer {
+                statusMessage = "Connected for this session. Inside LiveContainer, enable \"Fix File Picker\" or use LiveContainer App Folder for permanent access."
+            } else {
+                statusMessage = "Connected for this session, but bookmark save failed: \(error.localizedDescription)"
+            }
         }
         refreshPDFList()
     }
 
     func restoreSavedVault() {
-        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return }
-        var stale = false
-        do {
-            let url = try URL(
-                resolvingBookmarkData: data,
-                options: [],
-                relativeTo: nil,
-                bookmarkDataIsStale: &stale
-            )
-            accessingRoot = url.startAccessingSecurityScopedResource()
-            isUsingLocalFallback = false
-            scopedRootURL = url
-            vaultURL = resolveEffectiveVaultRoot(from: url)
-            if stale {
-                setVaultFolder(url)
-            } else {
-                refreshPDFList()
+        lastSavedVaultName = UserDefaults.standard.string(forKey: lastVaultNameKey) ?? ""
+
+        // 1. If user chose Local App Folder (super reliable in LiveContainer!), restore immediately!
+        if UserDefaults.standard.bool(forKey: useLocalVaultKey) {
+            useLocalDocumentsFolder()
+            return
+        }
+
+        // 2. Try resolving saved security-scoped bookmark
+        if let data = UserDefaults.standard.data(forKey: bookmarkKey) {
+            var stale = false
+            do {
+                let url = try URL(
+                    resolvingBookmarkData: data,
+                    options: [],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &stale
+                )
+                let started = url.startAccessingSecurityScopedResource()
+                accessingRoot = started
+                isUsingLocalFallback = false
+                scopedRootURL = url
+                let effective = resolveEffectiveVaultRoot(from: url)
+                if started || FileManager.default.isReadableFile(atPath: effective.path) {
+                    vaultURL = effective
+                    lastSavedVaultName = effective.lastPathComponent
+                    if stale {
+                        if let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                            UserDefaults.standard.set(fresh, forKey: bookmarkKey)
+                        }
+                    }
+                    refreshPDFList()
+                    return
+                }
+            } catch {
+                // Fall through to LiveContainer direct-path check below before giving up
             }
-        } catch {
-            UserDefaults.standard.removeObject(forKey: bookmarkKey)
+        }
+
+        // 3. LiveContainer fallback: if the last folder path is still directly readable (e.g. external data folder / shared container), restore it seamlessly!
+        if let lastPath = UserDefaults.standard.string(forKey: lastVaultPathKey), !lastPath.isEmpty {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: lastPath, isDirectory: &isDir),
+               isDir.boolValue,
+               FileManager.default.isReadableFile(atPath: lastPath) {
+                let url = URL(fileURLWithPath: lastPath, isDirectory: true)
+                isUsingLocalFallback = false
+                scopedRootURL = url
+                vaultURL = resolveEffectiveVaultRoot(from: url)
+                refreshPDFList()
+                return
+            } else if Self.isRunningInLiveContainer && !lastSavedVaultName.isEmpty {
+                statusMessage = "LiveContainer reset external folder permission for \"\(lastSavedVaultName)\". Re-select the folder (with Fix File Picker enabled) or switch to LiveContainer App Folder + Drive Sync."
+            }
         }
     }
 
-    func refreshPDFList() {
+    func ensureSecurityScopeActive() {
+        if !accessingRoot, let url = scopedRootURL, !isUsingLocalFallback {
+            accessingRoot = url.startAccessingSecurityScopedResource()
+        }
+    }
+
+    func refreshPDFListAsync() async {
+        await withCheckedContinuation { cont in
+            refreshPDFList {
+                cont.resume()
+            }
+        }
+    }
+
+    func refreshPDFList(completion: (() -> Void)? = nil) {
+        ensureSecurityScopeActive()
         guard let root = vaultURL else {
             pdfs = []
             allFolders = []
+            completion?()
             return
         }
         let fm = FileManager.default
@@ -329,6 +439,7 @@ final class VaultManager: ObservableObject {
                 if let err = scanErr {
                     self.statusMessage = err
                 }
+                completion?()
             }
         }
     }
@@ -561,18 +672,71 @@ final class VaultManager: ObservableObject {
         refreshPDFList()
     }
 
+    /// Installs a PDF streamed from Google Drive into `<vaultRoot>/<relativePath>`, creating any missing subfolders
+    /// and falling back cleanly from NSFileCoordinator to direct atomic copy if running inside LiveContainer.
+    func installDownloadedPDF(from tempURL: URL, relativePath: String, modifiedAt: Date? = nil) throws -> URL {
+        ensureSecurityScopeActive()
+        guard let root = vaultURL else {
+            throw NSError(domain: "VaultManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Select a vault folder first."])
+        }
+        let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let dest = root.appendingPathComponent(cleanRel, isDirectory: false)
+        let parentDir = dest.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+
+        var coordError: NSError?
+        var copyError: Error?
+        var didCopy = false
+        NSFileCoordinator().coordinate(writingItemAt: dest, options: .forReplacing, error: &coordError) { coordURL in
+            do {
+                if FileManager.default.fileExists(atPath: coordURL.path) {
+                    try FileManager.default.removeItem(at: coordURL)
+                }
+                try FileManager.default.copyItem(at: tempURL, to: coordURL)
+                didCopy = true
+            } catch {
+                copyError = error
+            }
+        }
+        if !didCopy || copyError != nil || coordError != nil {
+            do {
+                if FileManager.default.fileExists(atPath: dest.path) {
+                    try FileManager.default.removeItem(at: dest)
+                }
+                try FileManager.default.copyItem(at: tempURL, to: dest)
+            } catch {
+                throw copyError ?? coordError ?? error
+            }
+        }
+        if let mod = modifiedAt {
+            try? FileManager.default.setAttributes([.modificationDate: mod], ofItemAtPath: dest.path)
+        }
+        try? FileManager.default.removeItem(at: tempURL)
+        return dest
+    }
+
     private func writeCoordinated(data: Data, to url: URL) throws {
+        ensureSecurityScopeActive()
+        let parentDir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+
         var coordError: NSError?
         var writeError: Error?
+        var didWrite = false
         NSFileCoordinator().coordinate(writingItemAt: url, options: .forReplacing, error: &coordError) { coordURL in
             do {
                 try data.write(to: coordURL, options: .atomic)
+                didWrite = true
             } catch {
                 writeError = error
             }
         }
-        if let err = writeError ?? coordError {
-            throw err
+        if !didWrite || writeError != nil || coordError != nil {
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                throw writeError ?? coordError ?? error
+            }
         }
     }
 }

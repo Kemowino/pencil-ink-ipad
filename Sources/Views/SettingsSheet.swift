@@ -61,7 +61,7 @@ struct SettingsSheet: View {
                     } label: {
                         HStack(spacing: 12) {
                             settingsIconBadge("wrench.and.screwdriver.fill", color: .blue)
-                            Text("Show / Hide Toolbar Tools")
+                            Text("Reorder & Show/Hide Tools")
                             Spacer()
                             let enabledCount = DrawingTool.allCases.filter { settings.isToolVisible($0) }.count
                             Text("\(enabledCount)/\(DrawingTool.allCases.count)")
@@ -109,7 +109,7 @@ struct SettingsSheet: View {
                             tabManager.closeAllTabs()
                             toastNote = "Closed all open tabs."
                         } label: {
-                            Label("Close All Open Tabs (\(tabManager.tabs.count))", systemImage: "xmark.rectangle.on.rectangle")
+                            Label("Close All Open Tabs (\(tabManager.tabs.count))", systemImage: "xmark.square")
                         }
                     }
                 }
@@ -171,6 +171,19 @@ struct SettingsSheet: View {
                         }
                     }
 
+                    if !vault.isUsingLocalFallback {
+                        Button {
+                            vault.useLocalDocumentsFolder()
+                            toastNote = "Switched to \(VaultManager.localFolderDisplayName)."
+                        } label: {
+                            HStack(spacing: 12) {
+                                settingsIconBadge("internaldrive", color: .indigo)
+                                Text("Use \(VaultManager.localFolderDisplayName)")
+                                    .foregroundColor(.primary)
+                            }
+                        }
+                    }
+
                     Button {
                         vault.clearThumbnailCache()
                         toastNote = "Thumbnail cache cleared."
@@ -196,7 +209,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v1.3.0")
+                        Text("v1.4.1")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }
@@ -245,34 +258,87 @@ struct SettingsSheet: View {
     }
 }
 
-/// Dedicated Toolbar Customization sub-screen (add/remove any tool & reset layout).
+/// Dedicated Toolbar Customization sub-screen: reorder tools (drag or up/down arrows), toggle visibility, & reset.
 struct ToolbarToolsCustomizationView: View {
     @EnvironmentObject var settings: AppSettings
 
     var body: some View {
-        Form {
+        let tools = settings.orderedTools
+        List {
             Section(
-                header: Text("Visible Drawing Tools"),
-                footer: Text("Toggle tools on or off to keep your toolbar minimal. At least one tool must remain visible.")
+                header: Text("Tool Order & Visibility"),
+                footer: Text("Drag rows or use the arrows to arrange tools in any order. Toggle switches to show or hide tools.")
             ) {
-                ForEach(DrawingTool.allCases) { tool in
-                    Toggle(isOn: Binding(
-                        get: { settings.isToolVisible(tool) },
-                        set: { settings.setToolVisible(tool, visible: $0) }
-                    )) {
+                ForEach(Array(tools.enumerated()), id: \.element.id) { idx, tool in
+                    HStack(spacing: 10) {
+                        HStack(spacing: 4) {
+                            Button {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    settings.moveTool(tool, offset: -1)
+                                }
+                                Haptics.selection()
+                            } label: {
+                                Image(systemName: "chevron.up")
+                                    .font(.system(size: 11.5, weight: .bold))
+                                    .foregroundColor(idx == 0 ? .secondary.opacity(0.28) : .secondary)
+                                    .frame(width: 24, height: 26)
+                                    .background(Color.primary.opacity(0.05))
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(idx == 0)
+
+                            Button {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    settings.moveTool(tool, offset: 1)
+                                }
+                                Haptics.selection()
+                            } label: {
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 11.5, weight: .bold))
+                                    .foregroundColor(idx == tools.count - 1 ? .secondary.opacity(0.28) : .secondary)
+                                    .frame(width: 24, height: 26)
+                                    .background(Color.primary.opacity(0.05))
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(idx == tools.count - 1)
+                        }
+
                         Label(tool.displayName, systemImage: tool.settingsIcon)
+                            .foregroundColor(settings.isToolVisible(tool) ? .primary : .secondary)
+
+                        Spacer()
+
+                        Toggle("", isOn: Binding(
+                            get: { settings.isToolVisible(tool) },
+                            set: { settings.setToolVisible(tool, visible: $0) }
+                        ))
+                        .labelsHidden()
                     }
+                    .padding(.vertical, 2)
+                }
+                .onMove { indices, newOffset in
+                    settings.moveTools(from: indices, to: newOffset)
                 }
             }
 
             Section {
                 Button("Reset Toolbar to Defaults") {
-                    settings.resetToolbarDefaults()
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        settings.resetToolbarDefaults()
+                    }
+                    Haptics.light()
                 }
                 .foregroundColor(.accentColor)
             }
         }
         .navigationTitle("Toolbar Tools")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                EditButton()
+            }
+        }
     }
 }

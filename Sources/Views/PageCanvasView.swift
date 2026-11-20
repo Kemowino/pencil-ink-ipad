@@ -57,8 +57,15 @@ final class PageCanvasView: UIView {
         }
         staticInkView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
         liveOverlayView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
-        layer.cornerRadius = 3
+        #if targetEnvironment(macCatalyst)
+        // Avoid offscreen GPU corner-mask compositing on Intel macOS for silky 60fps scrolling
+        layer.cornerRadius = 0
+        layer.masksToBounds = false
+        #else
+        layer.cornerRadius = 2.5
         layer.masksToBounds = true
+        #endif
+        isOpaque = true
         isUserInteractionEnabled = false
 
         if let hv = hv {
@@ -84,6 +91,7 @@ final class PageCanvasView: UIView {
         staticInkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         staticInkView.backgroundColor = .clear
         staticInkView.isOpaque = false
+        staticInkView.layer.drawsAsynchronously = true
         staticInkView.pageSize = slot.size
         addSubview(staticInkView)
 
@@ -315,10 +323,11 @@ final class PageCanvasView: UIView {
         pdfDoc: PDFDocument?,
         zoomScale: CGFloat,
         maxPixels: CGFloat = 6_000_000,
-        readingMode: PDFReadingMode = .original
+        readingMode: PDFReadingMode = .original,
+        displayScale: CGFloat = 2.0
     ) -> UIImage {
         let pageSize = slot.size
-        let dpr = min(UIScreen.main.scale, 2.0)
+        let dpr = max(1.0, min(displayScale, 2.0))
         let desiredScale = max(0.35, min(zoomScale * dpr, 3.0))
         let rawPx = (pageSize.width * desiredScale) * (pageSize.height * desiredScale)
         let finalScale = rawPx > maxPixels ? desiredScale * sqrt(maxPixels / rawPx) : desiredScale

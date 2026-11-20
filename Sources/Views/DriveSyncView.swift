@@ -29,8 +29,21 @@ struct SyncStatusDotButton: View {
             .frame(width: 34, height: 34)
         }
         .onAppear {
+            updatePulseState()
+        }
+        .onChange(of: syncManager.visualState) { _ in
+            updatePulseState()
+        }
+    }
+
+    private func updatePulseState() {
+        if syncManager.visualState == .syncing {
             withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
                 pulse = true
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                pulse = false
             }
         }
     }
@@ -71,6 +84,15 @@ struct SyncStatusPopoverView: View {
                 row("Books synced", "\(syncManager.sessionBooksSynced)")
                 if let last = syncManager.lastSyncedAt {
                     row("Last synced", last.formatted(date: .omitted, time: .standard))
+                }
+            }
+
+            if !syncManager.syncProgressText.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(syncManager.syncProgressText)
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.primary)
                 }
             }
 
@@ -168,6 +190,23 @@ struct DriveSyncSettingsSheet: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+                    if VaultManager.isRunningInLiveContainer {
+                        HStack {
+                            Text("Environment")
+                            Spacer()
+                            Text("LiveContainer")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.accentColor)
+                        }
+                    }
+                    if !syncManager.syncProgressText.isEmpty {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text(syncManager.syncProgressText)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
                     if let last = syncManager.lastSyncedAt {
                         HStack {
                             Text("Last Synced")
@@ -199,6 +238,10 @@ struct DriveSyncSettingsSheet: View {
                                     let check = await syncManager.verifyDriveConnection()
                                     feedbackMessage = check.message
                                     feedbackIsError = !check.ok
+                                    if check.ok && vault.vaultURL != nil {
+                                        let r = await syncManager.syncVault(vault: vault, force: true)
+                                        feedbackMessage = "Connected! Downloaded \(r.downloadedPDFs) PDFs, uploaded \(r.uploadedPDFs), synced \(r.syncedBooks) notes."
+                                    }
                                 }
                             } else if !res.ok {
                                 showManualKeyField = true
@@ -239,6 +282,10 @@ struct DriveSyncSettingsSheet: View {
                                         let check = await syncManager.verifyDriveConnection()
                                         feedbackMessage = check.message
                                         feedbackIsError = !check.ok
+                                        if check.ok && vault.vaultURL != nil {
+                                            let r = await syncManager.syncVault(vault: vault, force: true)
+                                            feedbackMessage = "Connected! Downloaded \(r.downloadedPDFs) PDFs, uploaded \(r.uploadedPDFs), synced \(r.syncedBooks) notes."
+                                        }
                                     }
                                 }
                             }
@@ -288,14 +335,19 @@ struct DriveSyncSettingsSheet: View {
 
                         Button {
                             Task {
-                                await syncManager.syncAllAnnotatedBooks(vault: vault)
-                                feedbackMessage = "Finished syncing annotated PDFs."
-                                feedbackIsError = false
+                                let r = await syncManager.syncVault(vault: vault, force: true)
+                                if syncManager.lastError.isEmpty {
+                                    feedbackMessage = "Vault synced! Downloaded \(r.downloadedPDFs) new PDF\(r.downloadedPDFs == 1 ? "" : "s"), uploaded \(r.uploadedPDFs), synced \(r.syncedBooks) note\(r.syncedBooks == 1 ? "" : "s")."
+                                    feedbackIsError = false
+                                } else {
+                                    feedbackMessage = syncManager.lastError
+                                    feedbackIsError = true
+                                }
                             }
                         } label: {
-                            Label("Sync All Annotated Books Now", systemImage: "arrow.triangle.2.circlepath")
+                            Label("Sync Vault & Download New PDFs Now", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .disabled(syncManager.visualState == .syncing)
+                        .disabled(syncManager.visualState == .syncing || vault.vaultURL == nil)
 
                         Button(role: .destructive) {
                             syncManager.disconnect()
@@ -316,7 +368,8 @@ struct DriveSyncSettingsSheet: View {
                     SecureField("OAuth Client Secret", text: $syncManager.config.clientSecret)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    Toggle("Auto-Sync Handwriting Deltas", isOn: $syncManager.config.autoSync)
+                    Toggle("Auto-Sync Vault & Annotations", isOn: $syncManager.config.autoSync)
+                    Toggle("Download & Upload PDF Files", isOn: $syncManager.config.syncPDFs)
                 }
 
                 if !syncManager.config.isConnected {

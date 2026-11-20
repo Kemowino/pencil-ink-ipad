@@ -37,6 +37,7 @@ struct LibraryView: View {
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var settings: AppSettings
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var activeSection: LibrarySection = .documents
     @State private var sortOption: LibrarySort = .modified
@@ -128,9 +129,11 @@ struct LibraryView: View {
             : Color(red: 0.965, green: 0.968, blue: 0.978)
     }
 
-    private let gridColumns = [
-        GridItem(.adaptive(minimum: 158, maximum: 196), spacing: 26, alignment: .top)
-    ]
+    private var gridColumns: [GridItem] {
+        let minW: CGFloat = (horizontalSizeClass == .compact) ? 140 : 158
+        let gap: CGFloat = (horizontalSizeClass == .compact) ? 18 : 26
+        return [GridItem(.adaptive(minimum: minW, maximum: 196), spacing: gap, alignment: .top)]
+    }
 
     var body: some View {
         NavigationStack {
@@ -149,6 +152,22 @@ struct LibraryView: View {
                         }
                         .padding(12)
                         .background(Color.orange.opacity(0.14))
+                    }
+
+                    if !syncManager.syncProgressText.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(syncManager.syncProgressText)
+                                .font(.caption.weight(.medium))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.accentColor.opacity(0.12))
+                        .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
                     if vault.vaultURL == nil {
@@ -317,14 +336,30 @@ struct LibraryView: View {
             })
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
+        .onAppear {
+            triggerSmartVaultSyncIfReady()
+        }
+        .onChange(of: vault.vaultURL) { _ in
+            triggerSmartVaultSyncIfReady()
+        }
+        .onChange(of: syncManager.config.refreshToken) { newToken in
+            if !newToken.isEmpty {
+                Task { _ = await syncManager.syncVault(vault: vault, force: true) }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            triggerSmartVaultSyncIfReady()
+        }
         .sheet(isPresented: $showNewNotebook) {
             NewNotebookSheet(vault: vault, targetFolder: currentFolder) { url, rel in
+                syncManager.uploadNewBookToDrive(pdfURL: url, relativePath: rel)
                 tabManager.openDocument(url: url, relativePath: rel, isHobonichi: false, vault: vault)
             }
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
         .sheet(isPresented: $showNewHobonichi) {
             NewHobonichiSheet(vault: vault, targetFolder: activeSection == .journals ? "Journals" : currentFolder) { url, rel in
+                syncManager.uploadNewBookToDrive(pdfURL: url, relativePath: rel)
                 tabManager.openDocument(url: url, relativePath: rel, isHobonichi: true, vault: vault)
             }
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
@@ -344,6 +379,7 @@ struct LibraryView: View {
             TextField("New title", text: $renameText)
             Button("Rename") {
                 if let item = renamingItem {
+                    tabManager.prepareForRename(relativePath: item.relativePath)
                     do {
                         if let renamed = try vault.renamePDF(item, newTitle: renameText) {
                             tabManager.handleRenamedDocument(
@@ -391,6 +427,7 @@ struct LibraryView: View {
                         )
                     case .importPDFCopy:
                         if let imported = try? vault.importPDFCopy(from: url, intoFolder: currentFolder) {
+                            syncManager.uploadNewBookToDrive(pdfURL: imported.url, relativePath: imported.relPath)
                             tabManager.openDocument(
                                 url: imported.url,
                                 relativePath: imported.relPath,
@@ -721,41 +758,71 @@ struct LibraryView: View {
         )
     }
 
+    private func triggerSmartVaultSyncIfReady() {
+        guard vault.vaultURL != nil, syncManager.config.isConnected else { return }
+        Task {
+            _ = await syncManager.syncVault(vault: vault, force: false)
+        }
+    }
+
     private var emptyVaultView: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            Image(systemName: "books.vertical.fill")
-                .font(.system(size: 56))
-                .foregroundColor(.accentColor)
-            Text("Connect Your Obsidian Vault")
-                .font(.title2.bold())
-            Text("Pick your Obsidian vault folder once. Pencil Ink opens your PDFs in-place and syncs strokes directly with Obsidian & Google Drive.")
+        ScrollView {
+            VStack(spacing: 16) {
+                Spacer(minLength: 32)
+                Image(systemName: "books.vertical.fill")
+                    .font(.system(size: 54))
+                    .foregroundColor(.accentColor)
+                Text("Connect Your Vault")
+                    .font(.title2.bold())
+                Text("Pick your Obsidian vault folder to edit PDFs in-place, or use the local app folder and sync all PDFs & annotations directly from Google Drive.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 28)
+
+                if VaultManager.isRunningInLiveContainer {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("LiveContainer Detected", systemImage: "shippingbox.fill")
+                            .font(.caption.bold())
+                            .foregroundColor(.accentColor)
+                        Text("• To pick an external Obsidian folder: long-press Pencil Ink in LiveContainer → Settings → enable "Fix File Picker" first.\n• Or tap Use LiveContainer App Folder below and paste your Device Key — all PDFs & annotations will sync automatically from Google Drive.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: 420, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(.horizontal, 24)
+                }
+
+                Button {
+                    pickerMode = .folder
+                    showImporter = true
+                } label: {
+                    Text(vault.lastSavedVaultName.isEmpty ? "Choose Vault Folder" : "Reconnect "\(vault.lastSavedVaultName)"")
+                        .font(.headline)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Use \(VaultManager.localFolderDisplayName)") {
+                    vault.useLocalDocumentsFolder()
+                }
+                .buttonStyle(.bordered)
+                .font(.subheadline.weight(.medium))
+
+                Button("Or Open a Single PDF") {
+                    pickerMode = .openSinglePDF
+                    showImporter = true
+                }
                 .font(.subheadline)
                 .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 36)
-            Button {
-                pickerMode = .folder
-                showImporter = true
-            } label: {
-                Text("Choose Vault Folder")
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 10)
+                .padding(.top, 2)
+                Spacer(minLength: 32)
             }
-            .buttonStyle(.borderedProminent)
-            Button("Or Open a Single PDF") {
-                pickerMode = .openSinglePDF
-                showImporter = true
-            }
-            .font(.subheadline)
-            Button("Use Local App Folder (On My iPad → Pencil Ink)") {
-                vault.useLocalDocumentsFolder()
-            }
-            .font(.caption)
-            .foregroundColor(.secondary)
-            .padding(.top, 4)
-            Spacer()
+            .frame(maxWidth: .infinity)
         }
     }
 }

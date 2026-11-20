@@ -599,18 +599,28 @@ struct InkDocument: Codable {
         let encoder = JSONEncoder()
         let data = try encoder.encode(copy)
         let url = InkDocument.sidecarURL(for: pdfURL)
+        let parentDir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+
         var coordError: NSError?
         var writeError: Error?
+        var didWrite = false
         let coordinator = NSFileCoordinator()
         coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordError) { coordURL in
             do {
                 try data.write(to: coordURL, options: .atomic)
+                didWrite = true
             } catch {
                 writeError = error
             }
         }
-        if let err = writeError ?? coordError {
-            throw err
+        if !didWrite || writeError != nil || coordError != nil {
+            // LiveContainer & external file-provider fallback: direct atomic write if NSFileCoordinator balks
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                throw writeError ?? coordError ?? error
+            }
         }
     }
 }

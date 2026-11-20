@@ -20,9 +20,43 @@ struct DriveConfig: Codable, Sendable {
     var expiresAt: Double = 0       // Unix ms
     var driveFolder: String = "Obsidian Vault"
     var autoSync: Bool = true
+    var syncPDFs: Bool = true
     var deviceLabel: String = ""
 
     var isConnected: Bool { !refreshToken.isEmpty }
+
+    enum CodingKeys: String, CodingKey {
+        case clientId, clientSecret, accessToken, refreshToken, expiresAt, driveFolder, autoSync, syncPDFs, deviceLabel
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        clientId = (try? c.decode(String.self, forKey: .clientId)) ?? ""
+        clientSecret = (try? c.decode(String.self, forKey: .clientSecret)) ?? ""
+        accessToken = (try? c.decode(String.self, forKey: .accessToken)) ?? ""
+        refreshToken = (try? c.decode(String.self, forKey: .refreshToken)) ?? ""
+        expiresAt = (try? c.decode(Double.self, forKey: .expiresAt)) ?? 0
+        driveFolder = (try? c.decode(String.self, forKey: .driveFolder)) ?? "Obsidian Vault"
+        autoSync = (try? c.decode(Bool.self, forKey: .autoSync)) ?? true
+        syncPDFs = (try? c.decode(Bool.self, forKey: .syncPDFs)) ?? true
+        deviceLabel = (try? c.decode(String.self, forKey: .deviceLabel)) ?? ""
+    }
+}
+
+struct RemotePDFFile: Sendable {
+    let meta: DriveFileMeta
+    let relativePath: String
+    let sizeBytes: Int64
+}
+
+struct RemoteVaultTree: Sendable {
+    let pdfs: [RemotePDFFile]
+    /// Relative paths (without `.ink.d`, e.g. `Folder/Book.pdf`) that have a remote `.ink.d` folder on Drive.
+    let annotatedPDFPaths: Set<String>
+    /// Normalized lowercase filenames -> remote PDFs (for smart matching across nested roots).
+    let folderIDByPath: [String: String]
 }
 
 enum DriveClientError: LocalizedError {
@@ -465,6 +499,178 @@ actor GoogleDriveClient {
         let meta = try JSONDecoder().decode(DriveFileMeta.self, from: data)
         metaCache[fileID] = meta
         return meta
+    }
+
+    /// Walks the Google Drive sync root folder via batched BFS to discover ALL remote `.pdf` files
+    /// and ALL remote `.ink.d` annotation folders in just 1–3 API calls.
+    func listVaultTree(rootID: String) async throws -> RemoteVaultTree {
+        let ignoredFolders: Set<String> = [".obsidian", ".trash", ".git", ".stfolder", "__MACOSX"]
+        var queue: [(id: String, relDir: String)] = [(rootID, "")]
+        var visited = Set<String>([rootID])
+        var pdfs: [RemotePDFFile] = []
+        var annotatedPDFPaths = Set<String>()
+        var folderIDByPath: [String: String] = ["": rootID]
+
+        while !queue.isEmpty {
+            let batchCount = min(15, queue.count)
+            let batch = Array(queue.prefix(batchCount))
+            queue.removeFirst(batchCount)
+
+            var relByID: [String: String] = [:]
+            for b in batch { relByID[b.id] = b.relDir }
+
+            let children = try await listChildren(parentIDs: batch.map { $0.id })
+            for child in children {
+                if child.trashed == true { continue }
+                let parentID = child.parents?.first(where: { relByID[$0] != nil }) ?? batch[0].id
+                let parentRel = relByID[parentID] ?? ""
+                let childRel = parentRel.isEmpty ? child.name : "\(parentRel)/\(child.name)"
+
+                if child.mimeType == Self.folderMime {
+                    if child.name.hasSuffix(".ink.d") {
+                        // Record the associated PDF relative path (strip `.ink.d`) without descending!
+                        let pdfRel = String(childRel.dropLast(6))
+                        annotatedPDFPaths.insert(pdfRel)
+                        continue
+                    }
+                    if child.name.hasPrefix(".") || ignoredFolders.contains(child.name) {
+                        continue
+                    }
+                    if !visited.contains(child.id) {
+                        visited.insert(child.id)
+                        folderIDByPath[childRel] = child.id
+                        dirIDCache[childRel] = child.id
+                        queue.append((child.id, childRel))
+                    }
+                } else if child.name.lowercased().hasSuffix(".pdf") || child.mimeType == "application/pdf" {
+                    let sz = Int64(child.size ?? "0") ?? 0
+                    pdfs.append(RemotePDFFile(meta: child, relativePath: childRel, sizeBytes: sz))
+                }
+            }
+        }
+
+        // Deduplicate by lowercase relative path (prefer newest modifiedTime if duplicate on Drive)
+        var dedup: [String: RemotePDFFile] = [:]
+        for item in pdfs {
+            let key = item.relativePath.lowercased()
+            if let existing = dedup[key] {
+                if (item.meta.modifiedTime ?? "") > (existing.meta.modifiedTime ?? "") {
+                    dedup[key] = item
+                }
+            } else {
+                dedup[key] = item
+            }
+        }
+        let sortedPDFs = dedup.values.sorted {
+            $0.relativePath.localizedCaseInsensitiveCompare($1.relativePath) == .orderedAscending
+        }
+        return RemoteVaultTree(
+            pdfs: sortedPDFs,
+            annotatedPDFPaths: annotatedPDFPaths,
+            folderIDByPath: folderIDByPath
+        )
+    }
+
+    /// Streams a Google Drive file directly to a temporary URL on disk (~2 MB RAM even for 250 MB textbooks!).
+    func downloadToFile(fileID: String) async throws -> URL {
+        let url = URL(string: "\(Self.apiBase)/files/\(fileID)?alt=media")!
+        var attempt = 0
+        while true {
+            let token = try await ensureValidToken()
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 300)
+            req.httpMethod = "GET"
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+            let (tempURL, resp) = try await session.download(for: req)
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 && attempt < 1 {
+                try? FileManager.default.removeItem(at: tempURL)
+                config.expiresAt = 0
+                attempt += 1
+                continue
+            }
+            if (status == 429 || status >= 500) && attempt < 3 {
+                try? FileManager.default.removeItem(at: tempURL)
+                attempt += 1
+                let delayNs = UInt64(700_000_000 * (1 << attempt))
+                try? await Task.sleep(nanoseconds: delayNs)
+                continue
+            }
+            guard status >= 200 && status < 300 else {
+                let errData = (try? Data(contentsOf: tempURL)) ?? Data()
+                try? FileManager.default.removeItem(at: tempURL)
+                throw DriveClientError.apiError(status: status, message: parseErrorMessage(errData))
+            }
+
+            // Move out of URLSession's ephemeral download location immediately so iOS doesn't purge it
+            let stableTemp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("pink-dl-\(UUID().uuidString).pdf")
+            try? FileManager.default.removeItem(at: stableTemp)
+            try FileManager.default.moveItem(at: tempURL, to: stableTemp)
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: stableTemp.path),
+               let fileSize = attrs[.size] as? Int64 {
+                bytesDown += fileSize
+            }
+            return stableTemp
+        }
+    }
+
+    /// Uploads a local PDF file from disk using Google Drive Resumable Upload (zero 5 MB limit, low RAM!).
+    func uploadPDFFile(fileURL: URL, name: String, parentID: String) async throws -> DriveFileMeta {
+        let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attrs[.size] as? Int64) ?? 0
+
+        let initURL = URL(string: "\(Self.uploadBase)/files?uploadType=resumable&fields=\(Self.fields)")!
+        let metaObj: [String: Any] = [
+            "name": name,
+            "mimeType": "application/pdf",
+            "parents": [parentID]
+        ]
+        let metaBody = try JSONSerialization.data(withJSONObject: metaObj)
+
+        var uploadSessionURL: URL? = nil
+        var attempt = 0
+        while uploadSessionURL == nil {
+            let token = try await ensureValidToken()
+            var initReq = URLRequest(url: initURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 45)
+            initReq.httpMethod = "POST"
+            initReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            initReq.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            initReq.setValue("application/pdf", forHTTPHeaderField: "X-Upload-Content-Type")
+            initReq.setValue("\(fileSize)", forHTTPHeaderField: "X-Upload-Content-Length")
+            initReq.httpBody = metaBody
+
+            let (data, resp) = try await session.data(for: initReq)
+            let http = resp as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
+            if status == 401 && attempt < 1 {
+                config.expiresAt = 0
+                attempt += 1
+                continue
+            }
+            guard status >= 200 && status < 300,
+                  let locStr = http?.value(forHTTPHeaderField: "Location"),
+                  let locURL = URL(string: locStr) else {
+                throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+            }
+            uploadSessionURL = locURL
+        }
+
+        let putURL = uploadSessionURL!
+        let token = try await ensureValidToken()
+        var putReq = URLRequest(url: putURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 300)
+        putReq.httpMethod = "PUT"
+        putReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        putReq.setValue("application/pdf", forHTTPHeaderField: "Content-Type")
+        putReq.setValue("\(fileSize)", forHTTPHeaderField: "Content-Length")
+
+        let (respData, resp) = try await session.upload(for: putReq, fromFile: fileURL)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard status >= 200 && status < 300 else {
+            throw DriveClientError.apiError(status: status, message: parseErrorMessage(respData))
+        }
+        bytesUp += fileSize
+        return try JSONDecoder().decode(DriveFileMeta.self, from: respData)
     }
 
     func trash(fileID: String) async throws {

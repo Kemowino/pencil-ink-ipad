@@ -99,12 +99,23 @@ enum SyncBehaviorMode: String, CaseIterable, Identifiable, Codable {
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
+    static let defaultToolOrderRaw: [String] = [
+        DrawingTool.pen.rawValue,
+        DrawingTool.eraser.rawValue,
+        DrawingTool.highlighter.rawValue,
+        DrawingTool.hand.rawValue,
+        DrawingTool.lasso.rawValue,
+        DrawingTool.text.rawValue,
+        DrawingTool.laser.rawValue
+    ]
+
     @Published var appTheme: AppThemeOption = .dark { didSet { persist() } }
     @Published var pdfReadingMode: PDFReadingMode = .original { didSet { persist() } }
     @Published var showTabBar: Bool = true { didSet { persist() } }
     @Published var restoreTabsOnLaunch: Bool = true { didSet { persist() } }
     @Published var startInHandMode: Bool = false { didSet { persist() } }
     @Published var toolbarPosition: ToolbarPosition = .top { didSet { persist() } }
+    @Published var toolOrder: [String] = AppSettings.defaultToolOrderRaw { didSet { persist() } }
     @Published var hiddenTools: Set<String> = [] { didSet { persist() } }
     @Published var drawWithFinger: Bool = false { didSet { persist() } }
     @Published var pencilDoubleTap: PencilDoubleTapAction = .switchEraser { didSet { persist() } }
@@ -124,6 +135,26 @@ final class AppSettings: ObservableObject {
     private let storageKey = "pencilink.native.appsettings.v1"
     private var loading = false
 
+    var orderedTools: [DrawingTool] {
+        var result: [DrawingTool] = []
+        var seen = Set<DrawingTool>()
+        for raw in toolOrder {
+            if let t = DrawingTool(rawValue: raw), !seen.contains(t) {
+                result.append(t)
+                seen.insert(t)
+            }
+        }
+        for t in DrawingTool.allCases where !seen.contains(t) {
+            result.append(t)
+            seen.insert(t)
+        }
+        return result
+    }
+
+    var orderedVisibleTools: [DrawingTool] {
+        orderedTools.filter { isToolVisible($0) }
+    }
+
     func isToolVisible(_ tool: DrawingTool) -> Bool {
         !hiddenTools.contains(tool.rawValue)
     }
@@ -132,15 +163,30 @@ final class AppSettings: ObservableObject {
         if visible {
             hiddenTools.remove(tool.rawValue)
         } else {
-            // Always keep at least one tool visible in the toolbar
-            let currentlyVisible = DrawingTool.allCases.filter { !hiddenTools.contains($0.rawValue) }
+            let currentlyVisible = orderedTools.filter { !hiddenTools.contains($0.rawValue) }
             guard currentlyVisible.count > 1 else { return }
             hiddenTools.insert(tool.rawValue)
         }
     }
 
+    func moveTools(from source: IndexSet, to destination: Int) {
+        var current = orderedTools.map { $0.rawValue }
+        current.move(fromOffsets: source, toOffset: destination)
+        toolOrder = current
+    }
+
+    func moveTool(_ tool: DrawingTool, offset: Int) {
+        var current = orderedTools.map { $0.rawValue }
+        guard let idx = current.firstIndex(of: tool.rawValue) else { return }
+        let target = idx + offset
+        guard target >= 0 && target < current.count else { return }
+        current.swapAt(idx, target)
+        toolOrder = current
+    }
+
     func resetToolbarDefaults() {
         toolbarPosition = .top
+        toolOrder = Self.defaultToolOrderRaw
         hiddenTools = []
         compactToolbar = false
     }
@@ -152,6 +198,7 @@ final class AppSettings: ObservableObject {
         var restoreTabsOnLaunch: Bool?
         var startInHandMode: Bool?
         var toolbarPosition: ToolbarPosition?
+        var toolOrder: [String]?
         var hiddenTools: [String]?
         var drawWithFinger: Bool?
         var pencilDoubleTap: PencilDoubleTapAction?
@@ -181,6 +228,7 @@ final class AppSettings: ObservableObject {
         if let v = s.restoreTabsOnLaunch { restoreTabsOnLaunch = v }
         if let v = s.startInHandMode { startInHandMode = v }
         if let v = s.toolbarPosition { toolbarPosition = v }
+        if let v = s.toolOrder, !v.isEmpty { toolOrder = v }
         if let v = s.hiddenTools { hiddenTools = Set(v) }
         if let v = s.drawWithFinger { drawWithFinger = v }
         if let v = s.pencilDoubleTap { pencilDoubleTap = v }
@@ -204,6 +252,7 @@ final class AppSettings: ObservableObject {
             restoreTabsOnLaunch: restoreTabsOnLaunch,
             startInHandMode: startInHandMode,
             toolbarPosition: toolbarPosition,
+            toolOrder: toolOrder,
             hiddenTools: Array(hiddenTools),
             drawWithFinger: drawWithFinger,
             pencilDoubleTap: pencilDoubleTap,

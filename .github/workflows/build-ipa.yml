@@ -1,4 +1,4 @@
-name: Build Pencil Ink (iPad IPA + macOS App)
+name: Build Pencil Ink (iPad/iPhone IPA + macOS App)
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build iPadOS Release .app
+      - name: Build iOS/iPadOS Release .app
         run: |
           xcodebuild \
             -project PencilInkNative.xcodeproj \
@@ -36,7 +36,7 @@ jobs:
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package iPadOS .ipa
+      - name: Package iOS/iPadOS .ipa
         run: |
           rm -rf Payload PencilInkNative.ipa
           mkdir -p Payload
@@ -78,17 +78,17 @@ jobs:
             PencilInkNative-macOS.zip
           retention-days: 30
 
-      - name: Publish iPad IPA & macOS App to GitHub Releases
+      - name: Publish iOS/iPadOS IPA & macOS App to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.3.0}"
+          TAG="v${VER:-1.4.1}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Hand/Scrolling Mode + Default Startup Toggle, Animated Documents/Journals Home Switcher, Smart Activity-Aware Drive Sync, Customizable Dynamic Color Palettes (+ Add / Edit / Remove), Goodnotes Circle Thickness Slots Shared Across Files, Customizable Toolbar (Top / Left Side / Right Side & Toggle Tools), and Top-Bar Document Rename Synced to Google Drive." \
+              --notes "Pencil Ink Native $TAG — Full Bidirectional Google Drive PDF Vault Sync (automatically downloads new PDFs & annotations from Drive and uploads new notebooks/journals across iPhone, iPad, and Mac), Full LiveContainer Sandbox/Folder Compatibility, Streaming Large-PDF Downloads & Resumable Uploads, and iPhone Compact Toolbar Polish." \
               --latest
           fi

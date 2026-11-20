@@ -38,7 +38,6 @@ struct WorkspaceRootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(
-            // Hidden Cmd+W shortcut to close active tab on Mac / iPad hardware keyboard
             Button("") {
                 if let aid = tabManager.activeTabID {
                     tabManager.closeTab(aid)
@@ -59,8 +58,7 @@ struct WorkspaceRootView: View {
 }
 
 /// Authentic Goodnotes 6 curved folder-tab shape:
-/// Rounded top corners (`topRadius`) + smooth concave outward bottom flares (`flare`)
-/// so the active tab flows seamlessly into the primary document bar below with zero seam.
+/// Rounded top corners + concave outward bottom flares merging seamlessly into Row 1.
 private struct GoodnotesFolderTabShape: Shape {
     var topRadius: CGFloat = 10
     var flare: CGFloat = 8
@@ -72,34 +70,40 @@ private struct GoodnotesFolderTabShape: Shape {
         let f = min(flare, w * 0.25, h * 0.5)
 
         var p = Path()
-        // Bottom-left flare start
         p.move(to: CGPoint(x: 0, y: h))
-        // Concave flare curving up into left edge
         p.addQuadCurve(to: CGPoint(x: f, y: h - f), control: CGPoint(x: f, y: h))
-        // Left vertical edge up to top-left corner
         p.addLine(to: CGPoint(x: f, y: r))
-        // Rounded top-left corner
         p.addQuadCurve(to: CGPoint(x: f + r, y: 0), control: CGPoint(x: f, y: 0))
-        // Top horizontal edge
         p.addLine(to: CGPoint(x: w - f - r, y: 0))
-        // Rounded top-right corner
         p.addQuadCurve(to: CGPoint(x: w - f, y: r), control: CGPoint(x: w - f, y: 0))
-        // Right vertical edge down to flare
         p.addLine(to: CGPoint(x: w - f, y: h - f))
-        // Concave flare curving out to bottom-right
         p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - f, y: h))
         p.closeSubpath()
         return p
     }
 }
 
-/// Pixel-faithful Goodnotes 6 Tab Bar:
-/// - Recessed top track with clean House icon on the far left (zero text, zero boxy borders)
-/// - Curved rounded-top active folder tab merging seamlessly into the document toolbar below
-/// - Soft vertical dividers ONLY between adjacent inactive tabs
 private struct GoodnotesTabBar: View {
     @EnvironmentObject var tabManager: TabManager
     @Environment(\.colorScheme) private var colorScheme
+
+    #if targetEnvironment(macCatalyst)
+    private let barHeight: CGFloat = 48
+    private let houseIconSize: CGFloat = 20
+    private let houseFrameW: CGFloat = 44
+    private let houseFrameH: CGFloat = 36
+    private let plusIconSize: CGFloat = 17.5
+    private let plusFrameW: CGFloat = 42
+    private let plusFrameH: CGFloat = 36
+    #else
+    private let barHeight: CGFloat = 36
+    private let houseIconSize: CGFloat = 15
+    private let houseFrameW: CGFloat = 34
+    private let houseFrameH: CGFloat = 28
+    private let plusIconSize: CGFloat = 13.5
+    private let plusFrameW: CGFloat = 32
+    private let plusFrameH: CGFloat = 28
+    #endif
 
     private var trackBg: Color {
         colorScheme == .dark
@@ -125,35 +129,32 @@ private struct GoodnotesTabBar: View {
         ZStack(alignment: .bottom) {
             trackBg
 
-            // Bottom hairline sits BEHIND the active curved tab so the active tab seamlessly breaks the seam!
             Rectangle()
                 .fill(bottomHairline)
                 .frame(height: 0.5)
 
             HStack(alignment: .bottom, spacing: 0) {
-                // Clean Goodnotes House Button on far left
                 Button {
                     tabManager.showLibrary()
                 } label: {
                     Image(systemName: tabManager.activeTabID == nil ? "house.fill" : "house")
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.system(size: houseIconSize, weight: .medium))
                         .foregroundColor(
                             tabManager.activeTabID == nil
                                 ? Color.accentColor
-                                : (colorScheme == .dark ? Color.white.opacity(0.75) : Color.black.opacity(0.65))
+                                : (colorScheme == .dark ? Color.white.opacity(0.78) : Color.black.opacity(0.68))
                         )
-                        .frame(width: 34, height: 28)
+                        .frame(width: houseFrameW, height: houseFrameH)
                         .background(
                             Circle()
                                 .fill(tabManager.activeTabID == nil ? Color.accentColor.opacity(0.14) : Color.clear)
                         )
                 }
                 .buttonStyle(.plain)
-                .padding(.leading, 10)
+                .padding(.leading, 12)
                 .padding(.trailing, 4)
-                .padding(.bottom, 4)
+                .padding(.bottom, 5)
 
-                // Curved Folder Document Tabs
                 ScrollViewReader { proxy in
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .bottom, spacing: -6) {
@@ -186,21 +187,20 @@ private struct GoodnotesTabBar: View {
                     }
                 }
 
-                // Subtle `+` button to pick another book from Library
                 Button {
                     tabManager.showLibrary()
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 13.5, weight: .medium))
-                        .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.68) : Color.black.opacity(0.58))
-                        .frame(width: 32, height: 28)
+                        .font(.system(size: plusIconSize, weight: .medium))
+                        .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.72) : Color.black.opacity(0.62))
+                        .frame(width: plusFrameW, height: plusFrameH)
                 }
                 .buttonStyle(.plain)
-                .padding(.trailing, 8)
-                .padding(.bottom, 4)
+                .padding(.trailing, 10)
+                .padding(.bottom, 5)
             }
         }
-        .frame(height: 36)
+        .frame(height: barHeight)
     }
 }
 
@@ -215,21 +215,49 @@ private struct GoodnotesCurvedTab: View {
 
     @Environment(\.colorScheme) private var colorScheme
 
+    #if targetEnvironment(macCatalyst)
+    private let tabHeight: CGFloat = 42
+    private let titleFontSize: CGFloat = 15.5
+    private let calIconSize: CGFloat = 13
+    private let minTitleW: CGFloat = 115
+    private let maxTitleW: CGFloat = 250
+    private let closeIconSize: CGFloat = 11.5
+    private let closeFrame: CGFloat = 24
+    private let topRadius: CGFloat = 12
+    private let flare: CGFloat = 10
+    private let padLead: CGFloat = 22
+    private let padTrail: CGFloat = 18
+    private let divHeight: CGFloat = 18
+    #else
+    private let tabHeight: CGFloat = 32
+    private let titleFontSize: CGFloat = 12.5
+    private let calIconSize: CGFloat = 10.5
+    private let minTitleW: CGFloat = 74
+    private let maxTitleW: CGFloat = 168
+    private let closeIconSize: CGFloat = 9
+    private let closeFrame: CGFloat = 18
+    private let topRadius: CGFloat = 10
+    private let flare: CGFloat = 8
+    private let padLead: CGFloat = 18
+    private let padTrail: CGFloat = 14
+    private let divHeight: CGFloat = 14
+    #endif
+
     var body: some View {
         ZStack(alignment: .trailing) {
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Button(action: onSelect) {
-                    HStack(spacing: 5) {
+                    HStack(spacing: 6) {
                         if tab.isHobonichi {
                             Image(systemName: "calendar")
-                                .font(.system(size: 10.5, weight: .semibold))
+                                .font(.system(size: calIconSize, weight: .semibold))
                                 .foregroundColor(isActive ? .orange : .secondary.opacity(0.8))
                         }
                         Text(tab.title)
-                            .font(.system(size: 12.5, weight: isActive ? .semibold : .regular))
+                            .font(.system(size: titleFontSize, weight: isActive ? .semibold : .regular))
                             .foregroundColor(isActive ? .primary : .secondary)
                             .lineLimit(1)
-                            .frame(minWidth: 74, maxWidth: 168, alignment: .center)
+                            .frame(minWidth: minTitleW, maxWidth: maxTitleW, alignment: .center)
                     }
                     .frame(maxHeight: .infinity)
                     .contentShape(Rectangle())
@@ -238,22 +266,22 @@ private struct GoodnotesCurvedTab: View {
 
                 Button(action: onClose) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(isActive ? .secondary : .secondary.opacity(0.55))
-                        .frame(width: 18, height: 18)
+                        .font(.system(size: closeIconSize, weight: .bold))
+                        .foregroundColor(isActive ? .secondary : .secondary.opacity(0.6))
+                        .frame(width: closeFrame, height: closeFrame)
                         .background(
                             Circle()
-                                .fill(isActive ? Color.primary.opacity(0.08) : Color.clear)
+                                .fill(isActive ? Color.primary.opacity(0.09) : Color.clear)
                         )
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 14)
-            .frame(height: 32)
+            .padding(.leading, padLead)
+            .padding(.trailing, padTrail)
+            .frame(height: tabHeight)
             .background {
                 if isActive {
-                    GoodnotesFolderTabShape(topRadius: 10, flare: 8)
+                    GoodnotesFolderTabShape(topRadius: topRadius, flare: flare)
                         .fill(activeFill)
                         .shadow(
                             color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.08),
@@ -267,7 +295,7 @@ private struct GoodnotesCurvedTab: View {
             if showTrailingDivider {
                 Rectangle()
                     .fill(dividerColor)
-                    .frame(width: 1, height: 14)
+                    .frame(width: 1, height: divHeight)
                     .padding(.trailing, 3)
             }
         }
