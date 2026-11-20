@@ -95,6 +95,53 @@ enum SyncBehaviorMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum PDFRenderQuality: String, CaseIterable, Identifiable, Codable {
+    case eco = "eco"
+    case balanced = "balanced"
+    case retina = "retina"
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .eco: return "Eco (Best Battery)"
+        case .balanced: return "Balanced"
+        case .retina: return "Retina (Sharpest)"
+        }
+    }
+
+    static var platformDefault: PDFRenderQuality {
+        #if targetEnvironment(macCatalyst)
+        return .eco
+        #else
+        return .retina
+        #endif
+    }
+
+    var baseMaxPixels: CGFloat {
+        switch self {
+        case .eco: return 1_250_000
+        case .balanced: return 2_000_000
+        case .retina: return 3_200_000
+        }
+    }
+
+    var zoomedMaxPixels: CGFloat {
+        switch self {
+        case .eco: return 2_200_000
+        case .balanced: return 3_000_000
+        case .retina: return 4_200_000
+        }
+    }
+
+    var displayScaleCap: CGFloat {
+        switch self {
+        case .eco: return 1.35
+        case .balanced: return 1.65
+        case .retina: return 2.0
+        }
+    }
+}
+
 @MainActor
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
@@ -130,6 +177,7 @@ final class AppSettings: ObservableObject {
         }
     }
     @Published var syncMode: SyncBehaviorMode = .smart { didSet { persist() } }
+    @Published var pdfRenderQuality: PDFRenderQuality = .platformDefault { didSet { persist() } }
     @Published var compactToolbar: Bool = false { didSet { persist() } }
 
     private let storageKey = "pencilink.native.appsettings.v1"
@@ -207,6 +255,7 @@ final class AppSettings: ObservableObject {
         var keepScreenAwake: Bool?
         var syncMode: SyncBehaviorMode?
         var syncPollSeconds: Double?
+        var pdfRenderQuality: PDFRenderQuality?
         var compactToolbar: Bool?
     }
 
@@ -240,6 +289,7 @@ final class AppSettings: ObservableObject {
         } else if let legacyPoll = s.syncPollSeconds, legacyPoll == 0 {
             syncMode = .manual
         }
+        if let v = s.pdfRenderQuality { pdfRenderQuality = v }
         if let v = s.compactToolbar { compactToolbar = v }
     }
 
@@ -261,6 +311,7 @@ final class AppSettings: ObservableObject {
             keepScreenAwake: keepScreenAwake,
             syncMode: syncMode,
             syncPollSeconds: nil,
+            pdfRenderQuality: pdfRenderQuality,
             compactToolbar: compactToolbar
         )
         if let data = try? JSONEncoder().encode(snap) {

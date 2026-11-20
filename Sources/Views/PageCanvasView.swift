@@ -29,14 +29,14 @@ final class PageCanvasView: UIView {
 
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
-    private(set) var isDraftRendered = false
     private(set) var readingMode: PDFReadingMode = .original
     private(set) var isHobonichiSlot: Bool
     var isTemplateOnly: Bool { isHobonichiSlot || slot.effectivePDFPageNumber == nil }
     var isRecyclablePDFPage: Bool { !isTemplateOnly }
     private(set) var renderedCGImage: CGImage? = nil
 
-    private static let sharedDeviceRGB = CGColorSpaceCreateDeviceRGB()
+    /// Tagged sRGB avoids WindowServer DeviceRGB->Display-P3 ColorSync shader passes on macOS!
+    private static let sharedSRGB = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     private static let nativeBGRXBitmapInfo: UInt32 =
         CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue
 
@@ -85,11 +85,15 @@ final class PageCanvasView: UIView {
         layer.masksToBounds = true
         #endif
         layer.actions = Self.noLayerActions
+        layer.allowsEdgeAntialiasing = false
+        layer.allowsGroupOpacity = false
         isOpaque = true
         isUserInteractionEnabled = false
 
         pdfContentLayer.frame = bounds
         pdfContentLayer.isOpaque = true
+        pdfContentLayer.allowsEdgeAntialiasing = false
+        pdfContentLayer.allowsGroupOpacity = false
         pdfContentLayer.contentsGravity = .resize
         pdfContentLayer.magnificationFilter = .linear
         pdfContentLayer.minificationFilter = .linear
@@ -135,7 +139,6 @@ final class PageCanvasView: UIView {
         renderedCGImage = nil
         renderedZoomScale = 0
         isRendered = false
-        isDraftRendered = false
         staticInkView.strokes = []
         staticInkView.hiddenStrokeIDs = []
         staticInkView.textBoxes = []
@@ -183,8 +186,7 @@ final class PageCanvasView: UIView {
             insertSubview(hv, belowSubview: staticInkView)
             hoboView = hv
             isRendered = true
-            isDraftRendered = false
-            renderedZoomScale = 1.0
+                renderedZoomScale = 1.0
         } else if slot.effectivePDFPageNumber == nil {
             backgroundColor = Self.paperBackdropColor(for: readingMode)
             pdfContentLayer.isHidden = true
@@ -196,16 +198,14 @@ final class PageCanvasView: UIView {
             insertSubview(tv, belowSubview: staticInkView)
             templateView = tv
             isRendered = true
-            isDraftRendered = false
-            renderedZoomScale = 1.0
+                renderedZoomScale = 1.0
         } else {
             backgroundColor = Self.paperBackdropColor(for: readingMode)
             pdfContentLayer.isHidden = false
             pdfContentLayer.contents = nil
             renderedCGImage = nil
             isRendered = false
-            isDraftRendered = false
-            renderedZoomScale = 0
+                renderedZoomScale = 0
         }
         CATransaction.commit()
 
@@ -344,13 +344,9 @@ final class PageCanvasView: UIView {
         liveOverlayView.isHidden = true
     }
 
-    /// Ultra-fast direct CALayer contents assignment (< 5 µs, zero UIKit layout invalidation!).
-    func applyRenderedCGImage(_ cgImage: CGImage, zoomScale: CGFloat, isDraft: Bool) {
+    /// Ultra-fast single-pass direct CALayer contents assignment (< 5 µs, zero UIKit layout invalidation!).
+    func applyRenderedCGImage(_ cgImage: CGImage, zoomScale: CGFloat) {
         if !isTemplateOnly {
-            // Never overwrite an already-crisp render with a lower-res draft
-            if isRendered && !isDraftRendered && isDraft {
-                return
-            }
             renderedCGImage = cgImage
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -359,8 +355,7 @@ final class PageCanvasView: UIView {
         }
         renderedZoomScale = zoomScale
         isRendered = true
-        isDraftRendered = isDraft
-        if !isDraft && (!staticInkView.isHidden || !liveOverlayView.isHidden || templateView != nil || hoboView != nil) {
+        if !staticInkView.isHidden || !liveOverlayView.isHidden || templateView != nil || hoboView != nil {
             refreshVectorScale(for: zoomScale)
         }
     }
@@ -396,8 +391,7 @@ final class PageCanvasView: UIView {
         if isTemplateOnly {
             renderedZoomScale = zoomScale
             isRendered = true
-            isDraftRendered = false
-        }
+            }
     }
 
     func setReadingMode(_ mode: PDFReadingMode) {
@@ -474,7 +468,6 @@ final class PageCanvasView: UIView {
         renderedCGImage = nil
         renderedZoomScale = 0
         isRendered = false
-        isDraftRendered = false
     }
 
     static func normalizedPageSize(for page: PDFPage) -> CGSize {
@@ -529,7 +522,7 @@ final class PageCanvasView: UIView {
                 height: pxH,
                 bitsPerComponent: 8,
                 bytesPerRow: bytesPerRow,
-                space: sharedDeviceRGB,
+                space: sharedSRGB,
                 bitmapInfo: nativeBGRXBitmapInfo
             ) else {
                 return nil

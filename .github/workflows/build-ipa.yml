@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.7.0}"
+          TAG="v${VER:-1.8.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Apple Preview-Class macOS Battery & Scroll Engine: Native-GPU 32-bit BGRX CGBitmapContext (Zero Double-Copy, Explicit autoreleasepool), Raw CALayer PDF Backing (Zero UIImageView Layout Cascades), Two-Tier Preview Progressive Scroll (480K Fast Scroll -> Crisp Visible Upgrade on Settle), Low-Voltage .utility Render QoS, Opaque ScrollView/Container (Zero Full-Screen Alpha Blending), Single-Flight Timestamp Settle Timer, Zero-Rebuild Sync/Vault Isolation, Removed Jarring Saving Indicator from Page Pill, and 20-Pass Full Codebase Audit." \
+              --notes "Pencil Ink Native $TAG — Ultra-Low-Power macOS Battery Architecture: Eliminated Two-Tier Double-Rendering (Single-Pass Direct Render), Configurable PDF Render Quality (Eco 1.25MP Default on Mac / Balanced 2.0MP / Retina 3.2MP), 650 pt/s Scroll Velocity Gate + 25% Viewport Visibility Filter (Zero Throwaway Page Decodes), 32pt Scroll-Delta Fast-Gate, Coalesced 50ms-Leeway Settle Timer, Tagged sRGB ColorSpace (Zero DeviceRGB ColorSync Overhead), Race-to-Sleep .userInitiated Serial Queue, 64-Page/192MB Cache, and 120s Quiet Window-Switch Sync." \
               --latest
           fi

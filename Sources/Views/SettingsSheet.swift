@@ -88,6 +88,14 @@ struct SettingsSheet: View {
                         }
                     }
 
+                    settingsRow(icon: "battery.100.bolt", color: .green) {
+                        Picker("PDF Render Quality", selection: $settings.pdfRenderQuality) {
+                            ForEach(PDFRenderQuality.allCases) { q in
+                                Text(q.title).tag(q)
+                            }
+                        }
+                    }
+
                     #if !targetEnvironment(macCatalyst)
                     settingsRow(icon: "sun.max.fill", color: .yellow) {
                         Toggle("Keep Screen Awake", isOn: $settings.keepScreenAwake)
@@ -209,7 +217,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v1.7.0")
+                        Text("v1.8.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }

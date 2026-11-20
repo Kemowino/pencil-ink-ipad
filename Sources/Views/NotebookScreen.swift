@@ -2075,12 +2075,16 @@ private struct NotebookFloatingHUD<JumpPopover: View>: View {
                             }
             .buttonStyle(.plain)
             .opacity(hud.isWriting ? 0.25 : 0.95)
+            #if !targetEnvironment(macCatalyst)
             .animation(.easeOut(duration: 0.16), value: hud.isWriting)
+            #endif
             .popover(isPresented: $jumpPopoverPresented) {
                 jumpPopoverContent()
             }
             .padding(.bottom, 12)
         }
+        #if !targetEnvironment(macCatalyst)
         .animation(.easeOut(duration: 0.18), value: hud.toastMessage)
+        #endif
     }
 }
