@@ -8,15 +8,19 @@ struct LaserPoint {
     let time: CFTimeInterval
 }
 
-/// Renders one PageSlot (PDF page, duplicated PDF page, or paper template) + committed ink + 120Hz live overlay (stroke, eraser ring, laser, or lasso).
+/// Renders one PageSlot (PDF page, duplicated PDF page, or paper template) + committed ink + live overlay.
+/// Toaster-Grade Optimization:
+/// - Recyclable for PDF pages via `configure(...)` + `prepareForReuse()` (zero UIView churn during scroll)
+/// - `staticInkView` and `liveOverlayView` stay `isHidden = true` when empty (0 bytes VRAM & 0 GPU alpha-blend cost!)
+/// - Direct `CGPDFPage` 8-bit sRGB rendering (`preferredRange = .standard`) cuts VRAM & GPU upload bandwidth by 50%.
 final class PageCanvasView: UIView {
-    let slot: PageSlot
+    private(set) var slot: PageSlot
     var pageIndex: Int { slot.index }
     var pageKey: String { slot.key }
     var pageSize: CGSize { slot.size }
 
-    private let templateView: TemplatePaperView?
-    private let hoboView: HobonichiPaperView?
+    private var templateView: TemplatePaperView?
+    private var hoboView: HobonichiPaperView?
     private let pdfImageView = UIImageView()
     private let staticInkView = StaticInkView()
     private let liveOverlayView = LiveInkOverlayView()
@@ -24,11 +28,26 @@ final class PageCanvasView: UIView {
     private(set) var renderedZoomScale: CGFloat = 0
     private(set) var isRendered = false
     private(set) var readingMode: PDFReadingMode = .original
-    let isHobonichiSlot: Bool
+    private(set) var isHobonichiSlot: Bool
     var isTemplateOnly: Bool { isHobonichiSlot || slot.effectivePDFPageNumber == nil }
+    var isRecyclablePDFPage: Bool { !isTemplateOnly }
     var renderedImage: UIImage? { pdfImageView.image }
 
-    private static let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false])
+    /// Lazily created ONLY if the user switches to Dark Paper mode (0 GPU/Metal cost in Original & Sepia modes!).
+    private static var lazyCIContext: CIContext?
+    private static let ciContextLock = NSLock()
+    private static func getCIContext() -> CIContext {
+        ciContextLock.lock()
+        defer { ciContextLock.unlock() }
+        if let ctx = lazyCIContext { return ctx }
+        let ctx = CIContext(options: [
+            .useSoftwareRenderer: false,
+            .priorityRequestLow: true,
+            .cacheIntermediates: false
+        ])
+        lazyCIContext = ctx
+        return ctx
+    }
 
     init(
         slot: PageSlot,
@@ -39,24 +58,9 @@ final class PageCanvasView: UIView {
     ) {
         self.slot = slot
         self.readingMode = readingMode
-        let hoboKind = HobonichiEngine.slotKind(for: slot, isHobo: isHobo)
-        self.isHobonichiSlot = (hoboKind != nil)
-        let hv: HobonichiPaperView? = (hoboKind != nil)
-            ? HobonichiPaperView(slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: isHobo)
-            : nil
-        let tplView: TemplatePaperView? = (hv == nil && slot.effectivePDFPageNumber == nil)
-            ? TemplatePaperView(template: slot.template, readingMode: readingMode)
-            : nil
-        self.hoboView = hv
-        self.templateView = tplView
+        self.isHobonichiSlot = (HobonichiEngine.slotKind(for: slot, isHobo: isHobo) != nil)
         super.init(frame: CGRect(origin: .zero, size: slot.size))
-        if hv != nil {
-            backgroundColor = HobonichiEngine.creamColor
-        } else {
-            backgroundColor = Self.paperBackdropColor(for: readingMode)
-        }
-        staticInkView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
-        liveOverlayView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
+
         #if targetEnvironment(macCatalyst)
         // Avoid offscreen GPU corner-mask compositing on Intel macOS for silky 60fps scrolling
         layer.cornerRadius = 0
@@ -68,64 +72,164 @@ final class PageCanvasView: UIView {
         isOpaque = true
         isUserInteractionEnabled = false
 
-        if let hv = hv {
-            hv.frame = bounds
-            hv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            addSubview(hv)
-            isRendered = true
-            renderedZoomScale = 1.0
-        } else if let tv = tplView {
-            tv.frame = bounds
-            tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            addSubview(tv)
-            isRendered = true
-            renderedZoomScale = 1.0
-        } else {
-            pdfImageView.frame = bounds
-            pdfImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            pdfImageView.contentMode = .scaleToFill
-            addSubview(pdfImageView)
-        }
+        pdfImageView.frame = bounds
+        pdfImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        pdfImageView.contentMode = .scaleToFill
+        pdfImageView.isOpaque = true
+        addSubview(pdfImageView)
 
         staticInkView.frame = bounds
         staticInkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         staticInkView.backgroundColor = .clear
         staticInkView.isOpaque = false
-        staticInkView.layer.drawsAsynchronously = true
-        staticInkView.pageSize = slot.size
+        staticInkView.isHidden = true
         addSubview(staticInkView)
 
         liveOverlayView.frame = bounds
         liveOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         liveOverlayView.backgroundColor = .clear
         liveOverlayView.isOpaque = false
+        liveOverlayView.isHidden = true
         addSubview(liveOverlayView)
+
+        configure(slot: slot, hoboDoc: hoboDoc, hoboAllSlots: hoboAllSlots, isHobo: isHobo, readingMode: readingMode)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    func prepareForReuse() {
+        pdfImageView.image = nil
+        renderedZoomScale = 0
+        isRendered = false
+        staticInkView.strokes = []
+        staticInkView.hiddenStrokeIDs = []
+        staticInkView.textBoxes = []
+        staticInkView.hiddenTextBoxID = nil
+        staticInkView.isHidden = true
+        liveOverlayView.mode = .none
+        liveOverlayView.isHidden = true
+    }
+
+    func configure(
+        slot: PageSlot,
+        hoboDoc: InkDocument? = nil,
+        hoboAllSlots: [PageSlot] = [],
+        isHobo: Bool = false,
+        readingMode: PDFReadingMode = .original
+    ) {
+        self.slot = slot
+        self.readingMode = readingMode
+        let hoboKind = HobonichiEngine.slotKind(for: slot, isHobo: isHobo)
+        self.isHobonichiSlot = (hoboKind != nil)
+
+        templateView?.removeFromSuperview()
+        templateView = nil
+        hoboView?.removeFromSuperview()
+        hoboView = nil
+
+        if bounds.size != slot.size {
+            bounds = CGRect(origin: .zero, size: slot.size)
+        }
+        staticInkView.pageSize = slot.size
+        staticInkView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
+        liveOverlayView.smartDarkInk = (!isHobonichiSlot && readingMode == .dark)
+
+        if hoboKind != nil {
+            backgroundColor = HobonichiEngine.creamColor
+            pdfImageView.isHidden = true
+            pdfImageView.image = nil
+            let hv = HobonichiPaperView(slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: isHobo)
+            hv.frame = bounds
+            hv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            insertSubview(hv, belowSubview: staticInkView)
+            hoboView = hv
+            isRendered = true
+            renderedZoomScale = 1.0
+        } else if slot.effectivePDFPageNumber == nil {
+            backgroundColor = Self.paperBackdropColor(for: readingMode)
+            pdfImageView.isHidden = true
+            pdfImageView.image = nil
+            let tv = TemplatePaperView(template: slot.template, readingMode: readingMode)
+            tv.frame = bounds
+            tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            insertSubview(tv, belowSubview: staticInkView)
+            templateView = tv
+            isRendered = true
+            renderedZoomScale = 1.0
+        } else {
+            backgroundColor = Self.paperBackdropColor(for: readingMode)
+            pdfImageView.isHidden = false
+            pdfImageView.image = nil
+            isRendered = false
+            renderedZoomScale = 0
+        }
+
+        staticInkView.strokes = []
+        staticInkView.hiddenStrokeIDs = []
+        staticInkView.textBoxes = []
+        staticInkView.hiddenTextBoxID = nil
+        staticInkView.isHidden = true
+
+        liveOverlayView.mode = .none
+        liveOverlayView.isHidden = true
+    }
+
+    private func syncStaticInkVisibility() {
+        let hasContent = !staticInkView.strokes.isEmpty || !staticInkView.textBoxes.isEmpty
+        if hasContent {
+            if staticInkView.isHidden {
+                staticInkView.isHidden = false
+                let screenScale = max(1.0, traitCollection.displayScale > 0 ? traitCollection.displayScale : 2.0)
+                let targetScale = min(screenScale * max(1.0, renderedZoomScale > 0 ? renderedZoomScale : 1.0), 2.5)
+                if abs(staticInkView.contentScaleFactor - targetScale) > 0.25 {
+                    staticInkView.contentScaleFactor = targetScale
+                }
+            }
+            staticInkView.setNeedsDisplay()
+        } else {
+            staticInkView.isHidden = true
+        }
+    }
+
     func setStrokes(_ strokes: [InkStroke], hiddenIDs: Set<String> = []) {
         staticInkView.strokes = strokes
         staticInkView.hiddenStrokeIDs = hiddenIDs
-        staticInkView.setNeedsDisplay()
+        syncStaticInkVisibility()
     }
 
     func setTextBoxes(_ boxes: [InkTextBox], hiddenID: String? = nil) {
         staticInkView.textBoxes = boxes
         staticInkView.hiddenTextBoxID = hiddenID
-        staticInkView.setNeedsDisplay()
+        syncStaticInkVisibility()
     }
 
     func setHiddenTextBoxID(_ id: String?) {
         staticInkView.hiddenTextBoxID = id
-        staticInkView.setNeedsDisplay()
+        if !staticInkView.isHidden {
+            staticInkView.setNeedsDisplay()
+        }
     }
 
     func setHiddenStrokeIDs(_ ids: Set<String>) {
         staticInkView.hiddenStrokeIDs = ids
-        staticInkView.setNeedsDisplay()
+        if !staticInkView.isHidden {
+            staticInkView.setNeedsDisplay()
+        }
+    }
+
+    private func showLiveOverlay(for zoomScale: CGFloat? = nil) {
+        if liveOverlayView.isHidden {
+            liveOverlayView.isHidden = false
+            let screenScale = max(1.0, traitCollection.displayScale > 0 ? traitCollection.displayScale : 2.0)
+            let z = max(1.0, zoomScale ?? (renderedZoomScale > 0 ? renderedZoomScale : 1.0))
+            let target = min(screenScale * z, 2.25)
+            if abs(liveOverlayView.contentScaleFactor - target) > 0.25 {
+                liveOverlayView.contentScaleFactor = target
+            }
+        }
+        liveOverlayView.setNeedsDisplay()
     }
 
     func updateLiveStroke(
@@ -146,46 +250,46 @@ final class PageCanvasView: UIView {
             straight: straight,
             isSmartShape: isSmartShape
         )
-        liveOverlayView.setNeedsDisplay()
+        showLiveOverlay()
     }
 
     func updateEraserRing(center: CGPoint?, radius: CGFloat, zoomScale: CGFloat) {
         if let c = center {
             liveOverlayView.mode = .eraserRing(center: c, radius: radius, zoomScale: zoomScale)
+            showLiveOverlay(for: zoomScale)
         } else {
-            liveOverlayView.mode = .none
+            clearLiveOverlay()
         }
-        liveOverlayView.setNeedsDisplay()
     }
 
     func updateLaser(points: [LaserPoint], color: UIColor, showTrail: Bool, zoomScale: CGFloat, now: CFTimeInterval) {
         if points.isEmpty {
-            liveOverlayView.mode = .none
+            clearLiveOverlay()
         } else {
             liveOverlayView.mode = .laser(points: points, color: color, showTrail: showTrail, zoomScale: zoomScale, now: now)
+            showLiveOverlay(for: zoomScale)
         }
-        liveOverlayView.setNeedsDisplay()
     }
 
     func updateLasso(selection: LassoSelection?, zoomScale: CGFloat) {
         guard let sel = selection else {
-            liveOverlayView.mode = .none
-            liveOverlayView.setNeedsDisplay()
+            clearLiveOverlay()
             return
         }
         if sel.mode == .drawing {
             liveOverlayView.mode = .lassoDrawing(poly: sel.poly, zoomScale: zoomScale)
+            showLiveOverlay(for: zoomScale)
         } else if !sel.strokes.isEmpty {
             liveOverlayView.mode = .lassoSelected(selection: sel, zoomScale: zoomScale)
+            showLiveOverlay(for: zoomScale)
         } else {
-            liveOverlayView.mode = .none
+            clearLiveOverlay()
         }
-        liveOverlayView.setNeedsDisplay()
     }
 
     func clearLiveOverlay() {
         liveOverlayView.mode = .none
-        liveOverlayView.setNeedsDisplay()
+        liveOverlayView.isHidden = true
     }
 
     func applyRenderedImage(_ image: UIImage, zoomScale: CGFloat) {
@@ -199,11 +303,24 @@ final class PageCanvasView: UIView {
 
     func refreshVectorScale(for zoomScale: CGFloat) {
         let screenScale = max(1.0, traitCollection.displayScale > 0 ? traitCollection.displayScale : 2.0)
-        let targetScale = min(screenScale * max(1.0, zoomScale), 3.0)
-        if abs(staticInkView.contentScaleFactor - targetScale) > 0.25 {
+        #if targetEnvironment(macCatalyst)
+        let maxVecScale: CGFloat = 2.5
+        #else
+        let maxVecScale: CGFloat = 3.0
+        #endif
+        let targetScale = min(screenScale * max(1.0, zoomScale), maxVecScale)
+
+        // Only rasterize staticInkView / liveOverlayView when they are actually visible (0 VRAM when empty!)
+        if !staticInkView.isHidden && abs(staticInkView.contentScaleFactor - targetScale) > 0.25 {
             staticInkView.contentScaleFactor = targetScale
             staticInkView.setNeedsDisplay()
-            liveOverlayView.contentScaleFactor = min(screenScale * max(1.0, zoomScale), 2.5)
+        }
+        if !liveOverlayView.isHidden {
+            let liveTarget = min(screenScale * max(1.0, zoomScale), 2.25)
+            if abs(liveOverlayView.contentScaleFactor - liveTarget) > 0.25 {
+                liveOverlayView.contentScaleFactor = liveTarget
+                liveOverlayView.setNeedsDisplay()
+            }
         }
         if let tv = templateView, abs(tv.contentScaleFactor - targetScale) > 0.25 {
             tv.contentScaleFactor = targetScale
@@ -225,7 +342,9 @@ final class PageCanvasView: UIView {
         if !isHobonichiSlot {
             backgroundColor = Self.paperBackdropColor(for: mode)
             staticInkView.smartDarkInk = (mode == .dark)
-            staticInkView.setNeedsDisplay()
+            if !staticInkView.isHidden {
+                staticInkView.setNeedsDisplay()
+            }
             liveOverlayView.smartDarkInk = (mode == .dark)
             if let tv = templateView {
                 tv.readingMode = mode
@@ -256,50 +375,34 @@ final class PageCanvasView: UIView {
         return base
     }
 
-    static func applyReadingFilter(to image: UIImage, mode: PDFReadingMode) -> UIImage {
-        guard mode != .original, let cgImg = image.cgImage else { return image }
-        switch mode {
-        case .original:
-            return image
-        case .dark:
-            let input = CIImage(cgImage: cgImg)
-            guard let invert = CIFilter(name: "CIColorInvert") else { return image }
-            invert.setValue(input, forKey: kCIInputImageKey)
-            guard let inverted = invert.outputImage else { return image }
-            let finalCI: CIImage
-            if let hue = CIFilter(name: "CIHueAdjust") {
-                hue.setValue(inverted, forKey: kCIInputImageKey)
-                hue.setValue(Float.pi, forKey: kCIInputAngleKey)
-                finalCI = hue.outputImage ?? inverted
-            } else {
-                finalCI = inverted
-            }
-            // Gently lift pure #000000 black background to comfortable OLED dark slate
-            let lifted: CIImage
-            if let tone = CIFilter(name: "CIColorControls") {
-                tone.setValue(finalCI, forKey: kCIInputImageKey)
-                tone.setValue(0.06, forKey: kCIInputBrightnessKey)
-                tone.setValue(0.92, forKey: kCIInputContrastKey)
-                lifted = tone.outputImage ?? finalCI
-            } else {
-                lifted = finalCI
-            }
-            if let outCG = sharedCIContext.createCGImage(lifted, from: input.extent) {
-                return UIImage(cgImage: outCG, scale: image.scale, orientation: image.imageOrientation)
-            }
-            return image
-        case .sepia:
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = image.scale
-            format.opaque = true
-            let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
-            return renderer.image { ctx in
-                image.draw(at: .zero)
-                ctx.cgContext.setBlendMode(.multiply)
-                UIColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0).setFill()
-                ctx.cgContext.fill(CGRect(origin: .zero, size: image.size))
-            }
+    /// Dark Paper filter (Sepia is now zero-copy single-pass directly inside `renderSlotBackground`!).
+    static func applyDarkPaperFilter(to image: UIImage) -> UIImage {
+        guard let cgImg = image.cgImage else { return image }
+        let input = CIImage(cgImage: cgImg)
+        guard let invert = CIFilter(name: "CIColorInvert") else { return image }
+        invert.setValue(input, forKey: kCIInputImageKey)
+        guard let inverted = invert.outputImage else { return image }
+        let finalCI: CIImage
+        if let hue = CIFilter(name: "CIHueAdjust") {
+            hue.setValue(inverted, forKey: kCIInputImageKey)
+            hue.setValue(Float.pi, forKey: kCIInputAngleKey)
+            finalCI = hue.outputImage ?? inverted
+        } else {
+            finalCI = inverted
         }
+        let lifted: CIImage
+        if let tone = CIFilter(name: "CIColorControls") {
+            tone.setValue(finalCI, forKey: kCIInputImageKey)
+            tone.setValue(0.06, forKey: kCIInputBrightnessKey)
+            tone.setValue(0.92, forKey: kCIInputContrastKey)
+            lifted = tone.outputImage ?? finalCI
+        } else {
+            lifted = finalCI
+        }
+        if let outCG = getCIContext().createCGImage(lifted, from: input.extent) {
+            return UIImage(cgImage: outCG, scale: image.scale, orientation: image.imageOrientation)
+        }
+        return image
     }
 
     func evictBitmap() {
@@ -318,29 +421,56 @@ final class PageCanvasView: UIView {
         return box.size
     }
 
+    static func normalizedPageSize(for cgPage: CGPDFPage) -> CGSize {
+        let box = cgPage.getBoxRect(.cropBox)
+        let rot = ((Int(cgPage.rotationAngle) % 360) + 360) % 360
+        if rot == 90 || rot == 270 {
+            return CGSize(width: box.height, height: box.width)
+        }
+        return box.size
+    }
+
     static func renderSlotBackground(
         slot: PageSlot,
-        pdfDoc: PDFDocument?,
+        cgPDFDoc: CGPDFDocument? = nil,
+        pdfDoc: PDFDocument? = nil,
         zoomScale: CGFloat,
-        maxPixels: CGFloat = 6_000_000,
+        maxPixels: CGFloat = 4_500_000,
         readingMode: PDFReadingMode = .original,
-        displayScale: CGFloat = 2.0
+        displayScale: CGFloat = 2.0,
+        fastQuality: Bool = false
     ) -> UIImage {
         let pageSize = slot.size
         let dpr = max(1.0, min(displayScale, 2.0))
-        let desiredScale = max(0.35, min(zoomScale * dpr, 3.0))
+        let maxScale: CGFloat = fastQuality ? 2.0 : 2.75
+        let desiredScale = max(0.35, min(zoomScale * dpr, maxScale))
         let rawPx = (pageSize.width * desiredScale) * (pageSize.height * desiredScale)
         let finalScale = rawPx > maxPixels ? desiredScale * sqrt(maxPixels / rawPx) : desiredScale
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = finalScale
         format.opaque = true
+        // CRITICAL for Intel Display-P3 MacBooks: force 8-bit standard sRGB (4 B/px instead of 16-bit half-float 8 B/px!)
+        format.preferredRange = .standard
+
         let renderer = UIGraphicsImageRenderer(size: pageSize, format: format)
         let baseImg = renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
-            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx)
+            ctx.interpolationQuality = fastQuality ? .low : .medium
+            drawSlotBackground(slot: slot, cgPDFDoc: cgPDFDoc, pdfDoc: pdfDoc, in: ctx)
+            // Single-pass zero-copy Sepia multiply tint (eliminates 2nd full-page bitmap allocation!)
+            if readingMode == .sepia {
+                ctx.saveGState()
+                ctx.setBlendMode(.multiply)
+                ctx.setFillColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0)
+                ctx.fill(CGRect(origin: .zero, size: pageSize))
+                ctx.restoreGState()
+            }
         }
-        return applyReadingFilter(to: baseImg, mode: readingMode)
+        if readingMode == .dark {
+            return applyDarkPaperFilter(to: baseImg)
+        }
+        return baseImg
     }
 
     func updateHobonichiData(doc: InkDocument, allSlots: [PageSlot]) {
@@ -352,7 +482,8 @@ final class PageCanvasView: UIView {
 
     static func drawSlotBackground(
         slot: PageSlot,
-        pdfDoc: PDFDocument?,
+        cgPDFDoc: CGPDFDocument? = nil,
+        pdfDoc: PDFDocument? = nil,
         in ctx: CGContext,
         hoboDoc: InkDocument? = nil,
         hoboAllSlots: [PageSlot] = [],
@@ -361,6 +492,17 @@ final class PageCanvasView: UIView {
         ctx.saveGState()
         if isHobo, HobonichiEngine.slotKind(for: slot, isHobo: true) != nil {
             HobonichiEngine.drawSpread(in: ctx, slot: slot, doc: hoboDoc ?? InkDocument.empty(name: ""), allSlots: hoboAllSlots, isHobo: true)
+        } else if let pdfN = slot.effectivePDFPageNumber, let cgPage = cgPDFDoc?.page(at: pdfN) {
+            // Fast pure-C CoreGraphics PDF draw (zero PDFKit Objective-C lock or page-tree retention!)
+            ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+            ctx.fill(CGRect(origin: .zero, size: slot.size))
+            ctx.translateBy(x: 0, y: slot.size.height)
+            ctx.scaleBy(x: 1, y: -1)
+            let destRect = CGRect(origin: .zero, size: slot.size)
+            let xform = cgPage.getDrawingTransform(.cropBox, rect: destRect, rotate: 0, preserveAspectRatio: true)
+            ctx.concatenate(xform)
+            ctx.clip(to: cgPage.getBoxRect(.cropBox))
+            ctx.drawPDFPage(cgPage)
         } else if let pdfN = slot.effectivePDFPageNumber, let page = pdfDoc?.page(at: pdfN - 1) {
             UIColor.white.setFill()
             ctx.fill(CGRect(origin: .zero, size: slot.size))
@@ -386,7 +528,7 @@ final class PageCanvasView: UIView {
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 
-        // 1. Highlighters first (multiply on light/sepia paper, screen/normal translucent on dark paper)
+        // 1. Highlighters first
         ctx.saveGState()
         ctx.setBlendMode(smartDarkInk ? .screen : .multiply)
         ctx.setAlpha(smartDarkInk ? 0.34 : 0.42)
@@ -424,7 +566,6 @@ final class PageCanvasView: UIView {
         ctx.restoreGState()
     }
 
-    /// Renders a complete composite image (PDF/template + ink strokes) for thumbnails or PNG sharing.
     static func drawTextBoxes(
         _ boxes: [InkTextBox],
         in ctx: CGContext,
@@ -468,7 +609,8 @@ final class PageCanvasView: UIView {
 
     static func renderCompositeImage(
         slot: PageSlot,
-        pdfDoc: PDFDocument?,
+        cgPDFDoc: CGPDFDocument? = nil,
+        pdfDoc: PDFDocument? = nil,
         strokes: [InkStroke],
         textBoxes: [InkTextBox] = [],
         scale: CGFloat,
@@ -479,10 +621,11 @@ final class PageCanvasView: UIView {
         let format = UIGraphicsImageRendererFormat()
         format.scale = max(0.25, scale)
         format.opaque = true
+        format.preferredRange = .standard
         let renderer = UIGraphicsImageRenderer(size: slot.size, format: format)
         return renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
-            drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx, hoboDoc: hoboDoc, hoboAllSlots: hoboAllSlots, isHobo: isHobo)
+            drawSlotBackground(slot: slot, cgPDFDoc: cgPDFDoc, pdfDoc: pdfDoc, in: ctx, hoboDoc: hoboDoc, hoboAllSlots: hoboAllSlots, isHobo: isHobo)
             drawStrokes(strokes, in: ctx)
             drawTextBoxes(textBoxes, in: ctx)
         }
@@ -498,7 +641,7 @@ private final class StaticInkView: UIView {
     var smartDarkInk: Bool = false
 
     override func draw(_ rect: CGRect) {
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        guard (!strokes.isEmpty || !textBoxes.isEmpty), let ctx = UIGraphicsGetCurrentContext() else { return }
         if !strokes.isEmpty {
             PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs, smartDarkInk: smartDarkInk)
         }
@@ -617,7 +760,6 @@ private final class LiveInkOverlayView: UIView {
 
         case let .lassoSelected(sel, zoomScale):
             let sc = max(0.5, zoomScale)
-            // 1. Render transformed strokes live
             ctx.saveGState()
             ctx.translateBy(x: sel.pivot.x + sel.tx, y: sel.pivot.y + sel.ty)
             if sel.rotation != 0 { ctx.rotate(by: sel.rotation) }
@@ -626,7 +768,6 @@ private final class LiveInkOverlayView: UIView {
             PageCanvasView.drawStrokes(sel.strokes, in: ctx)
             ctx.restoreGState()
 
-            // 2. Render selection dashed box + 4 scale handles + top rotation handle
             let h = sel.handles(zoomScale: sc)
             let accent = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0)
             ctx.saveGState()
@@ -644,7 +785,6 @@ private final class LiveInkOverlayView: UIView {
             ctx.setLineDash(phase: 0, lengths: [5.0 / sc, 4.0 / sc])
             ctx.stroke(boxRect)
 
-            // Rotation stem + handle
             ctx.setLineDash(phase: 0, lengths: [])
             ctx.move(to: CGPoint(x: h.cx, y: h.by0))
             ctx.addLine(to: CGPoint(x: h.cx, y: h.rotY))
@@ -658,7 +798,6 @@ private final class LiveInkOverlayView: UIView {
             ctx.setLineWidth(1.5 / sc)
             ctx.strokeEllipse(in: rotRect)
 
-            // 4 corner scale handles
             ctx.setFillColor(UIColor.white.cgColor)
             ctx.setStrokeColor(accent.cgColor)
             ctx.setLineWidth(1.8 / sc)
@@ -671,7 +810,6 @@ private final class LiveInkOverlayView: UIView {
         }
     }
 }
-
 
 private final class TemplatePaperView: UIView {
     let template: PaperTemplate
@@ -752,7 +890,6 @@ private final class TemplatePaperView: UIView {
         }
     }
 }
-
 
 private final class HobonichiPaperView: UIView {
     let slot: PageSlot

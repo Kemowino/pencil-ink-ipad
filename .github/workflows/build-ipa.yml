@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.4.1}"
+          TAG="v${VER:-1.5.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Full Bidirectional Google Drive PDF Vault Sync (automatically downloads new PDFs & annotations from Drive and uploads new notebooks/journals across iPhone, iPad, and Mac), Full LiveContainer Sandbox/Folder Compatibility, Streaming Large-PDF Downloads & Resumable Uploads, and iPhone Compact Toolbar Polish." \
+              --notes "Pencil Ink Native $TAG — Toaster-Grade macOS & iPadOS Engine: Direct CGPDFDocument Rendering, 8-Bit Standard Color Range (50% Less VRAM), PageCanvasView Recycling Pool, Zero-VRAM Lazy Ink/Overlay Layers, NSSupportsAutomaticGraphicsSwitching (Integrated GPU Only), Velocity-Gated Center-First Scroll Renderer, Zero SwiftUI Re-renders During Scroll, and Zero-Blur macOS Canvas Chrome." \
               --latest
           fi

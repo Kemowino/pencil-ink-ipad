@@ -79,6 +79,12 @@ struct NotebookScreen: View {
         colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.10)
     }
 
+    private var floatingPillBg: Color {
+        colorScheme == .dark
+            ? Color(red: 0.145, green: 0.150, blue: 0.168).opacity(0.96)
+            : Color.white.opacity(0.96)
+    }
+
     #if targetEnvironment(macCatalyst)
     private let primaryBarHeight: CGFloat = 54
     private let primaryIconFont: CGFloat = 20
@@ -124,9 +130,13 @@ struct NotebookScreen: View {
                     .frame(height: 0.5)
             }
 
-            // Optional Hobonichi Ribbon Strip
+            // Optional Hobonichi Ribbon Strip (observes isolated HUD state)
             if toolState.isHobonichi {
-                hobonichiRibbonStrip
+                HobonichiRibbonBar(
+                    hud: toolState.hud,
+                    secondaryBarBg: secondaryBarBg,
+                    controllerBox: controllerBox
+                )
                 Rectangle()
                     .fill(hairlineColor)
                     .frame(height: 0.5)
@@ -253,68 +263,25 @@ struct NotebookScreen: View {
                         .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
-                if !toolState.toastMessage.isEmpty {
-                    Text(toolState.toastMessage)
-                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                        .foregroundColor(colorScheme == .dark ? .white : .primary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(.regularMaterial)
-                        .clipShape(Capsule())
-                        .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                        .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
-                        .padding(.top, toolState.hasLassoSelection || toolState.hasActiveTextBox ? 0 : 10)
-                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                }
-
-                Spacer()
-
-                // Subtle Goodnotes Bottom Page Pill
-                Button {
-                    jumpPageInput = "\(toolState.currentPage)"
-                    activePopover = .jumpPage
-                    Haptics.selection()
-                } label: {
-                    HStack(spacing: 5) {
-                        if toolState.isHobonichi && !toolState.currentSlotLabel.isEmpty {
-                            Text(toolState.currentSlotLabel)
-                                .font(.system(size: pagePillFont, weight: .semibold))
-                            Text("·")
-                                .opacity(0.55)
-                            Text("\(toolState.currentPage)/\(toolState.totalPages)")
-                                .font(.system(size: pagePillFont, weight: .medium))
-                                .monospacedDigit()
-                        } else {
-                            Text("Page \(toolState.currentPage) of \(toolState.totalPages)")
-                                .font(.system(size: pagePillFont, weight: .semibold))
-                                .monospacedDigit()
-                        }
-                        if toolState.saveStatus != "Saved" {
-                            Text("· \(toolState.saveStatus)")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .foregroundColor(.primary.opacity(0.88))
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 5.5)
-                    .background(.regularMaterial)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                    .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
-                }
-                .buttonStyle(.plain)
-                .opacity(toolState.isWriting ? 0.25 : 0.95)
-                .animation(.easeOut(duration: 0.16), value: toolState.isWriting)
-                .popover(isPresented: Binding(
-                    get: { activePopover == .jumpPage },
-                    set: { if !$0 { activePopover = nil } }
-                )) {
-                    jumpPagePopover
-                }
-                .padding(.bottom, 12)
+                NotebookFloatingHUD(
+                    hud: toolState.hud,
+                    isHobonichi: toolState.isHobonichi,
+                    hasTopActionBar: toolState.hasLassoSelection || toolState.hasActiveTextBox,
+                    pagePillFont: pagePillFont,
+                    hairlineColor: hairlineColor,
+                    floatingPillBg: floatingPillBg,
+                    onTapPagePill: {
+                        jumpPageInput = "\(toolState.currentPage)"
+                        activePopover = .jumpPage
+                        Haptics.selection()
+                    },
+                    jumpPopoverPresented: Binding(
+                        get: { activePopover == .jumpPage },
+                        set: { if !$0 { activePopover = nil } }
+                    ),
+                    jumpPopoverContent: { jumpPagePopover }
+                )
             }
-            .animation(.easeOut(duration: 0.18), value: toolState.toastMessage)
             .animation(.easeOut(duration: 0.18), value: toolState.hasLassoSelection)
             .animation(.easeOut(duration: 0.18), value: toolState.hasActiveTextBox)
         }
@@ -357,9 +324,10 @@ struct NotebookScreen: View {
                     showPageOverview = true
                 }
 
-                barIconButton(
-                    systemName: toolState.isCurrentPageBookmarked ? "bookmark.fill" : "bookmark",
-                    tint: toolState.isCurrentPageBookmarked ? .orange : nil
+                BookmarkToolbarButton(
+                    hud: toolState.hud,
+                    iconFont: primaryIconFont,
+                    iconFrame: primaryIconFrame
                 ) {
                     controllerBox.vc?.toggleBookmarkForCurrentPage()
                     Haptics.light()
@@ -1392,60 +1360,7 @@ struct NotebookScreen: View {
         .frame(width: 268)
     }
 
-    // MARK: - Hobonichi Two-Ribbon Strip
 
-    private var hobonichiRibbonStrip: some View {
-        HStack(spacing: 8) {
-            ribbonChip("Index", active: toolState.currentPage == 1, activeColor: Color(red: 0.78, green: 0.29, blue: 0.19)) {
-                controllerBox.vc?.jumpToHoboIndex()
-                Haptics.selection()
-            }
-            ribbonChip("This Week", active: false, activeColor: .accentColor) {
-                controllerBox.vc?.jumpToHoboCurrentWeek()
-                Haptics.selection()
-            }
-            ribbonChip(toolState.isOnHoboNotes ? "⇄ Back to Week" : "⇄ Notes", active: toolState.isOnHoboNotes, activeColor: Color(red: 0.78, green: 0.62, blue: 0.18)) {
-                controllerBox.vc?.toggleHoboNotesRibbon()
-                Haptics.selection()
-            }
-            Menu {
-                Button { controllerBox.vc?.expandHoboWeeks(4) } label: {
-                    Label("Add +4 Weeks (1 Month)", systemImage: "calendar.badge.plus")
-                }
-                Button { controllerBox.vc?.expandHoboWeeks(12) } label: {
-                    Label("Add +12 Weeks (3 Months)", systemImage: "calendar.badge.plus")
-                }
-                Divider()
-                Button { controllerBox.vc?.addHoboBackNotesPage() } label: {
-                    Label("Add Back Notes Spread", systemImage: "note.text.badge.plus")
-                }
-            } label: {
-                Text("+ Expand")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(Color(red: 0.78, green: 0.62, blue: 0.18))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color(red: 0.78, green: 0.62, blue: 0.18).opacity(0.14))
-                    .clipShape(Capsule())
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 5)
-        .background(secondaryBarBg)
-    }
-
-    private func ribbonChip(_ title: String, active: Bool, activeColor: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundColor(active ? .white : .primary.opacity(0.84))
-                .padding(.horizontal, 11)
-                .padding(.vertical, 4)
-                .background(active ? activeColor : Color.primary.opacity(0.07))
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
 
     // MARK: - Floating Lasso & Text Box Action Pills
 
@@ -1481,10 +1396,10 @@ struct NotebookScreen: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.regularMaterial)
+        .background(floatingPillBg)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.9))
-        .shadow(color: .black.opacity(0.22), radius: 10, y: 4)
+        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
     }
 
     private func lassoPillButton(_ title: String, danger: Bool = false, action: @escaping () -> Void) -> some View {
@@ -1525,10 +1440,10 @@ struct NotebookScreen: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.regularMaterial)
+        .background(floatingPillBg)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.9))
-        .shadow(color: .black.opacity(0.20), radius: 10, y: 4)
+        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
     }
 
     // MARK: - Tool Settings Popovers
@@ -2010,5 +1925,158 @@ private struct GoodnotesLaserIcon: View {
             let core = Path(ellipseIn: CGRect(x: cx - coreR, y: cy - coreR, width: coreR * 2, height: coreR * 2))
             ctx.fill(core, with: .color(dot))
         }
+    }
+}
+
+
+// MARK: - Isolated High-Frequency HUD Subviews (ZERO NotebookScreen Rebuilds During Scroll!)
+
+private struct BookmarkToolbarButton: View {
+    @ObservedObject var hud: NotebookHUDState
+    let iconFont: CGFloat
+    let iconFrame: CGFloat
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: hud.isCurrentPageBookmarked ? "bookmark.fill" : "bookmark")
+                .font(.system(size: iconFont, weight: .regular))
+                .foregroundColor(hud.isCurrentPageBookmarked ? .orange : .primary.opacity(0.84))
+                .frame(width: iconFrame, height: iconFrame)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct HobonichiRibbonBar: View {
+    @ObservedObject var hud: NotebookHUDState
+    let secondaryBarBg: Color
+    let controllerBox: PDFNotebookRepresentable.ControllerBox
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ribbonChip("Index", active: hud.currentPage == 1, activeColor: Color(red: 0.78, green: 0.29, blue: 0.19)) {
+                controllerBox.vc?.jumpToHoboIndex()
+                Haptics.selection()
+            }
+            ribbonChip("This Week", active: false, activeColor: .accentColor) {
+                controllerBox.vc?.jumpToHoboCurrentWeek()
+                Haptics.selection()
+            }
+            ribbonChip(hud.isOnHoboNotes ? "⇄ Back to Week" : "⇄ Notes", active: hud.isOnHoboNotes, activeColor: Color(red: 0.78, green: 0.62, blue: 0.18)) {
+                controllerBox.vc?.toggleHoboNotesRibbon()
+                Haptics.selection()
+            }
+            Menu {
+                Button { controllerBox.vc?.expandHoboWeeks(4) } label: {
+                    Label("Add +4 Weeks (1 Month)", systemImage: "calendar.badge.plus")
+                }
+                Button { controllerBox.vc?.expandHoboWeeks(12) } label: {
+                    Label("Add +12 Weeks (3 Months)", systemImage: "calendar.badge.plus")
+                }
+                Divider()
+                Button { controllerBox.vc?.addHoboBackNotesPage() } label: {
+                    Label("Add Back Notes Spread", systemImage: "note.text.badge.plus")
+                }
+            } label: {
+                Text("+ Expand")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(Color(red: 0.78, green: 0.62, blue: 0.18))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color(red: 0.78, green: 0.62, blue: 0.18).opacity(0.14))
+                    .clipShape(Capsule())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(secondaryBarBg)
+    }
+
+    private func ribbonChip(_ title: String, active: Bool, activeColor: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundColor(active ? .white : .primary.opacity(0.84))
+                .padding(.horizontal, 11)
+                .padding(.vertical, 4)
+                .background(active ? activeColor : Color.primary.opacity(0.07))
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct NotebookFloatingHUD<JumpPopover: View>: View {
+    @ObservedObject var hud: NotebookHUDState
+    let isHobonichi: Bool
+    let hasTopActionBar: Bool
+    let pagePillFont: CGFloat
+    let hairlineColor: Color
+    let floatingPillBg: Color
+    let onTapPagePill: () -> Void
+    @Binding var jumpPopoverPresented: Bool
+    @ViewBuilder let jumpPopoverContent: () -> JumpPopover
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(spacing: 10) {
+            if !hud.toastMessage.isEmpty {
+                Text(hud.toastMessage)
+                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                    .foregroundColor(colorScheme == .dark ? .white : .primary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(floatingPillBg)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
+                    .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+                    .padding(.top, hasTopActionBar ? 0 : 10)
+                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
+            }
+
+            Spacer()
+
+            // Zero-blur Goodnotes Bottom Page Pill (saves 60Hz WindowServer blur readback on macOS!)
+            Button(action: onTapPagePill) {
+                HStack(spacing: 5) {
+                    if isHobonichi && !hud.currentSlotLabel.isEmpty {
+                        Text(hud.currentSlotLabel)
+                            .font(.system(size: pagePillFont, weight: .semibold))
+                        Text("·")
+                            .opacity(0.55)
+                        Text("\(hud.currentPage)/\(hud.totalPages)")
+                            .font(.system(size: pagePillFont, weight: .medium))
+                            .monospacedDigit()
+                    } else {
+                        Text("Page \(hud.currentPage) of \(hud.totalPages)")
+                            .font(.system(size: pagePillFont, weight: .semibold))
+                            .monospacedDigit()
+                    }
+                    if hud.saveStatus != "Saved" {
+                        Text("· \(hud.saveStatus)")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .foregroundColor(.primary.opacity(0.88))
+                .padding(.horizontal, 13)
+                .padding(.vertical, 5.5)
+                .background(floatingPillBg)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
+                .shadow(color: .black.opacity(0.10), radius: 3, y: 1.5)
+            }
+            .buttonStyle(.plain)
+            .opacity(hud.isWriting ? 0.25 : 0.95)
+            .animation(.easeOut(duration: 0.16), value: hud.isWriting)
+            .popover(isPresented: $jumpPopoverPresented) {
+                jumpPopoverContent()
+            }
+            .padding(.bottom, 12)
+        }
+        .animation(.easeOut(duration: 0.18), value: hud.toastMessage)
     }
 }

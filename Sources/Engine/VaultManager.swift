@@ -465,18 +465,25 @@ final class VaultManager: ObservableObject {
         }
         let url = item.url
         thumbQueue.async { [weak self] in
-            guard let doc = PDFDocument(url: url), let page = doc.page(at: 0) else {
+            guard let cgDoc = CGPDFDocument(url as CFURL), let cgPage = cgDoc.page(at: 1) else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let sz = PageCanvasView.normalizedPageSize(for: page)
+            let sz = PageCanvasView.normalizedPageSize(for: cgPage)
             guard sz.width > 0, sz.height > 0 else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let scale = min(1.0, 260.0 / sz.width)
+            let scale = min(1.0, 240.0 / sz.width)
             let slot = PageSlot(index: 0, key: "1", pdfN: 1, srcN: nil, blank: nil, size: sz)
-            let img = PageCanvasView.renderSlotBackground(slot: slot, pdfDoc: doc, zoomScale: scale, maxPixels: 300_000)
+            let img = PageCanvasView.renderSlotBackground(
+                slot: slot,
+                cgPDFDoc: cgDoc,
+                zoomScale: scale,
+                maxPixels: 240_000,
+                displayScale: 1.5,
+                fastQuality: true
+            )
             self?.thumbCache.setObject(img, forKey: key)
             DispatchQueue.main.async { completion(img) }
         }

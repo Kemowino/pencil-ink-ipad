@@ -18,10 +18,10 @@ struct WorkspaceRootView: View {
             }
 
             ZStack {
-                LibraryView()
-                    .opacity(tabManager.activeTabID == nil ? 1 : 0)
-                    .allowsHitTesting(tabManager.activeTabID == nil)
-                    .zIndex(tabManager.activeTabID == nil ? 5 : 0)
+                if tabManager.activeTabID == nil {
+                    LibraryView()
+                        .zIndex(5)
+                }
 
                 ForEach(tabManager.tabs) { tab in
                     let isActive = (tabManager.activeTabID == tab.id)
