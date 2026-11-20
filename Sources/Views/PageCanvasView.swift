@@ -467,10 +467,9 @@ final class PageCanvasView: UIView {
                 ctx.restoreGState()
             }
         }
-        if readingMode == .dark {
-            return applyDarkPaperFilter(to: baseImg)
-        }
-        return baseImg
+        let finalImg = (readingMode == .dark) ? applyDarkPaperFilter(to: baseImg) : baseImg
+        // Pre-decode/swizzle bitmap on background thread so main-thread CA::Transaction::commit never stalls!
+        return finalImg.preparingForDisplay() ?? finalImg
     }
 
     func updateHobonichiData(doc: InkDocument, allSlots: [PageSlot]) {

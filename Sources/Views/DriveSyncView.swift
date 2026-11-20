@@ -4,7 +4,6 @@ import UIKit
 struct SyncStatusDotButton: View {
     @ObservedObject var syncManager: DriveSyncManager
     let action: () -> Void
-    @State private var pulse = false
 
     private var dotColor: Color {
         switch syncManager.visualState {
@@ -19,33 +18,15 @@ struct SyncStatusDotButton: View {
         Button(action: action) {
             ZStack {
                 Circle()
-                    .fill(dotColor.opacity(0.24))
-                    .frame(width: 22, height: 22)
-                    .scaleEffect(syncManager.visualState == .syncing && pulse ? 1.18 : 0.92)
+                    .fill(dotColor.opacity(syncManager.visualState == .syncing ? 0.34 : 0.22))
+                    .frame(width: 20, height: 20)
                 Circle()
                     .fill(dotColor)
-                    .frame(width: 11, height: 11)
+                    .frame(width: 10, height: 10)
             }
-            .frame(width: 34, height: 34)
+            .frame(width: 32, height: 32)
         }
-        .onAppear {
-            updatePulseState()
-        }
-        .onChange(of: syncManager.visualState) { _ in
-            updatePulseState()
-        }
-    }
-
-    private func updatePulseState() {
-        if syncManager.visualState == .syncing {
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
-        } else {
-            withAnimation(.easeOut(duration: 0.2)) {
-                pulse = false
-            }
-        }
+        .buttonStyle(.plain)
     }
 }
 

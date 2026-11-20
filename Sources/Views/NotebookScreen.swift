@@ -86,18 +86,19 @@ struct NotebookScreen: View {
     }
 
     #if targetEnvironment(macCatalyst)
-    private let primaryBarHeight: CGFloat = 54
-    private let primaryIconFont: CGFloat = 20
-    private let primaryIconFrame: CGFloat = 44
-    private let docTitleFont: CGFloat = 17
-    private var topToolBarHeight: CGFloat { settings.compactToolbar ? 50 : 58 }
-    private var sideRailWidth: CGFloat { settings.compactToolbar ? 58 : 66 }
-    private let toolSlotFrame: CGFloat = 44
-    private let toolIconCanvas: CGFloat = 26
-    private let swatchInnerSize: CGFloat = 26
-    private let swatchRingSize: CGFloat = 33
-    private let swatchHitFrame: CGFloat = 36
-    private let pagePillFont: CGFloat = 13.5
+    // Native 1.0x Mac Idiom ("Optimize for Mac" — crisp native macOS toolbar proportions!)
+    private let primaryBarHeight: CGFloat = 42
+    private let primaryIconFont: CGFloat = 15.5
+    private let primaryIconFrame: CGFloat = 34
+    private let docTitleFont: CGFloat = 13.5
+    private var topToolBarHeight: CGFloat { settings.compactToolbar ? 40 : 45 }
+    private var sideRailWidth: CGFloat { settings.compactToolbar ? 46 : 52 }
+    private let toolSlotFrame: CGFloat = 34
+    private let toolIconCanvas: CGFloat = 20
+    private let swatchInnerSize: CGFloat = 20
+    private let swatchRingSize: CGFloat = 26
+    private let swatchHitFrame: CGFloat = 28
+    private let pagePillFont: CGFloat = 11.5
     #else
     private let primaryBarHeight: CGFloat = 44
     private var primaryIconFont: CGFloat { horizontalSizeClass == .compact ? 15.0 : 16.5 }
@@ -1399,8 +1400,7 @@ struct NotebookScreen: View {
         .background(floatingPillBg)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.9))
-        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
-    }
+            }
 
     private func lassoPillButton(_ title: String, danger: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -1443,8 +1443,7 @@ struct NotebookScreen: View {
         .background(floatingPillBg)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.9))
-        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
-    }
+            }
 
     // MARK: - Tool Settings Popovers
 
@@ -1697,9 +1696,9 @@ private struct GoodnotesThicknessCircleButton: View {
     @Environment(\.colorScheme) private var colorScheme
 
     #if targetEnvironment(macCatalyst)
-    private let ringSize: CGFloat = 34
-    private let hitSize: CGFloat = 36
-    private let dotScale: CGFloat = 1.15
+    private let ringSize: CGFloat = 28
+    private let hitSize: CGFloat = 30
+    private let dotScale: CGFloat = 1.0
     #else
     private let ringSize: CGFloat = 30
     private let hitSize: CGFloat = 32
@@ -1735,7 +1734,7 @@ private struct GoodnotesHandIcon: View {
     let isDark: Bool
 
     #if targetEnvironment(macCatalyst)
-    private let iconSize: CGFloat = 20
+    private let iconSize: CGFloat = 16.0
     #else
     private let iconSize: CGFloat = 16.5
     #endif
@@ -2032,8 +2031,7 @@ private struct NotebookFloatingHUD<JumpPopover: View>: View {
                     .background(floatingPillBg)
                     .clipShape(Capsule())
                     .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                    .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
-                    .padding(.top, hasTopActionBar ? 0 : 10)
+                                        .padding(.top, hasTopActionBar ? 0 : 10)
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
             }
 
@@ -2067,8 +2065,7 @@ private struct NotebookFloatingHUD<JumpPopover: View>: View {
                 .background(floatingPillBg)
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                .shadow(color: .black.opacity(0.10), radius: 3, y: 1.5)
-            }
+                            }
             .buttonStyle(.plain)
             .opacity(hud.isWriting ? 0.25 : 0.95)
             .animation(.easeOut(duration: 0.16), value: hud.isWriting)

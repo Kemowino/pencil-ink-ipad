@@ -8,7 +8,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
-    TARGETED_DEVICE_FAMILY: "1,2"
+    TARGETED_DEVICE_FAMILY: "1,2,6"
     SUPPORTS_MACCATALYST: YES
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
     DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
@@ -26,17 +26,14 @@ targets:
       properties:
         CFBundleDisplayName: Pencil Ink
         CFBundleName: PencilInkNative
-        CFBundleShortVersionString: "1.5.0"
-        CFBundleVersion: "17"
+        CFBundleShortVersionString: "1.6.0"
+        CFBundleVersion: "18"
         NSSupportsAutomaticGraphicsSwitching: true
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         UISupportsDocumentBrowser: true
         LSSupportsOpeningDocumentsInPlace: true
         UIFileSharingEnabled: true
-        UIDeviceFamily:
-          - 1
-          - 2
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -88,13 +88,14 @@ private struct GoodnotesTabBar: View {
     @Environment(\.colorScheme) private var colorScheme
 
     #if targetEnvironment(macCatalyst)
-    private let barHeight: CGFloat = 48
-    private let houseIconSize: CGFloat = 20
-    private let houseFrameW: CGFloat = 44
-    private let houseFrameH: CGFloat = 36
-    private let plusIconSize: CGFloat = 17.5
-    private let plusFrameW: CGFloat = 42
-    private let plusFrameH: CGFloat = 36
+    // Native 1.0x Mac Idiom ("Optimize for Mac" — crisp native macOS proportions, zero 0.77x scaling!)
+    private let barHeight: CGFloat = 38
+    private let houseIconSize: CGFloat = 15.5
+    private let houseFrameW: CGFloat = 34
+    private let houseFrameH: CGFloat = 28
+    private let plusIconSize: CGFloat = 14
+    private let plusFrameW: CGFloat = 32
+    private let plusFrameH: CGFloat = 28
     #else
     private let barHeight: CGFloat = 36
     private let houseIconSize: CGFloat = 15
@@ -216,18 +217,18 @@ private struct GoodnotesCurvedTab: View {
     @Environment(\.colorScheme) private var colorScheme
 
     #if targetEnvironment(macCatalyst)
-    private let tabHeight: CGFloat = 42
-    private let titleFontSize: CGFloat = 15.5
-    private let calIconSize: CGFloat = 13
-    private let minTitleW: CGFloat = 115
-    private let maxTitleW: CGFloat = 250
-    private let closeIconSize: CGFloat = 11.5
-    private let closeFrame: CGFloat = 24
-    private let topRadius: CGFloat = 12
-    private let flare: CGFloat = 10
-    private let padLead: CGFloat = 22
-    private let padTrail: CGFloat = 18
-    private let divHeight: CGFloat = 18
+    private let tabHeight: CGFloat = 33
+    private let titleFontSize: CGFloat = 12.5
+    private let calIconSize: CGFloat = 10.5
+    private let minTitleW: CGFloat = 96
+    private let maxTitleW: CGFloat = 210
+    private let closeIconSize: CGFloat = 9.5
+    private let closeFrame: CGFloat = 19
+    private let topRadius: CGFloat = 9
+    private let flare: CGFloat = 8
+    private let padLead: CGFloat = 18
+    private let padTrail: CGFloat = 14
+    private let divHeight: CGFloat = 14
     #else
     private let tabHeight: CGFloat = 32
     private let titleFontSize: CGFloat = 12.5
@@ -283,12 +284,6 @@ private struct GoodnotesCurvedTab: View {
                 if isActive {
                     GoodnotesFolderTabShape(topRadius: topRadius, flare: flare)
                         .fill(activeFill)
-                        .shadow(
-                            color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.08),
-                            radius: 3,
-                            x: 0,
-                            y: -1
-                        )
                 }
             }
 
