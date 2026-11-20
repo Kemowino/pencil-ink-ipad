@@ -32,10 +32,11 @@ struct NotebookScreen: View {
     let tab: OpenDocumentTab
     let isActive: Bool
     let showHomeButtonInBar: Bool
+    /// Plain non-observed references so Vault refreshes, Drive sync ticks, & tab switches NEVER rebuild inactive NotebookScreens!
+    let vault: VaultManager
+    let syncManager: DriveSyncManager
+    let tabManager: TabManager
 
-    @EnvironmentObject var vault: VaultManager
-    @EnvironmentObject var syncManager: DriveSyncManager
-    @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var palette: ToolPaletteStore
     @ObservedObject private var toolState: NotebookToolState
@@ -52,10 +53,20 @@ struct NotebookScreen: View {
     @State private var renameDraft: String = ""
     @State private var addColorDraft: Color = Color(red: 0.0, green: 0.48, blue: 1.0)
 
-    init(tab: OpenDocumentTab, isActive: Bool, showHomeButtonInBar: Bool) {
+    init(
+        tab: OpenDocumentTab,
+        isActive: Bool,
+        showHomeButtonInBar: Bool,
+        vault: VaultManager,
+        syncManager: DriveSyncManager,
+        tabManager: TabManager
+    ) {
         self.tab = tab
         self.isActive = isActive
         self.showHomeButtonInBar = showHomeButtonInBar
+        self.vault = vault
+        self.syncManager = syncManager
+        self.tabManager = tabManager
         self._toolState = ObservedObject(wrappedValue: tab.toolState)
     }
 
@@ -2053,11 +2064,7 @@ private struct NotebookFloatingHUD<JumpPopover: View>: View {
                             .font(.system(size: pagePillFont, weight: .semibold))
                             .monospacedDigit()
                     }
-                    if hud.saveStatus != "Saved" {
-                        Text("· \(hud.saveStatus)")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }
+                    // Clean steady page counter (no jarring "Saving..." width jump after every stroke)
                 }
                 .foregroundColor(.primary.opacity(0.88))
                 .padding(.horizontal, 13)

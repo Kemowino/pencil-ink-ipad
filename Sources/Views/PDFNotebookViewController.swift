@@ -244,14 +244,16 @@ private enum UndoAction {
 
 
 private final class CachedPageBitmap {
-    let image: UIImage
+    let cgImage: CGImage
     let zoomScale: CGFloat
     let readingMode: PDFReadingMode
+    let isDraft: Bool
 
-    init(image: UIImage, zoomScale: CGFloat, readingMode: PDFReadingMode) {
-        self.image = image
+    init(cgImage: CGImage, zoomScale: CGFloat, readingMode: PDFReadingMode, isDraft: Bool) {
+        self.cgImage = cgImage
         self.zoomScale = zoomScale
         self.readingMode = readingMode
+        self.isDraft = isDraft
     }
 }
 
@@ -473,11 +475,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private let pageBitmapCache: NSCache<NSString, CachedPageBitmap> = {
         let c = NSCache<NSString, CachedPageBitmap>()
         #if targetEnvironment(macCatalyst)
-        c.countLimit = 20
-        c.totalCostLimit = 96 * 1024 * 1024
+        c.countLimit = 48
+        c.totalCostLimit = 128 * 1024 * 1024
         #else
-        c.countLimit = 18
-        c.totalCostLimit = 64 * 1024 * 1024
+        c.countLimit = 28
+        c.totalCostLimit = 72 * 1024 * 1024
         #endif
         return c
     }()
@@ -486,7 +488,12 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private let documentContainer = UIView()
     private let pencilRecognizer = PencilDrawingGestureRecognizer()
 
+    /// Low-energy `.utility` QoS on Mac Catalyst prevents Intel XNU from boosting CPU P-states/voltage rails while scrolling!
+    #if targetEnvironment(macCatalyst)
+    private let renderQueue = DispatchQueue(label: "com.pencilink.pdfrender", qos: .utility)
+    #else
     private let renderQueue = DispatchQueue(label: "com.pencilink.pdfrender", qos: .userInitiated)
+    #endif
     private var renderingKeys = Set<String>()
     private var layoutGeneration: Int = 0
     private let renderWindowLock = NSLock()
@@ -500,11 +507,15 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var isSnappingZoom: Bool = false
     private var zoomSettleWorkItem: DispatchWorkItem?
     private var scrollSettleWorkItem: DispatchWorkItem?
+    private var scrollSettleScheduled: Bool = false
+    private var pendingSharpUpgrade: Bool = false
     private var pagePersistWorkItem: DispatchWorkItem?
     private var lastScrollSampleTime: CFTimeInterval = 0
     private var lastScrollOffsetY: CGFloat = 0
     private var scrollVelocityPtsPerSec: CGFloat = 0
     private var deferredDueToVelocity: Bool = false
+    private var lastHUDPagePublishTime: CFTimeInterval = 0
+    private var pendingHUDPage: Int = 1
     private var lastMountedKeepRange: Range<Int> = 0..<0
     private var lastRenderedVisRange: Range<Int> = 0..<0
     private var cachedDisplayScale: CGFloat = 2.0
@@ -603,13 +614,22 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         if let obs = memoryWarningObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
+    private func resolvedCanvasBackdropColor() -> UIColor {
+        traitCollection.userInterfaceStyle == .dark
+            ? UIColor(red: 0.11, green: 0.114, blue: 0.129, alpha: 1.0)
+            : UIColor(red: 0.902, green: 0.910, blue: 0.929, alpha: 1.0)
+    }
+
+    private func applyOpaqueCanvasBackdrop() {
+        let bg = resolvedCanvasBackdropColor()
+        view.backgroundColor = bg
+        scrollView.backgroundColor = bg
+        documentContainer.backgroundColor = bg
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = UIColor { trait in
-            trait.userInterfaceStyle == .dark
-                ? UIColor(red: 0.11, green: 0.114, blue: 0.129, alpha: 1.0)
-                : UIColor(red: 0.902, green: 0.910, blue: 0.929, alpha: 1.0)
-        }
+        applyOpaqueCanvasBackdrop()
         currentReadingMode = AppSettings.shared.pdfReadingMode
         setupScrollView()
         setupTapUndoGestures()
@@ -787,6 +807,14 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             idleCheckWorkItem = nil
             scrollSettleWorkItem?.cancel()
             scrollSettleWorkItem = nil
+            scrollSettleScheduled = false
+            pendingSharpUpgrade = false
+            deferredDueToVelocity = false
+            layoutGeneration += 1
+            renderWindowLock.lock()
+            activeLayoutGenSnapshot = layoutGeneration
+            renderWindowLock.unlock()
+            renderingKeys.removeAll()
             cancelHoldTimer()
             commitActiveTextBox()
             clearLassoSelection(commitFirst: true)
@@ -850,6 +878,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         super.traitCollectionDidChange(previousTraitCollection)
         let ds = traitCollection.displayScale
         if ds > 0 { cachedDisplayScale = ds }
+        if previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle {
+            applyOpaqueCanvasBackdrop()
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -924,7 +955,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     private func setupScrollView() {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.backgroundColor = .clear
+        scrollView.backgroundColor = resolvedCanvasBackdropColor()
+        scrollView.isOpaque = true
         scrollView.delegate = self
         scrollView.isScrollEnabled = true
         scrollView.alwaysBounceVertical = true
@@ -953,7 +985,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
 
-        documentContainer.backgroundColor = .clear
+        documentContainer.backgroundColor = resolvedCanvasBackdropColor()
+        documentContainer.isOpaque = true
         documentContainer.isMultipleTouchEnabled = true
         scrollView.addSubview(documentContainer)
 
@@ -1226,12 +1259,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
         // Cache currently mounted PDF bitmaps before tearing down subviews so unchanged pages never flash blank
         for (key, pv) in mountedPageViews {
-            if !pv.isTemplateOnly, pv.isRendered, let img = pv.renderedImage {
-                pageBitmapCache.setObject(
-                    CachedPageBitmap(image: img, zoomScale: pv.renderedZoomScale, readingMode: currentReadingMode),
-                    forKey: key as NSString,
-                    cost: estimatedImageCost(img)
-                )
+            if !pv.isTemplateOnly, pv.isRendered, let cg = pv.renderedCGImage {
+                cacheBitmap(cg, forKey: key, zoomScale: pv.renderedZoomScale, readingMode: currentReadingMode, isDraft: pv.isDraftRendered)
             }
         }
 
@@ -1241,6 +1270,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         activeLayoutGenSnapshot = layoutGeneration
         renderWindowLock.unlock()
         renderingKeys.removeAll()
+        pendingSharpUpgrade = false
         lastMountedKeepRange = 0..<0
         lastRenderedVisRange = 0..<0
 
@@ -1306,23 +1336,30 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
-    private func estimatedImageCost(_ image: UIImage) -> Int {
-        if let cg = image.cgImage {
-            return cg.bytesPerRow * cg.height
+    private func cacheBitmap(_ cg: CGImage, forKey key: String, zoomScale: CGFloat, readingMode: PDFReadingMode, isDraft: Bool) {
+        // Never downgrade a crisp cached page with a draft!
+        if isDraft, let existing = pageBitmapCache.object(forKey: key as NSString),
+           !existing.isDraft, existing.readingMode == readingMode {
+            return
         }
-        let pxW = Int(image.size.width * image.scale)
-        let pxH = Int(image.size.height * image.scale)
-        return max(1024, pxW * pxH * 4)
+        let cost = max(1024, cg.bytesPerRow * cg.height)
+        pageBitmapCache.setObject(
+            CachedPageBitmap(cgImage: cg, zoomScale: zoomScale, readingMode: readingMode, isDraft: isDraft),
+            forKey: key as NSString,
+            cost: cost
+        )
     }
 
     /// Keeps recycled PDF views permanently attached to `documentContainer` with `isHidden = true`
-    /// so scrolling across 2,500 pages performs ZERO `addSubview`/`removeFromSuperview` calls
-    /// (preventing `viewDidLayoutSubviews` cascades & Mac Catalyst AppKit accessibility tree rebuilds!).
+    /// so scrolling across 2,500 pages performs ZERO `addSubview`/`removeFromSuperview` calls.
     private func recycleOrRemove(_ pv: PageCanvasView) {
         let recyclable = pv.isRecyclablePDFPage
         pv.prepareForReuse()
         if recyclable && reusablePagePool.count < 8 && pv.superview === documentContainer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             pv.isHidden = true
+            CATransaction.commit()
             reusablePagePool.append(pv)
         } else {
             pv.removeFromSuperview()
@@ -1357,8 +1394,12 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             )
             alreadyAttached = false
         }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         pv.frame = pageFrames[idx]
         pv.isHidden = false
+        CATransaction.commit()
+
         let hiddenStrokes = (lassoSelection?.pageKey == slot.key) ? (lassoSelection?.hiddenStrokeIDs ?? []) : []
         if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
             pv.setStrokes(strokes, hiddenIDs: hiddenStrokes)
@@ -1369,7 +1410,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
         if let cached = pageBitmapCache.object(forKey: slot.key as NSString),
            cached.readingMode == currentReadingMode {
-            pv.applyRenderedImage(cached.image, zoomScale: cached.zoomScale)
+            pv.applyRenderedCGImage(cached.cgImage, zoomScale: cached.zoomScale, isDraft: cached.isDraft)
         } else if pv.isTemplateOnly {
             pv.refreshVectorScale(for: max(0.5, scrollView.zoomScale))
         }
@@ -1554,21 +1595,55 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         lastScrollSampleTime = now
         lastScrollOffsetY = curY
 
-        updateCurrentPageLabel()
+        updateCurrentPageLabel(forceImmediate: false)
         updateVisiblePages(forceSharp: false)
 
-        // Zero-timer-churn scrolling: ONLY arm a settle callback when a fast flick actually deferred rendering!
-        if deferredDueToVelocity {
-            scrollSettleWorkItem?.cancel()
-            let settle = DispatchWorkItem { [weak self] in
-                guard let self, !self.isRebuildingPages else { return }
-                self.scrollVelocityPtsPerSec = 0
-                self.deferredDueToVelocity = false
-                self.updateVisiblePages(forceSharp: true)
-            }
-            scrollSettleWorkItem = settle
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: settle)
+        // Zero-timer cached scroll: ONLY arm the settle timer if something visible actually needs crisp upgrade or HUD flush!
+        if deferredDueToVelocity || pendingHUDPage != toolState.currentPage || anyVisiblePageNeedsSharpUpgrade() {
+            scheduleSingleFlightScrollSettle()
         }
+    }
+
+    private func anyVisiblePageNeedsSharpUpgrade() -> Bool {
+        let zoom = max(0.1, scrollView.zoomScale)
+        for idx in lastRenderedVisRange {
+            guard idx >= 0 && idx < pageSlots.count else { continue }
+            let key = pageSlots[idx].key
+            guard let pv = mountedPageViews[key] else { return true }
+            if pv.isTemplateOnly { continue }
+            if !pv.isRendered || pv.isDraftRendered { return true }
+            if abs(pv.renderedZoomScale - zoom) / max(0.1, pv.renderedZoomScale) > 0.22 { return true }
+        }
+        return false
+    }
+
+    /// Single-flight timestamp-checked settle timer: creates at most ONE timer per scroll gesture
+    /// (zero 60Hz DispatchWorkItem churn!), upgrading only the 1–2 visible draft pages once scrolling stops.
+    private func scheduleSingleFlightScrollSettle() {
+        guard !scrollSettleScheduled else { return }
+        scrollSettleScheduled = true
+        #if targetEnvironment(macCatalyst)
+        let settleDelay: CFTimeInterval = 0.24
+        #else
+        let settleDelay: CFTimeInterval = 0.16
+        #endif
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.scrollSettleScheduled = false
+            guard !self.isRebuildingPages else { return }
+            let elapsed = CACurrentMediaTime() - self.lastScrollSampleTime
+            if elapsed < settleDelay - 0.02 {
+                // Still scrolling — re-arm once for remaining window
+                self.scheduleSingleFlightScrollSettle()
+                return
+            }
+            self.scrollVelocityPtsPerSec = 0
+            self.deferredDueToVelocity = false
+            self.updateCurrentPageLabel(forceImmediate: true)
+            self.updateVisiblePages(forceSharp: true)
+        }
+        scrollSettleWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay, execute: item)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
@@ -1579,44 +1654,49 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         guard !isRebuildingPages, !decelerate else { return }
         scrollVelocityPtsPerSec = 0
-        if deferredDueToVelocity {
-            deferredDueToVelocity = false
-            updateVisiblePages(forceSharp: true)
-        }
+        deferredDueToVelocity = false
+        updateCurrentPageLabel(forceImmediate: true)
+        updateVisiblePages(forceSharp: true)
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         guard !isRebuildingPages else { return }
         scrollVelocityPtsPerSec = 0
-        if deferredDueToVelocity {
-            deferredDueToVelocity = false
-            updateVisiblePages(forceSharp: true)
-        }
+        deferredDueToVelocity = false
+        updateCurrentPageLabel(forceImmediate: true)
+        updateVisiblePages(forceSharp: true)
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         guard !isRebuildingPages else { return }
         scrollVelocityPtsPerSec = 0
         deferredDueToVelocity = false
-        updateCurrentPageLabel()
+        updateCurrentPageLabel(forceImmediate: true)
         updateVisiblePages(forceSharp: true)
     }
 
-    private func updateCurrentPageLabel() {
+    private func updateCurrentPageLabel(forceImmediate: Bool = true) {
         guard !pageFrames.isEmpty else { return }
         let zoom = max(0.01, scrollView.zoomScale)
         let midY = (scrollView.contentOffset.y + scrollView.bounds.height * 0.4) / zoom
         let idx = min(pageFrames.count - 1, firstPageIndex(withMaxYAtLeast: midY))
         let current = idx + 1
+        pendingHUDPage = current
+
+        let now = CACurrentMediaTime()
+        if !forceImmediate && (now - lastHUDPagePublishTime) < 0.14 {
+            return
+        }
         if toolState.currentPage != current {
-            // Debounce UserDefaults disk IPC by 1.2s so scrolling 100 pages does ZERO disk writes mid-scroll!
+            lastHUDPagePublishTime = now
+            // Debounce UserDefaults disk IPC by 1.5s so scrolling 100 pages does ZERO disk writes mid-scroll!
             pagePersistWorkItem?.cancel()
             let key = lastPageStorageKey
             let pItem = DispatchWorkItem {
                 UserDefaults.standard.set(current, forKey: key)
             }
             pagePersistWorkItem = pItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: pItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: pItem)
 
             let slot = pageSlots[safe: idx]
             let label = (isHoboDoc && slot != nil) ? HobonichiEngine.slotLabel(for: slot!, doc: inkDoc) : ""
@@ -1645,8 +1725,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let keepHi = min(pageSlots.count, visRange.upperBound + 2)
         let keepRange = keepLo..<keepHi
 
-        // Zero-allocation fast exit: 90%+ of smooth-scroll frames stay on the same visible pages!
-        if !forceSharp && !deferredDueToVelocity && visRange == lastRenderedVisRange && keepRange == lastMountedKeepRange && renderingKeys.isEmpty {
+        // True zero-allocation fast exit: exits in <2 µs even while a background render is in flight!
+        // (When the in-flight render finishes, `pumpNextVisibleRenderIfNeeded` automatically pumps the next page.)
+        if !forceSharp && !deferredDueToVelocity && visRange == lastRenderedVisRange && keepRange == lastMountedKeepRange {
             return
         }
 
@@ -1663,12 +1744,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             for (key, pv) in mountedPageViews {
                 if protectedKeys.contains(key) { continue }
                 if let idx = slotIndexByKey[key], keepRange.contains(idx) { continue }
-                if !pv.isTemplateOnly, pv.isRendered, let img = pv.renderedImage {
-                    pageBitmapCache.setObject(
-                        CachedPageBitmap(image: img, zoomScale: pv.renderedZoomScale, readingMode: currentReadingMode),
-                        forKey: key as NSString,
-                        cost: estimatedImageCost(img)
-                    )
+                if !pv.isTemplateOnly, pv.isRendered, let cg = pv.renderedCGImage {
+                    cacheBitmap(cg, forKey: key, zoomScale: pv.renderedZoomScale, readingMode: currentReadingMode, isDraft: pv.isDraftRendered)
                 }
                 mountedPageViews.removeValue(forKey: key)
                 recycleOrRemove(pv)
@@ -1679,101 +1756,154 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             }
         }
 
-        let cgDoc = cgPDFDoc
-        let fallbackPDFDoc = lazyPDFDoc
         let gen = layoutGeneration
-        let mode = currentReadingMode
         renderWindowLock.lock()
         activeRenderWindow = keepRange
         activeLayoutGenSnapshot = gen
         renderWindowLock.unlock()
 
-        // Velocity Gate: skip throwaway renders during fast 2,000-page flicks and arm ONE settle render.
+        // Velocity Gate (Preview-Class): skip rendering completely during rapid multi-page flicks!
         #if targetEnvironment(macCatalyst)
-        let flickThreshold: CGFloat = 1800
+        let flickThreshold: CGFloat = 1100
         #else
-        let flickThreshold: CGFloat = 2400
+        let flickThreshold: CGFloat = 2000
         #endif
         if !forceSharp && scrollVelocityPtsPerSec > flickThreshold {
             deferredDueToVelocity = true
             return
         }
 
-        // Single-Pass Consistent Quality (ZERO 2x double-rendering on scroll stop!!):
-        // A page rendered while scrolling is already at final target quality and is NEVER re-rendered
-        // unless the user actually changes zoom (>22% delta)!
+        lastRenderedVisRange = visRange
+        pumpNextVisibleRenderIfNeeded(visRange: visRange, visibleMidY: visibleInDoc.midY, zoom: zoom, forceSharp: forceSharp)
+    }
+
+    /// Apple Preview-Class Two-Tier Progressive Render Pump:
+    /// - During scroll (`!forceSharp`): renders ONLY visible unrendered pages at fast 480K draft (`~8ms`, 1 concurrent on Mac)
+    /// - On settle (`forceSharp`): upgrades ONLY visible draft/zoom-mismatched pages to crisp 2.4M–3.6M resolution
+    /// - Self-chaining: when 1 page completes, immediately pumps the next needed visible page with zero scroll-tick polling!
+    private func pumpNextVisibleRenderIfNeeded(visRange: Range<Int>, visibleMidY: CGFloat, zoom: CGFloat, forceSharp: Bool) {
+        guard isTabActive, !isRebuildingPages, !pageSlots.isEmpty else { return }
+
         #if targetEnvironment(macCatalyst)
-        let dScale: CGFloat = min(cachedDisplayScale, 1.5)
-        let maxPx: CGFloat = 2_200_000
+        let maxConcurrentRenders = 1
+        // On Mac: render ONLY visible pages! Never burn CPU rendering offscreen pages the user may never scroll to.
+        let renderRange = visRange
+        let isZoomedIn = baseFitScale > 0 && zoom > baseFitScale * 1.28
+        let crispMaxPx: CGFloat = isZoomedIn ? 3_800_000 : 2_800_000
+        let draftMaxPx: CGFloat = 420_000
+        let dScale: CGFloat = forceSharp ? min(cachedDisplayScale, 2.0) : 1.0
+        #else
         let maxConcurrentRenders = 2
-        // On Mac, render visible pages + 1 adjacent page ONLY when settled/slow (keeps CPU & battery half of Obsidian!)
-        let renderRange: Range<Int> = (scrollVelocityPtsPerSec < 400 || forceSharp)
+        let renderRange: Range<Int> = forceSharp
             ? max(0, visRange.lowerBound - 1)..<min(pageSlots.count, visRange.upperBound + 1)
             : visRange
-        #else
-        let dScale: CGFloat = min(cachedDisplayScale, 2.0)
-        let maxPx: CGFloat = 4_200_000
-        let maxConcurrentRenders = 3
-        let renderRange: Range<Int> = max(0, visRange.lowerBound - 1)..<min(pageSlots.count, visRange.upperBound + 1)
+        let crispMaxPx: CGFloat = 4_200_000
+        let draftMaxPx: CGFloat = 1_100_000
+        let dScale: CGFloat = forceSharp ? min(cachedDisplayScale, 2.0) : 1.25
         #endif
 
-        lastRenderedVisRange = visRange
-
-        // Center-First Priority: render the page closest to the middle of the screen FIRST!
-        let midY = visibleInDoc.midY
-        let prioritized = Array(renderRange).sorted { a, b in
-            abs(pageFrames[a].midY - midY) < abs(pageFrames[b].midY - midY)
+        if forceSharp {
+            pendingSharpUpgrade = true
         }
+        guard renderingKeys.count < maxConcurrentRenders else { return }
 
-        for idx in prioritized {
+        // Find the single highest-priority (closest to screen center) page needing render — zero Array allocation!
+        var bestIdx: Int? = nil
+        var bestDist: CGFloat = .greatestFiniteMagnitude
+
+        for idx in renderRange {
+            guard idx >= 0 && idx < pageSlots.count else { continue }
             let pv = mountPageView(at: idx)
             if pv.isTemplateOnly {
-                if forceSharp {
-                    pv.refreshVectorScale(for: zoom)
-                }
+                if forceSharp { pv.refreshVectorScale(for: zoom) }
                 continue
             }
-            let needScale = !pv.isRendered || (forceSharp && abs(pv.renderedZoomScale - zoom) / max(0.1, pv.renderedZoomScale) > 0.22)
-            guard needScale, !renderingKeys.contains(pv.pageKey) else { continue }
-            if renderingKeys.count >= maxConcurrentRenders { break }
-            renderingKeys.insert(pv.pageKey)
-            let slot = pv.slot
-            let pageIdx = idx
-            let targetZoom = zoom
-            renderQueue.async { [weak self] in
-                guard let self else { return }
-                self.renderWindowLock.lock()
-                let stillRelevant = (self.activeLayoutGenSnapshot == gen) && self.activeRenderWindow.contains(pageIdx)
-                self.renderWindowLock.unlock()
-                guard stillRelevant else {
-                    DispatchQueue.main.async {
-                        if self.layoutGeneration == gen {
-                            self.renderingKeys.remove(slot.key)
+            if renderingKeys.contains(pv.pageKey) { continue }
+            let zoomChanged = abs(pv.renderedZoomScale - zoom) / max(0.1, pv.renderedZoomScale) > 0.22
+            let needsWork: Bool
+            if forceSharp {
+                needsWork = !pv.isRendered || pv.isDraftRendered || zoomChanged
+            } else {
+                needsWork = !pv.isRendered
+            }
+            if needsWork {
+                let dist = abs(pageFrames[idx].midY - visibleMidY)
+                if dist < bestDist {
+                    bestDist = dist
+                    bestIdx = idx
+                }
+            }
+        }
+
+        guard let targetIdx = bestIdx else {
+            if forceSharp {
+                pendingSharpUpgrade = false
+            }
+            return
+        }
+        let pv = mountPageView(at: targetIdx)
+        renderingKeys.insert(pv.pageKey)
+
+        let cgDoc = cgPDFDoc
+        let fallbackPDFDoc = lazyPDFDoc
+        let gen = layoutGeneration
+        let mode = currentReadingMode
+        let slot = pv.slot
+        let isDraftPass = !forceSharp
+        let maxPx = isDraftPass ? draftMaxPx : crispMaxPx
+
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.renderWindowLock.lock()
+            let stillRelevant = (self.activeLayoutGenSnapshot == gen) && self.activeRenderWindow.contains(targetIdx)
+            self.renderWindowLock.unlock()
+            guard stillRelevant else {
+                DispatchQueue.main.async {
+                    if self.layoutGeneration == gen {
+                        self.renderingKeys.remove(slot.key)
+                        if self.pendingSharpUpgrade && self.scrollVelocityPtsPerSec < 50 {
+                            self.updateVisiblePages(forceSharp: true)
                         }
                     }
-                    return
                 }
-                let img = PageCanvasView.renderSlotBackground(
-                    slot: slot,
-                    cgPDFDoc: cgDoc,
-                    pdfDoc: fallbackPDFDoc,
-                    zoomScale: targetZoom,
-                    maxPixels: maxPx,
-                    readingMode: mode,
-                    displayScale: dScale,
-                    fastQuality: false
-                )
-                let cost = self.estimatedImageCost(img)
-                DispatchQueue.main.async {
-                    guard self.layoutGeneration == gen else { return }
-                    self.renderingKeys.remove(slot.key)
-                    self.pageBitmapCache.setObject(
-                        CachedPageBitmap(image: img, zoomScale: targetZoom, readingMode: mode),
-                        forKey: slot.key as NSString,
-                        cost: cost
+                return
+            }
+            let cgImg = PageCanvasView.renderSlotCGImage(
+                slot: slot,
+                cgPDFDoc: cgDoc,
+                pdfDoc: fallbackPDFDoc,
+                zoomScale: zoom,
+                maxPixels: maxPx,
+                readingMode: mode,
+                displayScale: dScale,
+                fastQuality: isDraftPass
+            )
+            DispatchQueue.main.async {
+                guard self.layoutGeneration == gen else { return }
+                self.renderingKeys.remove(slot.key)
+                if let cgImg {
+                    self.cacheBitmap(cgImg, forKey: slot.key, zoomScale: zoom, readingMode: mode, isDraft: isDraftPass)
+                    self.mountedPageViews[slot.key]?.applyRenderedCGImage(cgImg, zoomScale: zoom, isDraft: isDraftPass)
+                }
+                // Chain next visible page cleanly — guarantees any pending sharp upgrade runs immediately after draft completes!
+                if self.isTabActive && !self.isRebuildingPages {
+                    let curZoom = max(0.1, self.scrollView.zoomScale)
+                    let curVisRect = CGRect(
+                        x: self.scrollView.contentOffset.x / curZoom,
+                        y: self.scrollView.contentOffset.y / curZoom,
+                        width: self.scrollView.bounds.width / curZoom,
+                        height: self.scrollView.bounds.height / curZoom
                     )
-                    // Always look up current mounted view by key (never apply stale bitmap to a recycled view!)
-                    self.mountedPageViews[slot.key]?.applyRenderedImage(img, zoomScale: targetZoom)
+                    let curVis = self.visibleIndexRange(for: curVisRect)
+                    let shouldSharp = (forceSharp || self.pendingSharpUpgrade) && self.scrollVelocityPtsPerSec < 50
+                    if shouldSharp || !self.deferredDueToVelocity {
+                        self.pumpNextVisibleRenderIfNeeded(
+                            visRange: curVis,
+                            visibleMidY: curVisRect.midY,
+                            zoom: curZoom,
+                            forceSharp: shouldSharp
+                        )
+                    }
                 }
             }
         }
@@ -3394,7 +3524,6 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     private func scheduleSave() {
         isDirty = true
-        DispatchQueue.main.async { self.toolState.saveStatus = "Saving…" }
         saveWorkItem?.cancel()
         idleCheckWorkItem?.cancel()
         syncManager?.cancelScheduledSync(for: relativePath)
@@ -3412,8 +3541,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
               let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
         // Only check Drive on return if we were away or haven't checked recently (>= 12s)
         let now = Date()
-        let awayLongEnough = lastBackgroundedAt.map { now.timeIntervalSince($0) >= 8.0 } ?? false
-        let staleCheck = lastDriveSyncCheckAt.map { now.timeIntervalSince($0) >= 15.0 } ?? true
+        let awayLongEnough = lastBackgroundedAt.map { now.timeIntervalSince($0) >= 10.0 } ?? false
+        let staleCheck = lastDriveSyncCheckAt.map { now.timeIntervalSince($0) >= 30.0 } ?? true
         lastBackgroundedAt = nil
         if awayLongEnough || staleCheck {
             syncNowWithDrive(silent: true, forceFolderScan: true)
@@ -3615,7 +3744,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 }
             } catch {
                 Task { @MainActor [weak self] in
-                    self?.toolState.saveStatus = "Save error"
+                    self?.toolState.showToast("Could not save changes")
                 }
             }
         }

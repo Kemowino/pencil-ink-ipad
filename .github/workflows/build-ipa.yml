@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.6.0}"
+          TAG="v${VER:-1.7.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Native 1.0x Optimize-for-Mac Idiom (Zero 0.77x Full-Window GPU Downscaling), Single-Pass PDF Rasterization (Eliminates 2x Double-Rendering on Scroll Stop), Zero-Subview-Churn Permanently-Attached Recycling Pool, Off-Main-Thread Image Pre-Decoding (preparingForDisplay), Fast-Exit Zero-Allocation Scrolling, Zero .repeatForever Animations, and Zero-Shadow Mac Canvas Chrome." \
+              --notes "Pencil Ink Native $TAG — Apple Preview-Class macOS Battery & Scroll Engine: Native-GPU 32-bit BGRX CGBitmapContext (Zero Double-Copy, Explicit autoreleasepool), Raw CALayer PDF Backing (Zero UIImageView Layout Cascades), Two-Tier Preview Progressive Scroll (480K Fast Scroll -> Crisp Visible Upgrade on Settle), Low-Voltage .utility Render QoS, Opaque ScrollView/Container (Zero Full-Screen Alpha Blending), Single-Flight Timestamp Settle Timer, Zero-Rebuild Sync/Vault Isolation, Removed Jarring Saving Indicator from Page Pill, and 20-Pass Full Codebase Audit." \
               --latest
           fi

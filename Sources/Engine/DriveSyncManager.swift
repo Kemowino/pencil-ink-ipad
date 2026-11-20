@@ -690,7 +690,7 @@ final class DriveSyncManager: ObservableObject {
             guard config.autoSync, AppSettings.shared.syncMode == .smart else {
                 return (0, 0, 0)
             }
-            if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < 20.0 {
+            if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < 90.0 {
                 return (0, 0, 0)
             }
         }

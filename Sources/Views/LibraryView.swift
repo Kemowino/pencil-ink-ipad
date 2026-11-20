@@ -920,7 +920,9 @@ private struct GoodnotesFolderArtwork: View {
                             .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
                     )
             }
+            #if !targetEnvironment(macCatalyst)
             .shadow(color: Color.black.opacity(0.22), radius: 7, y: 4)
+            #endif
         }
     }
 }
@@ -968,7 +970,9 @@ private struct GoodnotesDocumentTile: View {
                                         RoundedRectangle(cornerRadius: isLandscape ? 7 : 9, style: .continuous)
                                             .stroke(Color.black.opacity(0.10), lineWidth: 0.7)
                                     )
+                                    #if !targetEnvironment(macCatalyst)
                                     .shadow(color: Color.black.opacity(0.22), radius: 7, y: 4)
+                                    #endif
 
                                 if item.hasInk {
                                     Circle()
@@ -1029,7 +1033,9 @@ private struct GoodnotesDocumentTile: View {
                                 RoundedRectangle(cornerRadius: 9, style: .continuous)
                                     .stroke(Color.white.opacity(0.14), lineWidth: 0.7)
                             )
+                            #if !targetEnvironment(macCatalyst)
                             .shadow(color: Color.black.opacity(0.24), radius: 7, y: 4)
+                            #endif
                         }
                     }
                     .frame(width: maxW, height: maxH, alignment: .bottom)

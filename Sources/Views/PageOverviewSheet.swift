@@ -22,7 +22,8 @@ struct PageOverviewSheet: View {
     @State private var isSearchingText: Bool = false
 
     private var slots: [PageSlot] {
-        toolState.pageSlots
+        let _ = toolState.layoutRevision
+        return toolState.pageSlots
     }
 
     private var displayedSlots: [PageSlot] {
@@ -193,7 +194,9 @@ struct PageOverviewSheet: View {
                                         lineWidth: isCurrent ? 2.6 : 0.7
                                     )
                             )
-                            .shadow(color: .black.opacity(0.20), radius: 5, y: 2)
+                            #if !targetEnvironment(macCatalyst)
+                    .shadow(color: .black.opacity(0.20), radius: 5, y: 2)
+                    #endif
                         }
                         .buttonStyle(.plain)
 

@@ -10,7 +10,7 @@ struct PencilInkApp: App {
 
     var body: some Scene {
         WindowGroup {
-            WorkspaceRootView()
+            WorkspaceRootView(syncManagerRef: syncManager)
                 .environmentObject(vault)
                 .environmentObject(syncManager)
                 .environmentObject(tabManager)

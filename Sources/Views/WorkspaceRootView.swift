@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct WorkspaceRootView: View {
+    let syncManagerRef: DriveSyncManager
     @EnvironmentObject var vault: VaultManager
-    @EnvironmentObject var syncManager: DriveSyncManager
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var settings: AppSettings
 
@@ -28,7 +28,10 @@ struct WorkspaceRootView: View {
                     NotebookScreen(
                         tab: tab,
                         isActive: isActive,
-                        showHomeButtonInBar: !shouldShowTabBar
+                        showHomeButtonInBar: !shouldShowTabBar,
+                        vault: vault,
+                        syncManager: syncManagerRef,
+                        tabManager: tabManager
                     )
                     .opacity(isActive ? 1 : 0)
                     .allowsHitTesting(isActive)
