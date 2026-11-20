@@ -204,8 +204,19 @@ final class ToolPaletteStore: ObservableObject {
         if let v = p.textBgHex { textBgHex = v }
     }
 
+    private var persistWorkItem: DispatchWorkItem?
+
     private func persist() {
         guard !loading else { return }
+        persistWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.writePrefsNow()
+        }
+        persistWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
+    private func writePrefsNow() {
         let p = SavedPrefs(
             penStyle: penStyle.rawValue,
             penSmooth: penSmooth,

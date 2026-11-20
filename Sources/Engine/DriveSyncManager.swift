@@ -157,6 +157,13 @@ final class DriveSyncManager: ObservableObject {
     @Published var syncProgressText: String = ""
     @Published var isSyncingVault: Bool = false
 
+    private static let sharedISOFull: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let sharedISOBasic = ISO8601DateFormatter()
+
     private let configKey = "pencilink.native.drive.config.v1"
     private var lastVaultSyncAt: Date? = nil
     private var activeVaultSyncTask: Task<(downloadedPDFs: Int, uploadedPDFs: Int, syncedBooks: Int), Never>? = nil
@@ -446,7 +453,7 @@ final class DriveSyncManager: ObservableObject {
             logStates[newInk] = st
             saveLogState(st, for: newInk)
         }
-        try? FileManager.default.removeItem(at: oldStateURL)
+        logIOQueue.async { try? FileManager.default.removeItem(at: oldStateURL) }
 
         if let seen = logSeen.removeValue(forKey: oldInk) {
             logSeen[newInk] = seen
@@ -653,7 +660,7 @@ final class DriveSyncManager: ObservableObject {
                 }
                 let sidecar = InkDocument.sidecarURL(for: pdfURL)
                 if FileManager.default.fileExists(atPath: sidecar.path) {
-                    let local = InkDocument.load(for: pdfURL)
+                    let local = await Task.detached(priority: .utility) { InkDocument.load(for: pdfURL) }.value
                     _ = await self.syncBook(pdfURL: pdfURL, relativePath: cleanRel, localDoc: local, forceFolderScan: true)
                 }
                 let totals = await self.client.getTransferTotals()
@@ -754,9 +761,8 @@ final class DriveSyncManager: ObservableObject {
                         .filter { !localLowerSet.contains(remoteToLocalRel($0.relativePath).lowercased()) }
                         .sorted { $0.sizeBytes < $1.sizeBytes }
 
-                    let isoFull = ISO8601DateFormatter()
-                    isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    let isoBasic = ISO8601DateFormatter()
+                    let isoFull = Self.sharedISOFull
+                    let isoBasic = Self.sharedISOBasic
 
                     for (idx, remote) in missingRemote.enumerated() {
                         let localRel = remoteToLocalRel(remote.relativePath)
@@ -771,10 +777,17 @@ final class DriveSyncManager: ObservableObject {
                             _ = try vault.installDownloadedPDF(from: tempFile, relativePath: localRel, modifiedAt: modDate)
                             localLowerSet.insert(localRel.lowercased())
                             downloadedCount += 1
-                            await vault.refreshPDFListAsync()
+                            // Batch vault rescans every 5 downloads (plus final refresh) instead of O(N^2) per-file rescans!
+                            if downloadedCount % 5 == 0 {
+                                await vault.refreshPDFListAsync()
+                            }
                         } catch {
                             self.lastError = "Failed downloading \(remote.meta.name): \(error.localizedDescription)"
                         }
+                    }
+
+                    if downloadedCount > 0 && downloadedCount % 5 != 0 {
+                        await vault.refreshPDFListAsync()
                     }
 
                     // 2. Upload any local PDFs that do not exist on Google Drive yet!
@@ -816,15 +829,16 @@ final class DriveSyncManager: ObservableObject {
 
                 for (idx, item) in booksToSync.enumerated() {
                     self.syncProgressText = "Syncing notes \(idx + 1)/\(booksToSync.count): \(item.name)…"
-                    let local = InkDocument.load(for: item.url)
+                    let bookURL = item.url
+                    let local = await Task.detached(priority: .utility) { InkDocument.load(for: bookURL) }.value
                     if let (merged, changed) = await self.syncBook(
-                        pdfURL: item.url,
+                        pdfURL: bookURL,
                         relativePath: item.relativePath,
                         localDoc: local,
                         forceFolderScan: force || downloadedCount > 0
                     ) {
                         if changed {
-                            try? merged.save(for: item.url)
+                            await Task.detached(priority: .utility) { try? merged.save(for: bookURL) }.value
                         }
                         syncedAnnotationsCount += 1
                     }
@@ -929,7 +943,7 @@ final class DriveSyncManager: ObservableObject {
             : fileName + ".d"
         let expectedDrivePath = dir.isEmpty ? folderName : "\(dir)/\(folderName)"
 
-        var st = loadLogState(for: inkRelPath)
+        var st = await loadLogStateAsync(for: inkRelPath)
         var seen = logSeen[inkRelPath] ?? [:]
 
         // 1. Smart Folder Discovery under Drive sync root:
@@ -1225,7 +1239,8 @@ final class DriveSyncManager: ObservableObject {
 
         let changedLocally = !sameContent(merged, localDoc)
         if changedLocally {
-            try? merged.save(for: pdfURL)
+            let docToSave = merged
+            await Task.detached(priority: .utility) { try? docToSave.save(for: pdfURL) }.value
         }
         return (merged, changedLocally, didTransfer)
     }
@@ -1581,13 +1596,19 @@ final class DriveSyncManager: ObservableObject {
 
     private func sameContent(_ a: InkDocument, _ b: InkDocument) -> Bool {
         if a.blanks != b.blanks || a.bookmarks != b.bookmarks || a.removed != b.removed || a.texts != b.texts { return false }
-        if Set(a.pages.keys) != Set(b.pages.keys) { return false }
+        if a.pages.count != b.pages.count { return false }
         for (k, listA) in a.pages {
-            let listB = b.pages[k] ?? []
-            if listA.count != listB.count { return false }
-            let idsA = Set(listA.map { $0.id })
-            let idsB = Set(listB.map { $0.id })
-            if idsA != idsB { return false }
+            guard let listB = b.pages[k], listA.count == listB.count else { return false }
+            var orderMatch = true
+            for i in 0..<listA.count {
+                if listA[i].id != listB[i].id {
+                    orderMatch = false
+                    break
+                }
+            }
+            if !orderMatch {
+                if Set(listA.map { $0.id }) != Set(listB.map { $0.id }) { return false }
+            }
         }
         return true
     }
@@ -1603,11 +1624,20 @@ final class DriveSyncManager: ObservableObject {
         return dir.appendingPathComponent("\(hash).json")
     }
 
-    private func loadLogState(for inkRelPath: String) -> BookLogState {
+    private func loadLogStateAsync(for inkRelPath: String) async -> BookLogState {
         if let cached = logStates[inkRelPath] { return cached }
         let url = logStateURL(for: inkRelPath)
-        if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode(BookLogState.self, from: data) {
+        let decoded: BookLogState? = await withCheckedContinuation { cont in
+            logIOQueue.async {
+                if let data = try? Data(contentsOf: url),
+                   let st = try? JSONDecoder().decode(BookLogState.self, from: data) {
+                    cont.resume(returning: st)
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+        if let decoded {
             logStates[inkRelPath] = decoded
             return decoded
         }
@@ -1616,10 +1646,14 @@ final class DriveSyncManager: ObservableObject {
         return fresh
     }
 
+    private let logIOQueue = DispatchQueue(label: "com.pencilink.synclog.io", qos: .utility)
+
     private func saveLogState(_ st: BookLogState, for inkRelPath: String) {
         let url = logStateURL(for: inkRelPath)
-        if let data = try? JSONEncoder().encode(st) {
-            try? data.write(to: url, options: .atomic)
+        logIOQueue.async {
+            if let data = try? JSONEncoder().encode(st) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 }

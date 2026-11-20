@@ -11,6 +11,7 @@ struct SettingsSheet: View {
 
     @State private var showSyncSheet = false
     @State private var toastNote: String = ""
+    @State private var cacheSizeLabel: String = ""
 
     var body: some View {
         NavigationStack {
@@ -193,13 +194,26 @@ struct SettingsSheet: View {
                     }
 
                     Button {
-                        vault.clearThumbnailCache()
-                        toastNote = "Thumbnail cache cleared."
+                        vault.clearThumbnailCache {
+                            cacheSizeLabel = "0 B"
+                            toastNote = "Cover & page raster caches cleared."
+                        }
                     } label: {
                         HStack(spacing: 12) {
                             settingsIconBadge("sparkles", color: .orange)
-                            Text("Clear Cover Cache")
+                            Text("Clear Cover & Page Cache")
                                 .foregroundColor(.primary)
+                            Spacer()
+                            if !cacheSizeLabel.isEmpty {
+                                Text(cacheSizeLabel)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .onAppear {
+                        vault.computeTotalCacheSizeBytes { bytes in
+                            cacheSizeLabel = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
                         }
                     }
                 }
@@ -217,7 +231,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v1.9.0")
+                        Text("v2.0.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }

@@ -240,16 +240,90 @@ struct InkStroke: Codable, Identifiable, Equatable, Sendable {
     var style: String?        // "ball" | "fountain" | "brush"
     var color: String         // "#rrggbb"
     var size: Double
-    var pts: [Double]         // Flat [x0, y0, p0, x1, y1, p1, ...] in PDF points (top-left origin)
+    var pts: [Double] {       // Flat [x0, y0, p0, x1, y1, p1, ...] in PDF points (top-left origin)
+        didSet { _cachedBBox = Self.computeBBox(pts) }
+    }
     var straight: Bool?
     var _bakedSmooth: Bool?
     var _smoothLevel: Int?
     var _sens: Double?
     var _smartShape: String?
 
+    /// Non-serialized O(1) cached bounding box (eliminates scanning all stroke points on every draw & erase pass!).
+    private var _cachedBBox: CGRect
+
+    enum CodingKeys: String, CodingKey {
+        case id, t, tool, style, color, size, pts, straight, _bakedSmooth, _smoothLevel, _sens, _smartShape
+    }
+
+    init(
+        id: String,
+        t: Int64,
+        tool: String,
+        style: String?,
+        color: String,
+        size: Double,
+        pts: [Double],
+        straight: Bool?,
+        _bakedSmooth: Bool?,
+        _smoothLevel: Int?,
+        _sens: Double?,
+        _smartShape: String?
+    ) {
+        self.id = id
+        self.t = t
+        self.tool = tool
+        self.style = style
+        self.color = color
+        self.size = size
+        self.pts = pts
+        self.straight = straight
+        self._bakedSmooth = _bakedSmooth
+        self._smoothLevel = _smoothLevel
+        self._sens = _sens
+        self._smartShape = _smartShape
+        self._cachedBBox = Self.computeBBox(pts)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        t = try c.decode(Int64.self, forKey: .t)
+        tool = try c.decode(String.self, forKey: .tool)
+        style = try c.decodeIfPresent(String.self, forKey: .style)
+        color = try c.decode(String.self, forKey: .color)
+        size = try c.decode(Double.self, forKey: .size)
+        pts = try c.decode([Double].self, forKey: .pts)
+        straight = try c.decodeIfPresent(Bool.self, forKey: .straight)
+        _bakedSmooth = try c.decodeIfPresent(Bool.self, forKey: ._bakedSmooth)
+        _smoothLevel = try c.decodeIfPresent(Int.self, forKey: ._smoothLevel)
+        _sens = try c.decodeIfPresent(Double.self, forKey: ._sens)
+        _smartShape = try c.decodeIfPresent(String.self, forKey: ._smartShape)
+        _cachedBBox = Self.computeBBox(pts)
+    }
+
+    static func == (lhs: InkStroke, rhs: InkStroke) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.t == rhs.t &&
+        lhs.tool == rhs.tool &&
+        lhs.style == rhs.style &&
+        lhs.color == rhs.color &&
+        lhs.size == rhs.size &&
+        lhs.pts == rhs.pts &&
+        lhs.straight == rhs.straight &&
+        lhs._bakedSmooth == rhs._bakedSmooth &&
+        lhs._smoothLevel == rhs._smoothLevel &&
+        lhs._sens == rhs._sens &&
+        lhs._smartShape == rhs._smartShape
+    }
+
     var pointCount: Int { pts.count / 3 }
 
     func boundingBox() -> CGRect {
+        _cachedBBox
+    }
+
+    private static func computeBBox(_ pts: [Double]) -> CGRect {
         let n = pts.count / 3
         guard n > 0 else { return .zero }
         var minX = CGFloat.greatestFiniteMagnitude
@@ -575,6 +649,10 @@ struct InkDocument: Codable {
 
     static func load(for pdfURL: URL) -> InkDocument {
         let url = sidecarURL(for: pdfURL)
+        // Fast-path: avoid NSFileCoordinator XPC wakeup on fresh textbooks without an `.ink.json` sidecar!
+        if !FileManager.default.fileExists(atPath: url.path) {
+            return .empty(name: pdfURL.lastPathComponent)
+        }
         var loadedData: Data?
         var coordError: NSError?
         let coordinator = NSFileCoordinator()
@@ -625,7 +703,59 @@ struct InkDocument: Codable {
     }
 }
 
+private final class HexColorCache {
+    static let shared = HexColorCache()
+    private let lock = NSLock()
+    private var normal: [String: UIColor] = [:]
+    private var darkLifted: [String: UIColor] = [:]
+
+    func color(for hex: String) -> UIColor {
+        lock.lock()
+        if let hit = normal[hex] {
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+        let parsed = UIColor(hex: hex)
+        lock.lock()
+        if normal.count > 256 { normal.removeAll(keepingCapacity: true) }
+        normal[hex] = parsed
+        lock.unlock()
+        return parsed
+    }
+
+    func darkColor(for hex: String) -> UIColor {
+        lock.lock()
+        if let hit = darkLifted[hex] {
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+        let base = color(for: hex)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+        let lifted: UIColor
+        if base.getRed(&r, green: &g, blue: &b, alpha: &a), (0.299 * r + 0.587 * g + 0.114 * b) < 0.28 {
+            lifted = UIColor(red: 0.93, green: 0.94, blue: 0.97, alpha: a)
+        } else {
+            lifted = base
+        }
+        lock.lock()
+        if darkLifted.count > 256 { darkLifted.removeAll(keepingCapacity: true) }
+        darkLifted[hex] = lifted
+        lock.unlock()
+        return lifted
+    }
+}
+
 extension UIColor {
+    static func cached(hex: String) -> UIColor {
+        HexColorCache.shared.color(for: hex)
+    }
+
+    static func cachedDarkLifted(hex: String) -> UIColor {
+        HexColorCache.shared.darkColor(for: hex)
+    }
+
     convenience init(hex: String) {
         var cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleaned.hasPrefix("#") { cleaned.removeFirst() }

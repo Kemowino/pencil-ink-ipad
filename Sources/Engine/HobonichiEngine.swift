@@ -65,11 +65,30 @@ enum HobonichiEngine {
 
     // MARK: - Date Helpers
 
-    static var calendar: Calendar {
+    static let calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
         cal.firstWeekday = 2 // Monday
         return cal
-    }
+    }()
+
+    private static let isoCalendar: Calendar = {
+        var iso = Calendar(identifier: .iso8601)
+        iso.timeZone = calendar.timeZone
+        return iso
+    }()
+
+    private static let spineGradient: CGGradient? = {
+        let colors = [
+            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor,
+            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
+            UIColor(red: 0.29, green: 0.27, blue: 0.22, alpha: 0.18).cgColor,
+            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
+            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor
+        ] as CFArray
+        let locs: [CGFloat] = [0.0, 0.42, 0.5, 0.58, 1.0]
+        let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CGGradient(colorsSpace: cs, colors: colors, locations: locs)
+    }()
 
     static func mondayOf(_ date: Date) -> Date {
         let cal = calendar
@@ -103,9 +122,7 @@ enum HobonichiEngine {
     }
 
     static func isoWeekNumber(_ date: Date) -> Int {
-        var iso = Calendar(identifier: .iso8601)
-        iso.timeZone = calendar.timeZone
-        return iso.component(.weekOfYear, from: date)
+        isoCalendar.component(.weekOfYear, from: date)
     }
 
     // MARK: - Detection & Metadata
@@ -304,15 +321,7 @@ enum HobonichiEngine {
         ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
 
         let mid = W * 0.5
-        let colors = [
-            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor,
-            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
-            UIColor(red: 0.29, green: 0.27, blue: 0.22, alpha: 0.18).cgColor,
-            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
-            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor
-        ] as CFArray
-        let locs: [CGFloat] = [0.0, 0.42, 0.5, 0.58, 1.0]
-        if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: locs) {
+        if let grad = spineGradient {
             ctx.saveGState()
             ctx.clip(to: CGRect(x: mid - 22, y: 0, width: 44, height: H))
             ctx.drawLinearGradient(grad, start: CGPoint(x: mid - 22, y: 0), end: CGPoint(x: mid + 22, y: 0), options: [])

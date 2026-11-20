@@ -272,17 +272,77 @@ enum StrokeGeometry {
         }
     }
 
-    static func drawCommittedStroke(_ s: InkStroke, in ctx: CGContext) {
+    /// Builds a GPU-ready `CGPath` for uniform-width strokes (ballpoint, highlighter, straight shapes)
+    /// directly across `committed` + ephemeral `predicted` touches with ZERO temporary array copy at 240Hz!
+    static func buildLiveUniformPath(committed: [InkPoint], predicted: [InkPoint], straight: Bool) -> CGPath {
+        let cCount = committed.count
+        let pCount = predicted.count
+        let total = cCount + pCount
+        guard total > 0 else { return CGMutablePath() }
+        if pCount == 0 {
+            return straight ? buildLinearPath(from: committed) : buildSmoothPath(from: committed)
+        }
+        @inline(__always)
+        func ptAt(_ idx: Int) -> InkPoint {
+            idx < cCount ? committed[idx] : predicted[idx - cCount]
+        }
+        let path = CGMutablePath()
+        let p0 = ptAt(0)
+        path.move(to: CGPoint(x: p0.x, y: p0.y))
+        if total == 1 {
+            path.addLine(to: CGPoint(x: p0.x + 0.05, y: p0.y))
+            return path
+        }
+        if straight || total == 2 {
+            for i in 1..<total {
+                let p = ptAt(i)
+                path.addLine(to: CGPoint(x: p.x, y: p.y))
+            }
+            return path
+        }
+        let p1 = ptAt(1)
+        path.addLine(to: CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5))
+        for i in 1..<(total - 1) {
+            let cur = ptAt(i)
+            let nxt = ptAt(i + 1)
+            let mid = CGPoint(x: (cur.x + nxt.x) * 0.5, y: (cur.y + nxt.y) * 0.5)
+            path.addQuadCurve(to: mid, control: CGPoint(x: cur.x, y: cur.y))
+        }
+        let last = ptAt(total - 1)
+        path.addLine(to: CGPoint(x: last.x, y: last.y))
+        return path
+    }
+
+    static func dirtyRect(for points: [InkPoint], baseSize: CGFloat, extraPad: CGFloat = 6.0) -> CGRect {
+        guard !points.isEmpty else { return .null }
+        var minX = CGFloat.greatestFiniteMagnitude
+        var minY = CGFloat.greatestFiniteMagnitude
+        var maxX = -CGFloat.greatestFiniteMagnitude
+        var maxY = -CGFloat.greatestFiniteMagnitude
+        for pt in points {
+            if pt.x < minX { minX = pt.x }
+            if pt.x > maxX { maxX = pt.x }
+            if pt.y < minY { minY = pt.y }
+            if pt.y > maxY { maxY = pt.y }
+        }
+        let pad = baseSize * 1.8 + extraPad
+        return CGRect(x: minX - pad, y: minY - pad, width: max(1, maxX - minX) + pad * 2, height: max(1, maxY - minY) + pad * 2)
+    }
+
+    /// Zero-allocation committed stroke renderer: reads flat `[Double]` directly (no `[InkPoint]` temp array!)
+    /// and accepts `overrideColor` so Dark Paper mode performs ZERO struct copies or hex round-trips.
+    static func drawCommittedStroke(_ s: InkStroke, in ctx: CGContext, overrideColor: UIColor? = nil) {
         let n = s.pointCount
         guard n > 0 else { return }
         let isLinear = (s.straight == true)
         let style = s.tool == "highlighter" ? "ball" : (s.style ?? "ball")
-        let color = UIColor(hex: s.color)
+        let color = overrideColor ?? UIColor.cached(hex: s.color)
         let baseSize = CGFloat(s.size)
 
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setFillColor(color.cgColor)
+
         if style == "ball" || isLinear || s._smartShape != nil {
-            ctx.setStrokeColor(color.cgColor)
-            ctx.setFillColor(color.cgColor)
             ctx.setLineWidth(baseSize)
             if n == 1 {
                 let r = baseSize * 0.5 * 1.2
@@ -295,27 +355,84 @@ enum StrokeGeometry {
             return
         }
 
-        var pts: [InkPoint] = []
-        pts.reserveCapacity(n)
-        for i in 0..<n {
-            pts.append(InkPoint(
-                x: CGFloat(s.pts[i * 3]),
-                y: CGFloat(s.pts[i * 3 + 1]),
-                p: CGFloat(s.pts[i * 3 + 2]),
-                t: Double(i) * 0.008
-            ))
+        let sensitivity = s._sens ?? 1.0
+        if n == 1 {
+            let w0 = pointWidth(pressure: CGFloat(s.pts[2]), baseSize: baseSize, style: style, sensitivity: sensitivity)
+            let r = w0 * 0.5 * 1.2
+            ctx.fillEllipse(in: CGRect(x: CGFloat(s.pts[0]) - r, y: CGFloat(s.pts[1]) - r, width: r * 2, height: r * 2))
+            return
         }
-        drawStroke(
-            in: ctx,
-            points: pts,
-            color: color,
-            baseSize: baseSize,
-            tool: s.tool,
-            style: style,
-            straight: false,
-            isSmartShape: false,
-            sensitivity: s._sens ?? 1.0
-        )
+
+        var pMin: CGFloat = 1.0
+        var pMax: CGFloat = 0.0
+        for i in 0..<n {
+            let p = CGFloat(s.pts[i * 3 + 2])
+            if p < pMin { pMin = p }
+            if p > pMax { pMax = p }
+        }
+        if pMax - pMin < 0.025 {
+            let w = pointWidth(pressure: (pMin + pMax) * 0.5, baseSize: baseSize, style: style, sensitivity: sensitivity)
+            ctx.setLineWidth(w)
+            ctx.addPath(buildSmoothPath(from: s.pts))
+            ctx.strokePath()
+            return
+        }
+
+        // Zero-allocation variable-width batched quadratic renderer reading directly from flat `s.pts`
+        let tol = max(0.08, baseSize * 0.045)
+        var prev = CGPoint(x: CGFloat(s.pts[0]), y: CGFloat(s.pts[1]))
+        var curPath: CGMutablePath?
+        var batchW = baseSize
+
+        for i in 1..<n {
+            let cx = CGFloat(s.pts[i * 3])
+            let cy = CGFloat(s.pts[i * 3 + 1])
+            let cp = CGFloat(s.pts[i * 3 + 2])
+            let prevP = CGFloat(s.pts[(i - 1) * 3 + 2])
+            let target: CGPoint
+            if i < n - 1 {
+                let nx = CGFloat(s.pts[(i + 1) * 3])
+                let ny = CGFloat(s.pts[(i + 1) * 3 + 1])
+                target = CGPoint(x: (cx + nx) * 0.5, y: (cy + ny) * 0.5)
+            } else {
+                target = CGPoint(x: cx, y: cy)
+            }
+            var w = pointWidth(pressure: (prevP + cp) * 0.5, baseSize: baseSize, style: style, sensitivity: sensitivity)
+            if n >= 6 && (i <= 2 || i >= n - 2) {
+                let distEnd = CGFloat(min(i, n - 1 - i))
+                w *= 0.78 + 0.22 * (distEnd / 2.0)
+            }
+
+            if curPath == nil {
+                let p2 = CGMutablePath()
+                p2.move(to: prev)
+                curPath = p2
+                batchW = w
+            } else if abs(w - batchW) > tol {
+                if let flush = curPath {
+                    ctx.setLineWidth(batchW)
+                    ctx.addPath(flush)
+                    ctx.strokePath()
+                }
+                let p2 = CGMutablePath()
+                p2.move(to: prev)
+                curPath = p2
+                batchW = w
+            }
+
+            if i < n - 1 {
+                curPath?.addQuadCurve(to: target, control: CGPoint(x: cx, y: cy))
+            } else {
+                curPath?.addLine(to: target)
+            }
+            prev = target
+        }
+
+        if let flush = curPath {
+            ctx.setLineWidth(batchW)
+            ctx.addPath(flush)
+            ctx.strokePath()
+        }
     }
 
     static func strokeHits(_ stroke: InkStroke, point: CGPoint, radius: CGFloat) -> Bool {

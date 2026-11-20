@@ -92,6 +92,19 @@ enum LassoMath {
     }
 
     static func selectStrokes(in strokes: [InkStroke], polygon: [CGPoint]) -> (selected: [InkStroke], box: CGRect) {
+        guard polygon.count >= 3 else { return ([], .zero) }
+        var pMinX = CGFloat.greatestFiniteMagnitude
+        var pMinY = CGFloat.greatestFiniteMagnitude
+        var pMaxX = -CGFloat.greatestFiniteMagnitude
+        var pMaxY = -CGFloat.greatestFiniteMagnitude
+        for pt in polygon {
+            if pt.x < pMinX { pMinX = pt.x }
+            if pt.x > pMaxX { pMaxX = pt.x }
+            if pt.y < pMinY { pMinY = pt.y }
+            if pt.y > pMaxY { pMaxY = pt.y }
+        }
+        let polyBounds = CGRect(x: pMinX, y: pMinY, width: max(1, pMaxX - pMinX), height: max(1, pMaxY - pMinY))
+
         var selected: [InkStroke] = []
         var minX = CGFloat.greatestFiniteMagnitude
         var minY = CGFloat.greatestFiniteMagnitude
@@ -101,6 +114,8 @@ enum LassoMath {
         for s in strokes {
             let n = s.pointCount
             guard n > 0 else { continue }
+            let b = s.boundingBox()
+            guard b.intersects(polyBounds) else { continue }
             var hits = 0
             var total = 0
             let step = max(1, n / 24)
@@ -111,7 +126,6 @@ enum LassoMath {
                 if pointInPolygon(pt, polygon: polygon) { hits += 1 }
                 i += step
             }
-            let b = s.boundingBox()
             let centerInside = pointInPolygon(CGPoint(x: b.midX, y: b.midY), polygon: polygon)
             if (total > 0 && Double(hits) / Double(total) >= 0.25) || centerInside {
                 selected.append(s)

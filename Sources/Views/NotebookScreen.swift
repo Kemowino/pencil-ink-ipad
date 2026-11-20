@@ -6,7 +6,6 @@ private enum ToolPopoverKind: Equatable, Identifiable {
     case eraser
     case text
     case laser
-    case jumpPage
     case sync
     case editColor(tool: DrawingTool, index: Int)
     case addColor(tool: DrawingTool)
@@ -19,7 +18,6 @@ private enum ToolPopoverKind: Equatable, Identifiable {
         case .eraser: return "eraser"
         case .text: return "text"
         case .laser: return "laser"
-        case .jumpPage: return "jumpPage"
         case .sync: return "sync"
         case .editColor(let t, let i): return "editColor-\(t.rawValue)-\(i)"
         case .addColor(let t): return "addColor-\(t.rawValue)"
@@ -48,7 +46,6 @@ struct NotebookScreen: View {
     @State private var openOverviewInSearch = false
     @State private var showSyncSettings = false
     @State private var showAppSettings = false
-    @State private var jumpPageInput: String = ""
     @State private var showRenameAlert = false
     @State private var renameDraft: String = ""
     @State private var addColorDraft: Color = Color(red: 0.0, green: 0.48, blue: 1.0)
@@ -597,7 +594,7 @@ struct NotebookScreen: View {
         case .pen:
             toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
                 GoodnotesPenIcon(
-                    inkColor: Color(UIColor(hex: palette.activePenColorHex)),
+                    inkColor: Color(UIColor.cached(hex: palette.activePenColorHex)),
                     isActive: toolState.tool == .pen,
                     isDark: colorScheme == .dark
                 )
@@ -627,7 +624,7 @@ struct NotebookScreen: View {
         case .highlighter:
             toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
                 GoodnotesHighlighterIcon(
-                    accentColor: Color(UIColor(hex: palette.activeHlColorHex)),
+                    accentColor: Color(UIColor.cached(hex: palette.activeHlColorHex)),
                     isActive: toolState.tool == .highlighter,
                     isDark: colorScheme == .dark
                 )
@@ -665,7 +662,7 @@ struct NotebookScreen: View {
         case .laser:
             toolSlotButton(active: toolState.tool == .laser, accent: .red) {
                 GoodnotesLaserIcon(
-                    laserColor: Color(UIColor(hex: palette.activeLaserColorHex)),
+                    laserColor: Color(UIColor.cached(hex: palette.activeLaserColorHex)),
                     isActive: toolState.tool == .laser,
                     isDark: colorScheme == .dark
                 )
@@ -951,8 +948,8 @@ struct NotebookScreen: View {
     private func addColorButton(for tool: DrawingTool) -> some View {
         Button {
             addColorDraft = (tool == .highlighter)
-                ? Color(UIColor(hex: "#74c7ff"))
-                : Color(UIColor(hex: "#af52de"))
+                ? Color(UIColor.cached(hex: "#74c7ff"))
+                : Color(UIColor.cached(hex: "#af52de"))
             activePopover = .addColor(tool: tool)
             Haptics.selection()
         } label: {
@@ -983,7 +980,7 @@ struct NotebookScreen: View {
             GoodnotesThicknessCircleButton(
                 diameter: diameter,
                 selected: palette.penSizeIndex == idx,
-                fillColor: Color(UIColor(hex: palette.activePenColorHex))
+                fillColor: Color(UIColor.cached(hex: palette.activePenColorHex))
             ) {
                 if palette.penSizeIndex == idx {
                     activePopover = .editThickness(tool: .pen, index: idx)
@@ -1008,7 +1005,7 @@ struct NotebookScreen: View {
             GoodnotesThicknessCircleButton(
                 diameter: diameter,
                 selected: palette.hlSizeIndex == idx,
-                fillColor: Color(UIColor(hex: palette.activeHlColorHex))
+                fillColor: Color(UIColor.cached(hex: palette.activeHlColorHex))
             ) {
                 if palette.hlSizeIndex == idx {
                     activePopover = .editThickness(tool: .highlighter, index: idx)
@@ -1145,7 +1142,7 @@ struct NotebookScreen: View {
                 case .laser: hex = palette.laserColors.indices.contains(index) ? palette.laserColors[index] : "#ff3b30"
                 default: hex = "#1c1c1e"
                 }
-                return Color(UIColor(hex: hex))
+                return Color(UIColor.cached(hex: hex))
             },
             set: { newCol in
                 let hex = UIColor(newCol).toHexString()
@@ -1185,11 +1182,11 @@ struct NotebookScreen: View {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 6), spacing: 10) {
                 ForEach(presets, id: \.self) { hex in
                     Button {
-                        colorBinding(for: tool, index: index).wrappedValue = Color(UIColor(hex: hex))
+                        colorBinding(for: tool, index: index).wrappedValue = Color(UIColor.cached(hex: hex))
                         Haptics.selection()
                     } label: {
                         Circle()
-                            .fill(Color(UIColor(hex: hex)))
+                            .fill(Color(UIColor.cached(hex: hex)))
                             .frame(width: 28, height: 28)
                             .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 0.8))
                     }
@@ -1238,7 +1235,7 @@ struct NotebookScreen: View {
                         Haptics.selection()
                     } label: {
                         Circle()
-                            .fill(Color(UIColor(hex: hex)))
+                            .fill(Color(UIColor.cached(hex: hex)))
                             .frame(width: 28, height: 28)
                             .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 0.8))
                     }
@@ -1302,8 +1299,8 @@ struct NotebookScreen: View {
         )
 
         let previewColor: Color = isPen
-            ? Color(UIColor(hex: palette.activePenColorHex))
-            : (isHL ? Color(UIColor(hex: palette.activeHlColorHex)) : .primary)
+            ? Color(UIColor.cached(hex: palette.activePenColorHex))
+            : (isHL ? Color(UIColor.cached(hex: palette.activeHlColorHex)) : .primary)
 
         let curVal = valBinding.wrappedValue
         let previewDiam = max(5, min(32, CGFloat(isPen ? curVal * 2.5 : curVal * 0.55)))
@@ -1365,7 +1362,7 @@ struct NotebookScreen: View {
                     Haptics.selection()
                 } label: {
                     Circle()
-                        .fill(Color(UIColor(hex: hex)))
+                        .fill(Color(UIColor.cached(hex: hex)))
                         .frame(width: 20, height: 20)
                         .overlay(Circle().stroke(Color.primary.opacity(0.25), lineWidth: 1))
                 }
@@ -1494,7 +1491,7 @@ struct NotebookScreen: View {
                                 .background(
                                     selected
                                         ? Color.accentColor
-                                        : (preset.hex.isEmpty ? Color.primary.opacity(0.08) : Color(UIColor(hex: preset.hex)).opacity(0.65))
+                                        : (preset.hex.isEmpty ? Color.primary.opacity(0.08) : Color(UIColor.cached(hex: preset.hex)).opacity(0.65))
                                 )
                                 .clipShape(Capsule())
                         }
@@ -1588,26 +1585,6 @@ struct NotebookScreen: View {
         .frame(width: 240)
     }
 
-    private var jumpPagePopover: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Go to Page (1–\(toolState.totalPages))").font(.headline)
-            HStack(spacing: 8) {
-                TextField("Page #", text: $jumpPageInput)
-                    .keyboardType(.numberPad)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 110)
-                Button("Go") {
-                    if let n = Int(jumpPageInput.trimmingCharacters(in: .whitespaces)) {
-                        controllerBox.vc?.jumpToPage(n, animated: true)
-                    }
-                    activePopover = nil
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(16)
-    }
-
     // MARK: - Reusable Goodnotes Control Primitives
 
     private func barIconButton(
@@ -1660,7 +1637,7 @@ struct NotebookScreen: View {
         Button(action: action) {
             ZStack {
                 Circle()
-                    .fill(Color(UIColor(hex: hex)))
+                    .fill(Color(UIColor.cached(hex: hex)))
                     .frame(width: swatchInnerSize, height: swatchInnerSize)
                     .overlay(
                         Circle()

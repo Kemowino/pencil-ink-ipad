@@ -61,9 +61,8 @@ final class PencilDrawingGestureRecognizer: UIGestureRecognizer {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        let valid = touches.filter { isValidInputTouch($0) }
         if activeTouch == nil {
-            guard let touch = valid.first else {
+            guard let touch = touches.first(where: { isValidInputTouch($0) }) else {
                 state = .failed
                 return
             }

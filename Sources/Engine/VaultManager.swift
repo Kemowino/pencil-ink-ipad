@@ -80,6 +80,14 @@ final class VaultManager: ObservableObject {
     private var accessingRoot = false
     private let thumbCache = NSCache<NSString, UIImage>()
     private let thumbQueue = DispatchQueue(label: "com.pencilink.coverthumbs", qos: .utility)
+    private var coverWritesSincePrune: Int = 0
+    private let coverDiskDirURL: URL = {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = caches.appendingPathComponent("PencilInkCoverThumbs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
 
     init() {
         thumbCache.countLimit = 120
@@ -138,8 +146,34 @@ final class VaultManager: ObservableObject {
         saveMetadata()
     }
 
-    func clearThumbnailCache() {
+    func clearThumbnailCache(completion: (() -> Void)? = nil) {
         thumbCache.removeAllObjects()
+        let dir = coverDiskDirURL
+        thumbQueue.async {
+            if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                for u in files { try? FileManager.default.removeItem(at: u) }
+            }
+            PageRasterCache.shared.clearAllCaches(completion: completion)
+        }
+    }
+
+    func computeTotalCacheSizeBytes(completion: @escaping (Int64) -> Void) {
+        let dir = coverDiskDirURL
+        thumbQueue.async {
+            var total = PageRasterCache.shared.diskCacheBytesSync()
+            if let files = try? FileManager.default.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for u in files {
+                    if let sz = try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                        total += Int64(sz)
+                    }
+                }
+            }
+            DispatchQueue.main.async { completion(total) }
+        }
     }
 
     func setCoverColor(for relativePath: String, paletteID: Int) {
@@ -370,11 +404,14 @@ final class VaultManager: ObservableObject {
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles]
             ) {
+                let rawRootPath = root.standardizedFileURL.path
                 for case let itemURL as URL in enumerator {
-                    let stdPath = itemURL.standardizedFileURL.resolvingSymlinksInPath().path
+                    let stdPath = itemURL.standardizedFileURL.path
                     let relPath: String
                     if stdPath.hasPrefix(rootPath) {
                         relPath = String(stdPath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    } else if stdPath.hasPrefix(rawRootPath) {
+                        relPath = String(stdPath.dropFirst(rawRootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                     } else {
                         relPath = itemURL.lastPathComponent
                     }
@@ -453,7 +490,8 @@ final class VaultManager: ObservableObject {
     }
 
     func loadCoverThumb(for item: PDFItem, completion: @escaping (UIImage?) -> Void) {
-        let key = "\(item.id)|\(Int(item.modifiedAt.timeIntervalSince1970))" as NSString
+        let keyStr = "\(item.id)|\(Int(item.modifiedAt.timeIntervalSince1970))"
+        let key = keyStr as NSString
         if let hit = thumbCache.object(forKey: key) {
             completion(hit)
             return
@@ -464,7 +502,15 @@ final class VaultManager: ObservableObject {
             return
         }
         let url = item.url
+        let diskURL = coverDiskDirURL.appendingPathComponent("\(WireCodec.md5Hex(Data(keyStr.utf8))).jpg")
         thumbQueue.async { [weak self] in
+            // Persistent SSD cover cache hit -> ZERO cold PDF parsing on app launch!
+            if let data = try? Data(contentsOf: diskURL),
+               let diskImg = UIImage(data: data) {
+                self?.thumbCache.setObject(diskImg, forKey: key)
+                DispatchQueue.main.async { completion(diskImg) }
+                return
+            }
             guard let cgDoc = CGPDFDocument(url as CFURL), let cgPage = cgDoc.page(at: 1) else {
                 DispatchQueue.main.async { completion(nil) }
                 return
@@ -484,8 +530,48 @@ final class VaultManager: ObservableObject {
                 displayScale: 1.5,
                 fastQuality: true
             )
+            if let jpg = img.jpegData(compressionQuality: 0.78) {
+                try? jpg.write(to: diskURL, options: .atomic)
+                if let self {
+                    self.coverWritesSincePrune += 1
+                    if self.coverWritesSincePrune >= 20 {
+                        self.coverWritesSincePrune = 0
+                        self.pruneCoverDiskCacheIfNeeded()
+                    }
+                }
+            }
             self?.thumbCache.setObject(img, forKey: key)
             DispatchQueue.main.async { completion(img) }
+        }
+    }
+
+    private func pruneCoverDiskCacheIfNeeded() {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: coverDiskDirURL,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let maxFiles = 400
+        let maxBytes: Int64 = 40 * 1024 * 1024
+        var entries: [(url: URL, size: Int64, mtime: Date)] = []
+        var total: Int64 = 0
+        for u in urls {
+            guard let vals = try? u.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { continue }
+            let sz = Int64(vals.fileSize ?? 0)
+            total += sz
+            entries.append((u, sz, vals.contentModificationDate ?? .distantPast))
+        }
+        guard entries.count > maxFiles || total > maxBytes else { return }
+        entries.sort { $0.mtime < $1.mtime }
+        var remaining = entries.count
+        for e in entries {
+            try? fm.removeItem(at: e.url)
+            total -= e.size
+            remaining -= 1
+            if remaining <= Int(Double(maxFiles) * 0.8) && total <= Int64(Double(maxBytes) * 0.8) {
+                break
+            }
         }
     }
 

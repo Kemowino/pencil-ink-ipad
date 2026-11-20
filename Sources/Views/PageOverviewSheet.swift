@@ -16,10 +16,13 @@ struct PageOverviewSheet: View {
 
     @State private var activeTab: OverviewTab = .thumbnails
     @State private var thumbnails: [String: UIImage] = [:]
+    @State private var thumbnailLRUOrder: [String] = []
+    @State private var pendingThumbItems: [String: OverviewThumbToken] = [:]
     @State private var outlineEntries: [PDFOutlineEntry] = []
     @State private var searchQuery: String = ""
     @State private var searchHits: [PDFSearchHit] = []
     @State private var isSearchingText: Bool = false
+    @State private var searchDebounceWork: DispatchWorkItem? = nil
 
     private var slots: [PageSlot] {
         let _ = toolState.layoutRevision
@@ -69,6 +72,7 @@ struct PageOverviewSheet: View {
                         Button("Restore All") {
                             controllerBox.vc?.restoreAllRemovedPages()
                             thumbnails.removeAll()
+                            thumbnailLRUOrder.removeAll()
                         }
                         .font(.subheadline.bold())
                     }
@@ -129,6 +133,15 @@ struct PageOverviewSheet: View {
             }
             .onAppear {
                 outlineEntries = controllerBox.vc?.extractPDFOutline() ?? []
+            }
+            .onDisappear {
+                searchDebounceWork?.cancel()
+                searchDebounceWork = nil
+                for item in pendingThumbItems.values { item.cancel() }
+                pendingThumbItems.removeAll()
+                controllerBox.vc?.cancelOverviewThumbnails()
+                thumbnails.removeAll()
+                thumbnailLRUOrder.removeAll()
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -227,6 +240,11 @@ struct PageOverviewSheet: View {
             .clipped()
             .onAppear {
                 loadThumbnail(for: slot)
+            }
+            .onDisappear {
+                if let pending = pendingThumbItems.removeValue(forKey: slot.key) {
+                    pending.cancel()
+                }
             }
 
             // Iconic Goodnotes Page Number + Dropdown Chevron (`1 ⌄`)
@@ -407,6 +425,8 @@ struct PageOverviewSheet: View {
     }
 
     private func runSearch(for query: String) {
+        searchDebounceWork?.cancel()
+        searchDebounceWork = nil
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2 else {
             searchHits = []
@@ -414,20 +434,40 @@ struct PageOverviewSheet: View {
             return
         }
         isSearchingText = true
-        controllerBox.vc?.searchPDFText(q) { hits in
-            if self.trimmedSearch == q {
-                self.searchHits = hits
-                self.isSearchingText = false
+        let work = DispatchWorkItem {
+            controllerBox.vc?.searchPDFText(q) { hits in
+                if self.trimmedSearch == q {
+                    self.searchHits = hits
+                    self.isSearchingText = false
+                }
             }
         }
+        searchDebounceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private func loadThumbnail(for slot: PageSlot) {
-        if thumbnails[slot.key] != nil { return }
-        controllerBox.vc?.renderThumbnailAsync(for: slot, targetWidth: 260) { img in
+        let key = slot.key
+        if thumbnails[key] != nil {
+            thumbnailLRUOrder.removeAll { $0 == key }
+            thumbnailLRUOrder.append(key)
+            return
+        }
+        if pendingThumbItems[key] != nil { return }
+        if let work = controllerBox.vc?.renderThumbnailAsync(for: slot, targetWidth: 260, completion: { img in
+            pendingThumbItems.removeValue(forKey: key)
             if let img = img {
-                thumbnails[slot.key] = img
+                thumbnails[key] = img
+                thumbnailLRUOrder.removeAll { $0 == key }
+                thumbnailLRUOrder.append(key)
+                // Bounded 80-item LRU cap prevents RAM bloat on 2,000-page textbooks!
+                while thumbnailLRUOrder.count > 80 {
+                    let victim = thumbnailLRUOrder.removeFirst()
+                    thumbnails.removeValue(forKey: victim)
+                }
             }
+        }) {
+            pendingThumbItems[key] = work
         }
     }
 }
