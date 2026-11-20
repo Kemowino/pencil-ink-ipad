@@ -2703,10 +2703,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             do {
                 try data.write(to: outURL, options: .atomic)
                 DispatchQueue.main.async {
-                    self?.presentShareSheet(items: [outURL])
+                    self.presentShareSheet(items: [outURL])
                 }
             } catch {
-                DispatchQueue.main.async { self?.toolState.showToast("PNG export failed") }
+                DispatchQueue.main.async { self.toolState.showToast("PNG export failed") }
             }
         }
     }
@@ -2745,10 +2745,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                     }
                 }
                 DispatchQueue.main.async {
-                    self?.presentShareSheet(items: [outURL])
+                    self.presentShareSheet(items: [outURL])
                 }
             } catch {
-                DispatchQueue.main.async { self?.toolState.showToast("PDF export failed") }
+                DispatchQueue.main.async { self.toolState.showToast("PDF export failed") }
             }
         }
     }
