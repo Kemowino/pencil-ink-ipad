@@ -26,8 +26,8 @@ targets:
       properties:
         CFBundleDisplayName: Pencil Ink
         CFBundleName: PencilInkNative
-        CFBundleShortVersionString: "1.8.0"
-        CFBundleVersion: "20"
+        CFBundleShortVersionString: "1.9.0"
+        CFBundleVersion: "21"
         NSSupportsAutomaticGraphicsSwitching: true
         UILaunchScreen: {}
         UIRequiresFullScreen: false

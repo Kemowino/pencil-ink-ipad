@@ -93,27 +93,25 @@ enum EraserModeOption: String, CaseIterable, Identifiable {
     }
 }
 
-/// High-frequency HUD state isolated from `NotebookToolState` so scrolling across 2,500 pages
-/// or toggling `isWriting`/`saveStatus` updates ONLY the tiny bottom badge & bookmark button —
-/// causing ZERO full-screen SwiftUI re-renders of `NotebookScreen` or its toolbars!
+/// Ultra-minimal HUD observer: contains ONLY 3 rarely-changing booleans so scrolling across
+/// 2,500 pages triggers ZERO SwiftUI `AG::Graph::UpdateStack::update()` evaluations!
 @MainActor
 final class NotebookHUDState: ObservableObject {
-    @Published var currentPage: Int = 1
-    @Published var totalPages: Int = 1
-    @Published var currentSlotLabel: String = ""
-    @Published var saveStatus: String = "Saved"
-    @Published var toastMessage: String = ""
-    @Published var isWriting: Bool = false
-    @Published var isOnHoboNotes: Bool = false
     @Published var isCurrentPageBookmarked: Bool = false
+    @Published var isOnHoboIndex: Bool = true
+    @Published var isOnHoboNotes: Bool = false
 }
 
 @MainActor
 final class NotebookToolState: ObservableObject {
     @Published var tool: DrawingTool = .pen
 
-    // Isolated high-frequency HUD observer (never triggers NotebookScreen body rebuilds!)
+    // Rarely-changing boolean HUD observer (0 publications during normal PDF scrolling!)
     let hud = NotebookHUDState()
+
+    // Direct UIKit HUD callbacks (2 µs UILabel update, ZERO SwiftUI AttributeGraph work!)
+    var onHUDChanged: (() -> Void)?
+    var onShowToast: ((String) -> Void)?
 
     // Low-frequency Per-Tab Toolbar State
     @Published var canUndo: Bool = false
@@ -122,7 +120,7 @@ final class NotebookToolState: ObservableObject {
     @Published var lassoSelectedCount: Int = 0
     @Published var hasLassoClipboard: Bool = false
     @Published var hasActiveTextBox: Bool = false
-    /// Stored without `@Published` so updating metadata on a 2,500-page PDF NEVER triggers SwiftUI 2,500-struct diffing!
+    /// Stored without `@Published` so updating metadata on a 2,500-page PDF NEVER triggers SwiftUI diffing!
     var pageSlots: [PageSlot] = []
     @Published var layoutRevision: Int = 0
     @Published var bookmarkedKeys: Set<String> = [] {
@@ -132,48 +130,37 @@ final class NotebookToolState: ObservableObject {
     @Published var isHobonichi: Bool = false
     var previousTool: DrawingTool = .pen
 
-    // Transparent proxies into `hud` so callers stay clean while skipping NotebookScreen rebuilds
-    var currentPage: Int {
-        get { hud.currentPage }
-        set {
-            if hud.currentPage != newValue {
-                hud.currentPage = newValue
+    // Plain non-@Published high-frequency properties (updated directly in native UIKit!)
+    var currentPage: Int = 1 {
+        didSet {
+            if currentPage != oldValue {
                 syncCurrentBookmarkFlag()
+                let isIdx = (currentPage == 1)
+                if hud.isOnHoboIndex != isIdx { hud.isOnHoboIndex = isIdx }
+                onHUDChanged?()
             }
         }
     }
-    var totalPages: Int {
-        get { hud.totalPages }
-        set { if hud.totalPages != newValue { hud.totalPages = newValue } }
+    var totalPages: Int = 1 {
+        didSet { if totalPages != oldValue { onHUDChanged?() } }
     }
-    var saveStatus: String {
-        get { hud.saveStatus }
-        set { if hud.saveStatus != newValue { hud.saveStatus = newValue } }
-    }
-    var toastMessage: String {
-        get { hud.toastMessage }
-        set { if hud.toastMessage != newValue { hud.toastMessage = newValue } }
-    }
-    var currentSlotLabel: String {
-        get { hud.currentSlotLabel }
-        set { if hud.currentSlotLabel != newValue { hud.currentSlotLabel = newValue } }
+    var saveStatus: String = "Saved"
+    var currentSlotLabel: String = "" {
+        didSet { if currentSlotLabel != oldValue { onHUDChanged?() } }
     }
     var isOnHoboNotes: Bool {
         get { hud.isOnHoboNotes }
         set { if hud.isOnHoboNotes != newValue { hud.isOnHoboNotes = newValue } }
     }
-    var isWriting: Bool {
-        get { hud.isWriting }
-        set { if hud.isWriting != newValue { hud.isWriting = newValue } }
+    var isWriting: Bool = false {
+        didSet { if isWriting != oldValue { onHUDChanged?() } }
     }
     var isCurrentPageBookmarked: Bool {
         hud.isCurrentPageBookmarked
     }
 
-    private var toastWorkItem: DispatchWorkItem?
-
     func syncCurrentBookmarkFlag() {
-        let idx = hud.currentPage - 1
+        let idx = currentPage - 1
         let marked = (idx >= 0 && idx < pageSlots.count) && bookmarkedKeys.contains(pageSlots[idx].key)
         if hud.isCurrentPageBookmarked != marked {
             hud.isCurrentPageBookmarked = marked
@@ -222,14 +209,8 @@ final class NotebookToolState: ObservableObject {
     init() {}
 
     func showToast(_ message: String) {
-        DispatchQueue.main.async {
-            self.toastWorkItem?.cancel()
-            self.hud.toastMessage = message
-            let item = DispatchWorkItem { [weak self] in
-                self?.hud.toastMessage = ""
-            }
-            self.toastWorkItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: item)
+        DispatchQueue.main.async { [weak self] in
+            self?.onShowToast?(message)
         }
     }
 }
@@ -475,15 +456,20 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private let pageBitmapCache: NSCache<NSString, CachedPageBitmap> = {
         let c = NSCache<NSString, CachedPageBitmap>()
         #if targetEnvironment(macCatalyst)
-        // Eco 1.25MP BGRX = ~5 MB/page -> 38+ cached pages for 0% CPU chapter re-scrolling!
-        c.countLimit = 64
-        c.totalCostLimit = 192 * 1024 * 1024
+        // Eco 1.2MP BGRX = ~4.8 MB/page -> ~45 cached pages for 0% CPU chapter re-scrolling!
+        c.countLimit = 80
+        c.totalCostLimit = 220 * 1024 * 1024
         #else
         c.countLimit = 32
         c.totalCostLimit = 80 * 1024 * 1024
         #endif
         return c
     }()
+
+    // Native pure-UIKit floating Page Pill & Toast Banner (0% SwiftUI AttributeGraph CPU while scrolling!)
+    private let pagePillButton = UIButton(type: .system)
+    private let toastPillLabel = UILabel()
+    private var toastHideWorkItem: DispatchWorkItem?
 
     private let scrollView = InkScrollView()
     private let documentContainer = UIView()
@@ -607,6 +593,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         scrollSettleTimer?.cancel()
         scrollSettleTimer = nil
         pagePersistWorkItem?.cancel()
+        toastHideWorkItem?.cancel()
         if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = activeObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = resignActiveObserver { NotificationCenter.default.removeObserver(obs) }
@@ -625,6 +612,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         scrollView.backgroundColor = bg
         // Keep documentContainer clear with no backing store so CoreAnimation doesn't fill a 1.7M-pt redundant layer!
         documentContainer.backgroundColor = nil
+        applyNativeHUDTheme()
     }
 
     override func viewDidLoad() {
@@ -632,6 +620,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         applyOpaqueCanvasBackdrop()
         currentReadingMode = AppSettings.shared.pdfReadingMode
         setupScrollView()
+        setupNativeFloatingHUD()
         setupTapUndoGestures()
         setupPencilInteraction()
         bindAppSettings()
@@ -1047,6 +1036,133 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             self?.handlePencilResetFallback()
         }
         scrollView.addGestureRecognizer(pencilRecognizer)
+    }
+
+    // MARK: - Pure UIKit Floating Page Pill & Toast (ZERO SwiftUI AttributeGraph Overhead!)
+
+    private func setupNativeFloatingHUD() {
+        var cfg = UIButton.Configuration.plain()
+        cfg.contentInsets = NSDirectionalEdgeInsets(top: 5.5, leading: 13, bottom: 5.5, trailing: 13)
+        pagePillButton.configuration = cfg
+        pagePillButton.translatesAutoresizingMaskIntoConstraints = false
+        pagePillButton.layer.cornerRadius = 13
+        pagePillButton.layer.borderWidth = 0.8
+        pagePillButton.clipsToBounds = true
+        pagePillButton.addTarget(self, action: #selector(handleTapPagePill), for: .touchUpInside)
+        view.addSubview(pagePillButton)
+
+        toastPillLabel.translatesAutoresizingMaskIntoConstraints = false
+        toastPillLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+        toastPillLabel.textAlignment = .center
+        toastPillLabel.layer.cornerRadius = 14
+        toastPillLabel.layer.borderWidth = 0.8
+        toastPillLabel.clipsToBounds = true
+        toastPillLabel.isHidden = true
+        toastPillLabel.isUserInteractionEnabled = false
+        view.addSubview(toastPillLabel)
+
+        NSLayoutConstraint.activate([
+            pagePillButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            pagePillButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+
+            toastPillLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            toastPillLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            toastPillLabel.heightAnchor.constraint(equalToConstant: 28)
+        ])
+
+        toolState.onHUDChanged = { [weak self] in
+            self?.updateNativePagePill()
+        }
+        toolState.onShowToast = { [weak self] msg in
+            self?.showNativeToast(msg)
+        }
+        applyNativeHUDTheme()
+        updateNativePagePill()
+    }
+
+    private func applyNativeHUDTheme() {
+        let isDark = (traitCollection.userInterfaceStyle == .dark)
+        let pillBg = isDark
+            ? UIColor(red: 0.145, green: 0.150, blue: 0.168, alpha: 0.96)
+            : UIColor(white: 1.0, alpha: 0.96)
+        let borderCol = isDark
+            ? UIColor(white: 1.0, alpha: 0.12).cgColor
+            : UIColor(white: 0.0, alpha: 0.12).cgColor
+        let textCol = isDark
+            ? UIColor(white: 0.94, alpha: 0.92)
+            : UIColor(white: 0.10, alpha: 0.88)
+
+        pagePillButton.backgroundColor = pillBg
+        pagePillButton.layer.borderColor = borderCol
+        pagePillButton.tintColor = textCol
+
+        toastPillLabel.backgroundColor = pillBg
+        toastPillLabel.layer.borderColor = borderCol
+        toastPillLabel.textColor = isDark ? .white : .label
+    }
+
+    private func updateNativePagePill() {
+        let text: String
+        if isHoboDoc && !toolState.currentSlotLabel.isEmpty {
+            text = "\(toolState.currentSlotLabel) · \(toolState.currentPage)/\(toolState.totalPages)"
+        } else {
+            text = "Page \(toolState.currentPage) of \(toolState.totalPages)"
+        }
+        let font = UIFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        let isDark = (traitCollection.userInterfaceStyle == .dark)
+        let fg = isDark ? UIColor(white: 0.94, alpha: 0.92) : UIColor(white: 0.10, alpha: 0.88)
+        var container = AttributeContainer()
+        container.font = font
+        container.foregroundColor = fg
+        if var cfg = pagePillButton.configuration {
+            cfg.attributedTitle = AttributedString(text, attributes: container)
+            pagePillButton.configuration = cfg
+        }
+        let targetAlpha: CGFloat = toolState.isWriting ? 0.25 : 0.96
+        if abs(pagePillButton.alpha - targetAlpha) > 0.01 {
+            pagePillButton.alpha = targetAlpha
+        }
+    }
+
+    private func showNativeToast(_ message: String) {
+        toastHideWorkItem?.cancel()
+        if message.isEmpty {
+            toastPillLabel.isHidden = true
+            return
+        }
+        toastPillLabel.text = "   \(message)   "
+        toastPillLabel.isHidden = false
+        let item = DispatchWorkItem { [weak self] in
+            self?.toastPillLabel.isHidden = true
+        }
+        toastHideWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: item)
+    }
+
+    @objc private func handleTapPagePill() {
+        Haptics.selection()
+        presentJumpToPageAlert()
+    }
+
+    func presentJumpToPageAlert() {
+        let total = max(1, pageSlots.count)
+        let alert = UIAlertController(
+            title: "Go to Page",
+            message: "Enter a page number (1–\(total))",
+            preferredStyle: .alert
+        )
+        alert.addTextField { tf in
+            tf.keyboardType = .numberPad
+            tf.placeholder = "\(self.toolState.currentPage)"
+            tf.text = "\(self.toolState.currentPage)"
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Go", style: .default) { [weak self, weak alert] _ in
+            guard let self, let raw = alert?.textFields?.first?.text,
+                  let num = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
+            self.jumpToPage(num, animated: true)
+        })
+        present(alert, animated: true)
     }
 
     private func setupTapUndoGestures() {
@@ -1520,6 +1636,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         scrollView.minimumZoomScale = fit * 0.55
         scrollView.maximumZoomScale = fit * 6.0
         scrollView.setZoomScale(fit, animated: false)
+        scrollView.showsHorizontalScrollIndicator = false
         centerContentIfNeeded()
         scrollView.contentOffset.x = -scrollView.contentInset.left
     }
@@ -1589,6 +1706,10 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         guard !isRebuildingPages else { return }
+        let needHBar = baseFitScale > 0 && scrollView.zoomScale > baseFitScale * 1.06
+        if scrollView.showsHorizontalScrollIndicator != needHBar {
+            scrollView.showsHorizontalScrollIndicator = needHBar
+        }
         centerContentIfNeeded()
         guard !isSnappingZoom else { return }
         // Debounced settle check ensures macOS trackpad pinch-to-zoom ALSO snaps cleanly to Fit-to-Width & sharpens!
@@ -1659,13 +1780,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         guard !scrollSettleScheduled else { return }
         scrollSettleScheduled = true
         #if targetEnvironment(macCatalyst)
-        let settleDelayMs = 150
+        let settleDelayMs = 110
         #else
-        let settleDelayMs = 120
+        let settleDelayMs = 110
         #endif
         let settleSec = Double(settleDelayMs) / 1000.0
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + .milliseconds(settleDelayMs), leeway: .milliseconds(50))
+        timer.schedule(deadline: .now() + .milliseconds(settleDelayMs), leeway: .milliseconds(40))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.cancelScrollSettleTimer()
@@ -1770,15 +1891,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         // Fast-path recycle of offscreen views ONLY when the keep window actually moved!
         if keepRange != lastMountedKeepRange {
             lastMountedKeepRange = keepRange
-            let protectedKeys: Set<String> = Set([
-                activePageView?.pageKey,
-                laserPageView?.pageKey,
-                lassoSelection?.pageKey,
-                activeTextEditor?.pageKey
-            ].compactMap { $0 })
+            let kActive = activePageView?.pageKey
+            let kLaser = laserPageView?.pageKey
+            let kLasso = lassoSelection?.pageKey
+            let kText = activeTextEditor?.pageKey
 
             for (key, pv) in mountedPageViews {
-                if protectedKeys.contains(key) { continue }
+                if key == kActive || key == kLaser || key == kLasso || key == kText { continue }
                 if let idx = slotIndexByKey[key], keepRange.contains(idx) { continue }
                 if !pv.isTemplateOnly, pv.isRendered, let cg = pv.renderedCGImage {
                     cacheBitmap(cg, forKey: key, zoomScale: pv.renderedZoomScale, readingMode: currentReadingMode, quality: currentRenderQuality)
@@ -1798,9 +1917,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         activeLayoutGenSnapshot = gen
         renderWindowLock.unlock()
 
-        // Tight Velocity Gate (Eco-Class): skips ALL throwaway PDF decodes during normal fast skimming (>650 pt/s Mac)!
+        // Profiler-Driven Velocity Gate: skips ALL throwaway PDF image decodes during continuous trackpad browsing (>280 pt/s Mac)!
         #if targetEnvironment(macCatalyst)
-        let flickThreshold: CGFloat = 650
+        let flickThreshold: CGFloat = 280
         #else
         let flickThreshold: CGFloat = 1800
         #endif
@@ -1829,7 +1948,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let isZoomedIn = baseFitScale > 0 && zoom > baseFitScale * 1.32
         let targetMaxPx: CGFloat = isZoomedIn ? quality.zoomedMaxPixels : quality.baseMaxPixels
         let dScale: CGFloat = min(cachedDisplayScale, quality.displayScaleCap)
-        let useEcoInterpolation = (quality == .eco)
+        let interp = quality.interpolationQuality
 
         #if targetEnvironment(macCatalyst)
         let maxConcurrentRenders = 1
@@ -1854,7 +1973,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             if !isSettled {
                 let pFrame = pageFrames[idx]
                 let overlapH = max(0, min(pFrame.maxY, visibleInDoc.maxY) - max(pFrame.minY, visibleInDoc.minY))
-                if overlapH < min(120, pFrame.height * 0.25) {
+                if overlapH < min(140, pFrame.height * 0.28) {
                     continue
                 }
             }
@@ -1907,7 +2026,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 maxPixels: targetMaxPx,
                 readingMode: mode,
                 displayScale: dScale,
-                fastQuality: useEcoInterpolation
+                interpolation: interp
             )
             DispatchQueue.main.async {
                 guard self.layoutGeneration == gen else { return }

@@ -500,13 +500,13 @@ final class PageCanvasView: UIView {
         maxPixels: CGFloat = 2_400_000,
         readingMode: PDFReadingMode = .original,
         displayScale: CGFloat = 2.0,
-        fastQuality: Bool = false
+        interpolation: CGInterpolationQuality = .none
     ) -> CGImage? {
         autoreleasepool {
             let pageSize = slot.size
             guard pageSize.width > 1, pageSize.height > 1 else { return nil }
             let dpr = max(1.0, min(displayScale, 2.0))
-            let maxScale: CGFloat = fastQuality ? 1.5 : 2.75
+            let maxScale: CGFloat = (interpolation == .none) ? 1.65 : 2.75
             let desiredScale = max(0.35, min(zoomScale * dpr, maxScale))
             let rawPx = (pageSize.width * desiredScale) * (pageSize.height * desiredScale)
             let finalScale = rawPx > maxPixels ? desiredScale * sqrt(maxPixels / rawPx) : desiredScale
@@ -533,7 +533,7 @@ final class PageCanvasView: UIView {
             ctx.setAllowsAntialiasing(true)
             ctx.setShouldSmoothFonts(false)
             ctx.setAllowsFontSmoothing(false)
-            ctx.interpolationQuality = fastQuality ? .low : .medium
+            ctx.interpolationQuality = interpolation
 
             // Flip Y to UIKit top-left coordinates matching `drawSlotBackground`
             ctx.translateBy(x: 0, y: CGFloat(pxH))
@@ -576,7 +576,7 @@ final class PageCanvasView: UIView {
             maxPixels: maxPixels,
             readingMode: readingMode,
             displayScale: displayScale,
-            fastQuality: fastQuality
+            interpolation: fastQuality ? .none : .low
         ) {
             return UIImage(cgImage: cg)
         }

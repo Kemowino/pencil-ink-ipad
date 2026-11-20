@@ -275,24 +275,7 @@ struct NotebookScreen: View {
                         .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
-                NotebookFloatingHUD(
-                    hud: toolState.hud,
-                    isHobonichi: toolState.isHobonichi,
-                    hasTopActionBar: toolState.hasLassoSelection || toolState.hasActiveTextBox,
-                    pagePillFont: pagePillFont,
-                    hairlineColor: hairlineColor,
-                    floatingPillBg: floatingPillBg,
-                    onTapPagePill: {
-                        jumpPageInput = "\(toolState.currentPage)"
-                        activePopover = .jumpPage
-                        Haptics.selection()
-                    },
-                    jumpPopoverPresented: Binding(
-                        get: { activePopover == .jumpPage },
-                        set: { if !$0 { activePopover = nil } }
-                    ),
-                    jumpPopoverContent: { jumpPagePopover }
-                )
+                Spacer()
             }
             .animation(.easeOut(duration: 0.18), value: toolState.hasLassoSelection)
             .animation(.easeOut(duration: 0.18), value: toolState.hasActiveTextBox)
@@ -376,8 +359,7 @@ struct NotebookScreen: View {
                 }
 
                 Button {
-                    jumpPageInput = "\(toolState.currentPage)"
-                    activePopover = .jumpPage
+                    controllerBox.vc?.presentJumpToPageAlert()
                 } label: {
                     Label("Go to Page…", systemImage: "number.square")
                 }
@@ -496,8 +478,7 @@ struct NotebookScreen: View {
                     }
 
                     Button {
-                        jumpPageInput = "\(toolState.currentPage)"
-                        activePopover = .jumpPage
+                        controllerBox.vc?.presentJumpToPageAlert()
                     } label: {
                         Label("Go to Page…", systemImage: "number.square")
                     }
@@ -1966,7 +1947,7 @@ private struct HobonichiRibbonBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            ribbonChip("Index", active: hud.currentPage == 1, activeColor: Color(red: 0.78, green: 0.29, blue: 0.19)) {
+            ribbonChip("Index", active: hud.isOnHoboIndex, activeColor: Color(red: 0.78, green: 0.29, blue: 0.19)) {
                 controllerBox.vc?.jumpToHoboIndex()
                 Haptics.selection()
             }
@@ -2015,76 +1996,5 @@ private struct HobonichiRibbonBar: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-    }
-}
-
-private struct NotebookFloatingHUD<JumpPopover: View>: View {
-    @ObservedObject var hud: NotebookHUDState
-    let isHobonichi: Bool
-    let hasTopActionBar: Bool
-    let pagePillFont: CGFloat
-    let hairlineColor: Color
-    let floatingPillBg: Color
-    let onTapPagePill: () -> Void
-    @Binding var jumpPopoverPresented: Bool
-    @ViewBuilder let jumpPopoverContent: () -> JumpPopover
-
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        VStack(spacing: 10) {
-            if !hud.toastMessage.isEmpty {
-                Text(hud.toastMessage)
-                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                    .foregroundColor(colorScheme == .dark ? .white : .primary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(floatingPillBg)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                                        .padding(.top, hasTopActionBar ? 0 : 10)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
-            }
-
-            Spacer()
-
-            // Zero-blur Goodnotes Bottom Page Pill (saves 60Hz WindowServer blur readback on macOS!)
-            Button(action: onTapPagePill) {
-                HStack(spacing: 5) {
-                    if isHobonichi && !hud.currentSlotLabel.isEmpty {
-                        Text(hud.currentSlotLabel)
-                            .font(.system(size: pagePillFont, weight: .semibold))
-                        Text("·")
-                            .opacity(0.55)
-                        Text("\(hud.currentPage)/\(hud.totalPages)")
-                            .font(.system(size: pagePillFont, weight: .medium))
-                            .monospacedDigit()
-                    } else {
-                        Text("Page \(hud.currentPage) of \(hud.totalPages)")
-                            .font(.system(size: pagePillFont, weight: .semibold))
-                            .monospacedDigit()
-                    }
-                    // Clean steady page counter (no jarring "Saving..." width jump after every stroke)
-                }
-                .foregroundColor(.primary.opacity(0.88))
-                .padding(.horizontal, 13)
-                .padding(.vertical, 5.5)
-                .background(floatingPillBg)
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                            }
-            .buttonStyle(.plain)
-            .opacity(hud.isWriting ? 0.25 : 0.95)
-            #if !targetEnvironment(macCatalyst)
-            .animation(.easeOut(duration: 0.16), value: hud.isWriting)
-            #endif
-            .popover(isPresented: $jumpPopoverPresented) {
-                jumpPopoverContent()
-            }
-            .padding(.bottom, 12)
-        }
-        #if !targetEnvironment(macCatalyst)
-        .animation(.easeOut(duration: 0.18), value: hud.toastMessage)
-        #endif
     }
 }
