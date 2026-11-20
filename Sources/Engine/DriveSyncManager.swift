@@ -373,19 +373,25 @@ final class DriveSyncManager: ObservableObject {
 
     // MARK: - Fast Debounced Auto-Push & Live Book Sync
 
+    func cancelScheduledSync(for relativePath: String) {
+        let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
+        debounceTimers[inkRelPath]?.cancel()
+        debounceTimers.removeValue(forKey: inkRelPath)
+    }
+
     func scheduleBookSync(
         pdfURL: URL,
         relativePath: String,
+        delaySeconds: TimeInterval = 4.0,
         localDocProvider: @escaping () -> InkDocument,
         onMerged: @escaping (InkDocument) -> Void
     ) {
-        guard config.isConnected, config.autoSync else { return }
+        guard config.isConnected, config.autoSync, AppSettings.shared.syncMode == .smart else { return }
         let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
         debounceTimers[inkRelPath]?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.debounceTimers.removeValue(forKey: inkRelPath)
-            // If a background poll is already in flight, queue an immediate follow-up push so strokes NEVER wait!
             if self.activeSyncTasks[inkRelPath] != nil {
                 self.pendingFollowups[inkRelPath] = PendingFollowup(
                     pdfURL: pdfURL,
@@ -408,8 +414,134 @@ final class DriveSyncManager: ObservableObject {
             }
         }
         debounceTimers[inkRelPath] = item
-        // Fast 0.45s debounce so strokes leave the iPad in <1 second!
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: item)
+        // Smart idle debounce (4s default): batches continuous writing/typing into ONE clean upload!
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.2, delaySeconds), execute: item)
+    }
+
+    /// Translates a local PDF rename to Google Drive (renaming `<Book.pdf.ink.d>`, `<Book.pdf>`, and `<Book.pdf.ink.json>` if present)
+    /// and migrates the local CRDT log state so other devices & Obsidian seamlessly follow the rename without duplicating strokes.
+    @discardableResult
+    func renameBookOnDrive(oldRelativePath: String, newRelativePath: String) async -> Bool {
+        let oldInk = oldRelativePath.hasSuffix(".ink.json") ? oldRelativePath : (oldRelativePath + ".ink.json")
+        let newInk = newRelativePath.hasSuffix(".ink.json") ? newRelativePath : (newRelativePath + ".ink.json")
+        if oldInk == newInk { return true }
+
+        // 1. Cancel any pending timers for the old path & migrate local CRDT log state file
+        debounceTimers[oldInk]?.cancel()
+        debounceTimers.removeValue(forKey: oldInk)
+        pendingFollowups.removeValue(forKey: oldInk)
+
+        let oldStateURL = logStateURL(for: oldInk)
+        let newStateURL = logStateURL(for: newInk)
+        var migratedState = logStates.removeValue(forKey: oldInk)
+        if migratedState == nil,
+           let data = try? Data(contentsOf: oldStateURL),
+           let decoded = try? JSONDecoder().decode(BookLogState.self, from: data) {
+            migratedState = decoded
+        }
+        if let st = migratedState {
+            logStates[newInk] = st
+            saveLogState(st, for: newInk)
+        }
+        try? FileManager.default.removeItem(at: oldStateURL)
+
+        if let seen = logSeen.removeValue(forKey: oldInk) {
+            logSeen[newInk] = seen
+        }
+        if let extra = extraFolderCache.removeValue(forKey: oldInk) {
+            extraFolderCache[newInk] = extra
+        }
+        folderCheckAt.removeValue(forKey: oldInk)
+        resolvedPathCache.removeValue(forKey: oldInk)
+
+        guard config.isConnected else { return false }
+
+        let oldPDFName = (oldRelativePath as NSString).lastPathComponent
+        let newPDFName = (newRelativePath as NSString).lastPathComponent
+        let oldInkName = (oldInk as NSString).lastPathComponent
+        let newInkName = (newInk as NSString).lastPathComponent
+        let oldFolderName = oldInkName.hasSuffix(".json") ? String(oldInkName.dropLast(5)) + ".d" : oldInkName + ".d"
+        let newFolderName = newInkName.hasSuffix(".json") ? String(newInkName.dropLast(5)) + ".d" : newInkName + ".d"
+        let dir = (oldRelativePath as NSString).deletingLastPathComponent
+        let cleanDir = (dir == "." || dir == "/") ? "" : dir
+
+        await client.updateConfig(config)
+        visualState = .syncing
+        statusText = "Renaming on Drive…"
+
+        do {
+            let rootID = try await client.resolveRootFolderID()
+            var parentIDs = Set<String>()
+            var renamedAny = false
+
+            // Rename all matching `<OldBook.pdf.ink.d>` folders under sync root
+            var folderIDsToRename = Set<String>()
+            if let cachedID = migratedState?.folderId, !cachedID.isEmpty {
+                folderIDsToRename.insert(cachedID)
+            }
+            let foundFolders = try await client.findFoldersNamed(oldFolderName)
+            for f in foundFolders {
+                if let _ = try await client.resolvePathUnderRoot(folder: f, rootID: rootID) {
+                    folderIDsToRename.insert(f.id)
+                    if let pid = f.parents?.first { parentIDs.insert(pid) }
+                }
+            }
+            for fid in folderIDsToRename {
+                if let meta = try? await client.getFile(id: fid), let pid = meta.parents?.first {
+                    parentIDs.insert(pid)
+                }
+                _ = try await client.renameFile(fileID: fid, newName: newFolderName)
+                renamedAny = true
+            }
+
+            // Also resolve parent directory by path in case the PDF exists on Drive even without an `.ink.d` folder yet
+            if parentIDs.isEmpty {
+                if cleanDir.isEmpty {
+                    parentIDs.insert(rootID)
+                } else {
+                    let segments = cleanDir.split(separator: "/").map(String.init)
+                    var cur = rootID
+                    var ok = true
+                    for seg in segments {
+                        let matches = try await client.findChildren(parentID: cur, name: seg, mimeType: GoogleDriveClient.folderMime)
+                        if let first = matches.sorted(by: { $0.id < $1.id }).first {
+                            cur = first.id
+                        } else {
+                            ok = false
+                            break
+                        }
+                    }
+                    if ok { parentIDs.insert(cur) }
+                }
+            }
+
+            // Rename `<OldBook.pdf>` and legacy `<OldBook.pdf.ink.json>` inside the Drive parent directory
+            for pid in parentIDs {
+                let pdfMatches = try await client.findChildren(parentID: pid, name: oldPDFName)
+                for f in pdfMatches {
+                    _ = try await client.renameFile(fileID: f.id, newName: newPDFName)
+                    renamedAny = true
+                }
+                let legacyInkMatches = try await client.findChildren(parentID: pid, name: oldInkName)
+                for f in legacyInkMatches {
+                    _ = try await client.renameFile(fileID: f.id, newName: newInkName)
+                    renamedAny = true
+                }
+            }
+
+            lastError = ""
+            visualState = .ok
+            statusText = "Synced"
+            if renamedAny {
+                lastSyncedAt = Date()
+            }
+            return renamedAny
+        } catch {
+            lastError = error.localizedDescription
+            visualState = .error
+            statusText = "Sync Error"
+            return false
+        }
     }
 
     func syncBook(

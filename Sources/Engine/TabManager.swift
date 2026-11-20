@@ -60,6 +60,8 @@ final class TabManager: ObservableObject {
             ? title!
             : url.deletingPathExtension().lastPathComponent
 
+        let initialToolState = NotebookToolState()
+        initialToolState.tool = AppSettings.shared.startInHandMode ? .hand : .pen
         let tab = OpenDocumentTab(
             id: stdID,
             url: url,
@@ -68,7 +70,7 @@ final class TabManager: ObservableObject {
             isHobonichi: isHobonichi,
             isStandaloneScoped: isStandaloneScoped,
             controllerBox: PDFNotebookRepresentable.ControllerBox(),
-            toolState: NotebookToolState()
+            toolState: initialToolState
         )
 
         withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -104,8 +106,8 @@ final class TabManager: ObservableObject {
     func closeTab(_ id: String, switchAfter: Bool = true) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         let closing = tabs[idx]
-        closing.controllerBox.vc?.saveNow()
-        closing.controllerBox.vc?.syncNowWithDrive(silent: true, forceFolderScan: false)
+        closing.controllerBox.vc?.commitActiveTextBox()
+        closing.controllerBox.vc?.saveNow(flushDriveImmediately: true)
         closing.controllerBox.vc?.setTabActive(false)
         if closing.isStandaloneScoped {
             closing.url.stopAccessingSecurityScopedResource()
@@ -139,8 +141,8 @@ final class TabManager: ObservableObject {
 
     func closeAllTabs() {
         for tab in tabs {
-            tab.controllerBox.vc?.saveNow()
-            tab.controllerBox.vc?.syncNowWithDrive(silent: true, forceFolderScan: false)
+            tab.controllerBox.vc?.commitActiveTextBox()
+            tab.controllerBox.vc?.saveNow(flushDriveImmediately: true)
             tab.controllerBox.vc?.setTabActive(false)
             if tab.isStandaloneScoped {
                 tab.url.stopAccessingSecurityScopedResource()
@@ -161,10 +163,27 @@ final class TabManager: ObservableObject {
 
     func handleRenamedDocument(oldRelativePath: String, newURL: URL, newRelativePath: String, newTitle: String) {
         guard let idx = tabs.firstIndex(where: { $0.relativePath == oldRelativePath }) else { return }
-        // Close and reopen cleanly under the new URL so file paths and sidecar sync stay 100% consistent
-        let wasActive = (activeTabID == tabs[idx].id)
-        let isHobo = tabs[idx].isHobonichi
-        closeTab(tabs[idx].id, switchAfter: false)
+        let oldTab = tabs[idx]
+        let wasActive = (activeTabID == oldTab.id)
+        let isHobo = oldTab.isHobonichi
+        let keepTool = oldTab.toolState.tool
+        let keepPage = oldTab.toolState.currentPage
+
+        // Detach old tab cleanly WITHOUT re-saving to the old moved URL!
+        oldTab.controllerBox.vc?.cancelAllPendingIO()
+        oldTab.controllerBox.vc?.setTabActive(false)
+        if oldTab.isStandaloneScoped {
+            oldTab.url.stopAccessingSecurityScopedResource()
+        }
+        tabs.remove(at: idx)
+
+        let newPageKey = "pencilink.lastpage." + newURL.lastPathComponent
+        if keepPage > 1 {
+            UserDefaults.standard.set(keepPage, forKey: newPageKey)
+        }
+
+        let newState = NotebookToolState()
+        newState.tool = keepTool
         let newTab = OpenDocumentTab(
             id: newURL.standardizedFileURL.resolvingSymlinksInPath().path,
             url: newURL,
@@ -173,7 +192,7 @@ final class TabManager: ObservableObject {
             isHobonichi: isHobo,
             isStandaloneScoped: false,
             controllerBox: PDFNotebookRepresentable.ControllerBox(),
-            toolState: NotebookToolState()
+            toolState: newState
         )
         tabs.insert(newTab, at: min(idx, tabs.count))
         if wasActive {
@@ -194,6 +213,8 @@ final class TabManager: ObservableObject {
             guard let item = vault.pdfs.first(where: { $0.relativePath == rel }) else { continue }
             let stdID = item.url.standardizedFileURL.resolvingSymlinksInPath().path
             if tabs.contains(where: { $0.id == stdID }) { continue }
+            let restoredState = NotebookToolState()
+            restoredState.tool = AppSettings.shared.startInHandMode ? .hand : .pen
             let tab = OpenDocumentTab(
                 id: stdID,
                 url: item.url,
@@ -202,7 +223,7 @@ final class TabManager: ObservableObject {
                 isHobonichi: item.isHobonichi,
                 isStandaloneScoped: false,
                 controllerBox: PDFNotebookRepresentable.ControllerBox(),
-                toolState: NotebookToolState()
+                toolState: restoredState
             )
             tabs.append(tab)
             if savedActive == rel {

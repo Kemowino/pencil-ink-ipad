@@ -161,7 +161,7 @@ struct DriveSyncSettingsSheet: View {
                     }
                     if !syncManager.config.deviceLabel.isEmpty {
                         HStack {
-                            Text("iPad Device ID")
+                            Text("Device ID")
                             Spacer()
                             Text(syncManager.config.deviceLabel)
                                 .font(.caption.monospaced())

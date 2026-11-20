@@ -7,6 +7,11 @@ private enum ActivePickerMode {
     case importPDFCopy
 }
 
+private enum LibrarySection: String, CaseIterable {
+    case documents = "Documents"
+    case journals = "Journals"
+}
+
 private enum LibrarySort: String, CaseIterable, Identifiable {
     case modified = "Date"
     case name = "Name"
@@ -33,6 +38,7 @@ struct LibraryView: View {
     @EnvironmentObject var settings: AppSettings
     @Environment(\.colorScheme) private var colorScheme
 
+    @State private var activeSection: LibrarySection = .documents
     @State private var sortOption: LibrarySort = .modified
     @State private var displayMode: LibraryDisplayMode = .grid
     @State private var currentFolder: String = ""
@@ -58,6 +64,7 @@ struct LibraryView: View {
     }
 
     private var visibleFolders: [FolderItem] {
+        guard activeSection == .documents else { return [] }
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !q.isEmpty {
             return vault.allFolders.filter { $0.name.lowercased().contains(q) }
@@ -65,6 +72,7 @@ struct LibraryView: View {
         return vault.allFolders.filter { folder in
             let parent = (folder.relativePath as NSString).deletingLastPathComponent
             let normParent = (parent == "." || parent == "/") ? "" : parent
+            if currentFolder.isEmpty && folder.relativePath == "Journals" { return false }
             return normParent == currentFolder
         }
     }
@@ -72,13 +80,21 @@ struct LibraryView: View {
     private var visiblePDFs: [PDFItem] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered: [PDFItem]
-        if !q.isEmpty {
+        if activeSection == .journals {
+            let journals = vault.pdfs.filter { $0.isHobonichi }
+            if q.isEmpty {
+                filtered = journals
+            } else {
+                filtered = journals.filter { $0.name.lowercased().contains(q) }
+            }
+        } else if !q.isEmpty {
             filtered = vault.pdfs.filter {
                 $0.name.lowercased().contains(q) || $0.relativeFolder.lowercased().contains(q)
             }
         } else {
             filtered = vault.pdfs.filter { item in
                 let folder = (item.relativeFolder == "." || item.relativeFolder == "/") ? "" : item.relativeFolder
+                if currentFolder.isEmpty && item.isHobonichi { return false }
                 return folder == currentFolder
             }
         }
@@ -138,9 +154,71 @@ struct LibraryView: View {
                     if vault.vaultURL == nil {
                         emptyVaultView
                     } else {
-                        // Subtle Goodnotes Sub-Header: Breadcrumbs (left) + Sort & View Toggle (right)
-                        HStack(spacing: 12) {
-                            if !currentFolder.isEmpty {
+                        // Clean Goodnotes Sub-Header: Documents | Journals switcher + Sort & View Toggle
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 12) {
+                                Picker("Section", selection: Binding(
+                                    get: { activeSection },
+                                    set: { next in
+                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                                            activeSection = next
+                                        }
+                                        Haptics.selection()
+                                    }
+                                )) {
+                                    ForEach(LibrarySection.allCases, id: \.self) { sec in
+                                        Text(sec.rawValue).tag(sec)
+                                    }
+                                }
+                                .pickerStyle(.segmented)
+                                .frame(maxWidth: 240)
+
+                                Spacer()
+
+                                Menu {
+                                    ForEach(LibrarySort.allCases) { opt in
+                                        Button {
+                                            sortOption = opt
+                                            Haptics.selection()
+                                        } label: {
+                                            if sortOption == opt {
+                                                Label("Sort by \(opt.rawValue)", systemImage: "checkmark")
+                                            } else {
+                                                Text("Sort by \(opt.rawValue)")
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text(sortOption.rawValue)
+                                            .font(.system(size: 13, weight: .medium))
+                                        Image(systemName: "chevron.down")
+                                            .font(.system(size: 10, weight: .semibold))
+                                    }
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.primary.opacity(0.05))
+                                    .clipShape(Capsule())
+                                }
+
+                                Button {
+                                    withAnimation(.easeOut(duration: 0.18)) {
+                                        displayMode = (displayMode == .grid) ? .list : .grid
+                                    }
+                                    Haptics.selection()
+                                } label: {
+                                    Image(systemName: displayMode == .grid ? "list.bullet" : "square.grid.2x2")
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 30, height: 30)
+                                        .background(Color.primary.opacity(0.05))
+                                        .clipShape(Circle())
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if activeSection == .documents && !currentFolder.isEmpty {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 5) {
                                         Button {
@@ -171,75 +249,48 @@ struct LibraryView: View {
                                         }
                                     }
                                 }
-                            } else {
-                                Text("\(visibleFolders.count + visiblePDFs.count) items")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundColor(.secondary)
                             }
-
-                            Spacer()
-
-                            // Goodnotes Sort Dropdown
-                            Menu {
-                                ForEach(LibrarySort.allCases) { opt in
-                                    Button {
-                                        sortOption = opt
-                                        Haptics.selection()
-                                    } label: {
-                                        if sortOption == opt {
-                                            Label("Sort by \(opt.rawValue)", systemImage: "checkmark")
-                                        } else {
-                                            Text("Sort by \(opt.rawValue)")
-                                        }
-                                    }
-                                }
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Text(sortOption.rawValue)
-                                        .font(.system(size: 13, weight: .medium))
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 10, weight: .semibold))
-                                }
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.primary.opacity(0.05))
-                                .clipShape(Capsule())
-                            }
-
-                            // Goodnotes Grid / List View Switcher
-                            Button {
-                                withAnimation(.easeOut(duration: 0.18)) {
-                                    displayMode = (displayMode == .grid) ? .list : .grid
-                                }
-                                Haptics.selection()
-                            } label: {
-                                Image(systemName: displayMode == .grid ? "list.bullet" : "square.grid.2x2")
-                                    .font(.system(size: 15, weight: .medium))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 30, height: 30)
-                                    .background(Color.primary.opacity(0.05))
-                                    .clipShape(Circle())
-                            }
-                            .buttonStyle(.plain)
                         }
                         .padding(.horizontal, 24)
                         .padding(.top, 4)
                         .padding(.bottom, 10)
 
-                        if displayMode == .grid {
-                            goodnotesGridView
-                        } else {
-                            goodnotesListView
+                        // Smooth animated transition between Documents and Journals
+                        ZStack {
+                            if activeSection == .documents {
+                                Group {
+                                    if displayMode == .grid {
+                                        goodnotesGridView
+                                    } else {
+                                        goodnotesListView
+                                    }
+                                }
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .leading).combined(with: .opacity),
+                                    removal: .opacity
+                                ))
+                            } else {
+                                Group {
+                                    if displayMode == .grid {
+                                        goodnotesGridView
+                                    } else {
+                                        goodnotesListView
+                                    }
+                                }
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                                    removal: .opacity
+                                ))
+                            }
                         }
+                        .animation(.spring(response: 0.28, dampingFraction: 0.88), value: activeSection)
                     }
                 }
             }
-            .navigationTitle(currentFolder.isEmpty ? "Documents" : (currentFolder as NSString).lastPathComponent)
+            .navigationTitle(navigationHeaderTitle)
             .navigationBarTitleDisplayMode(.large)
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search documents & folders")
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: activeSection == .journals ? "Search journals" : "Search documents & folders")
             .toolbar {
-                // Clean, minimal Goodnotes top-right icons (NO ugly "+ New" button!)
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     SyncStatusDotButton(syncManager: syncManager) {
                         showSyncSettings = true
@@ -273,7 +324,7 @@ struct LibraryView: View {
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
         .sheet(isPresented: $showNewHobonichi) {
-            NewHobonichiSheet(vault: vault, targetFolder: currentFolder) { url, rel in
+            NewHobonichiSheet(vault: vault, targetFolder: activeSection == .journals ? "Journals" : currentFolder) { url, rel in
                 tabManager.openDocument(url: url, relativePath: rel, isHobonichi: true, vault: vault)
             }
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
@@ -292,14 +343,24 @@ struct LibraryView: View {
         )) {
             TextField("New title", text: $renameText)
             Button("Rename") {
-                if let item = renamingItem,
-                   let renamed = try? vault.renamePDF(item, newTitle: renameText) {
-                    tabManager.handleRenamedDocument(
-                        oldRelativePath: item.relativePath,
-                        newURL: renamed.url,
-                        newRelativePath: renamed.relPath,
-                        newTitle: renamed.title
-                    )
+                if let item = renamingItem {
+                    do {
+                        if let renamed = try vault.renamePDF(item, newTitle: renameText) {
+                            tabManager.handleRenamedDocument(
+                                oldRelativePath: item.relativePath,
+                                newURL: renamed.url,
+                                newRelativePath: renamed.relPath,
+                                newTitle: renamed.title
+                            )
+                            let oldRel = item.relativePath
+                            let newRel = renamed.relPath
+                            Task {
+                                await syncManager.renameBookOnDrive(oldRelativePath: oldRel, newRelativePath: newRel)
+                            }
+                        }
+                    } catch {
+                        vault.statusMessage = error.localizedDescription
+                    }
                 }
                 renamingItem = nil
             }
@@ -347,17 +408,26 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - Goodnotes Unified Grid View (+ New... first tile -> Folders -> Documents)
+    private var navigationHeaderTitle: String {
+        if activeSection == .journals {
+            return "Journals"
+        }
+        return currentFolder.isEmpty ? "Documents" : (currentFolder as NSString).lastPathComponent
+    }
+
+    // MARK: - Goodnotes Unified Grid View
 
     private var goodnotesGridView: some View {
         ScrollView {
             LazyVGrid(columns: gridColumns, spacing: 28) {
-                // Iconic Goodnotes dashed "+ New..." first card (hidden only while actively filtering search)
                 if !isSearching {
-                    goodnotesNewTile
+                    if activeSection == .journals {
+                        goodnotesNewJournalTile
+                    } else {
+                        goodnotesNewTile
+                    }
                 }
 
-                // Folders seamlessly integrated in the same grid (classic Goodnotes style)
                 ForEach(visibleFolders) { folder in
                     GoodnotesFolderTile(folder: folder) {
                         withAnimation(.easeOut(duration: 0.18)) {
@@ -367,7 +437,6 @@ struct LibraryView: View {
                     }
                 }
 
-                // Documents & Journals (Portrait AND Landscape strictly bounded — ZERO overlap!)
                 ForEach(visiblePDFs) { item in
                     GoodnotesDocumentTile(
                         item: item,
@@ -411,12 +480,22 @@ struct LibraryView: View {
         List {
             if !isSearching {
                 Section {
-                    Menu {
-                        newCreationMenuItems
-                    } label: {
-                        Label("New Notebook, Folder, or Import…", systemImage: "plus.circle.fill")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(.accentColor)
+                    if activeSection == .journals {
+                        Button {
+                            showNewHobonichi = true
+                        } label: {
+                            Label("New Hobonichi Journal…", systemImage: "plus.circle.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.orange)
+                        }
+                    } else {
+                        Menu {
+                            newCreationMenuItems
+                        } label: {
+                            Label("New Notebook, Folder, or Import…", systemImage: "plus.circle.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.accentColor)
+                        }
                     }
                 }
             }
@@ -453,7 +532,7 @@ struct LibraryView: View {
                 }
             }
 
-            Section("Documents") {
+            Section(activeSection == .journals ? "Hobonichi Journals" : "Documents") {
                 ForEach(visiblePDFs) { item in
                     HStack(spacing: 12) {
                         Button {
@@ -519,7 +598,7 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - Iconic Goodnotes Dashed "+ New..." Tile
+    // MARK: - Iconic Goodnotes Dashed "+ New..." & "+ New Journal..." Tiles
 
     private var goodnotesNewTile: some View {
         Menu {
@@ -552,7 +631,45 @@ struct LibraryView: View {
                             .frame(maxWidth: .infinity, maxHeight: 176)
                     }
 
-                // Spacer matching the title/date height of sibling tiles
+                Text(" ")
+                    .font(.system(size: 13.5, weight: .medium))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var goodnotesNewJournalTile: some View {
+        Button {
+            showNewHobonichi = true
+        } label: {
+            VStack(spacing: 10) {
+                Color.clear
+                    .frame(height: 176)
+                    .overlay(alignment: .bottom) {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(
+                                Color.orange.opacity(0.72),
+                                style: StrokeStyle(lineWidth: 1.6, dash: [6, 5])
+                            )
+                            .background(
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .fill(Color.orange.opacity(colorScheme == .dark ? 0.07 : 0.04))
+                            )
+                            .overlay(
+                                VStack(spacing: 8) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 30, weight: .light))
+                                        .foregroundColor(.orange)
+                                    Text("New Journal...")
+                                        .font(.system(size: 13.5, weight: .medium))
+                                        .foregroundColor(.orange)
+                                }
+                            )
+                            .aspectRatio(0.74, contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: 176)
+                    }
+
                 Text(" ")
                     .font(.system(size: 13.5, weight: .medium))
             }
@@ -685,7 +802,6 @@ private struct GoodnotesFolderArtwork: View {
             let w = geo.size.width
             let h = geo.size.height
             ZStack(alignment: .bottom) {
-                // Back folder tab
                 Path { p in
                     let r: CGFloat = 10
                     let tabW = w * 0.42
@@ -713,7 +829,6 @@ private struct GoodnotesFolderArtwork: View {
                     )
                 )
 
-                // Subtle white sheet peeking inside folder
                 if count > 0 {
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(Color.white.opacity(0.88))
@@ -721,7 +836,6 @@ private struct GoodnotesFolderArtwork: View {
                         .offset(y: -h * 0.13)
                 }
 
-                // Front Goodnotes blue folder flap
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(
                         LinearGradient(
@@ -763,8 +877,6 @@ private struct GoodnotesDocumentTile: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            // Fixed-height stage with GeometryReader so BOTH portrait and landscape PDFs
-            // respect their true aspect ratio and NEVER exceed the column width!
             Button(action: onOpen) {
                 GeometryReader { geo in
                     let maxW = max(40, geo.size.width)
@@ -800,8 +912,7 @@ private struct GoodnotesDocumentTile: View {
                                 }
                             }
                         } else {
-                            // Crisp Goodnotes / Hobonichi Fabric Cover
-                            let ratio: CGFloat = item.isHobonichi ? 0.74 : 0.74
+                            let ratio: CGFloat = 0.74
                             let size = fittedSize(aspect: ratio, maxW: maxW, maxH: maxH)
 
                             ZStack(alignment: .leading) {
@@ -833,7 +944,6 @@ private struct GoodnotesDocumentTile: View {
                                 .padding(.leading, 20)
                                 .padding(.trailing, 12)
 
-                                // Tactile spine crease
                                 LinearGradient(
                                     colors: [
                                         Color.black.opacity(0.26),
@@ -862,7 +972,6 @@ private struct GoodnotesDocumentTile: View {
             }
             .buttonStyle(.plain)
 
-            // Iconic Goodnotes Centered Title + Dropdown Chevron (`Title ⌄`) + Subtle Date
             VStack(spacing: 2) {
                 Menu {
                     Button { onOpen() } label: { Label("Open", systemImage: "book.open") }

@@ -478,28 +478,53 @@ final class VaultManager: ObservableObject {
 
     @discardableResult
     func renamePDF(_ item: PDFItem, newTitle: String) throws -> (url: URL, relPath: String, title: String)? {
-        let clean = newTitle.replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
+        try renamePDF(at: item.url, oldRelativePath: item.relativePath, newTitle: newTitle)
+    }
+
+    @discardableResult
+    func renamePDF(at sourceURL: URL, oldRelativePath: String, newTitle: String) throws -> (url: URL, relPath: String, title: String)? {
+        let clean = newTitle
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return nil }
-        let parent = item.url.deletingLastPathComponent()
+        let parent = sourceURL.deletingLastPathComponent()
         let dest = parent.appendingPathComponent("\(clean).pdf")
-        if dest.path == item.url.path { return nil }
-        try FileManager.default.moveItem(at: item.url, to: dest)
-        let oldSidecar = InkDocument.sidecarURL(for: item.url)
+        if dest.standardizedFileURL.path == sourceURL.standardizedFileURL.path { return nil }
+        if FileManager.default.fileExists(atPath: dest.path) {
+            throw NSError(domain: "VaultManager", code: 2, userInfo: [NSLocalizedDescriptionKey: "A file named \"\(clean).pdf\" already exists in this folder."])
+        }
+        try FileManager.default.moveItem(at: sourceURL, to: dest)
+
+        let oldSidecar = InkDocument.sidecarURL(for: sourceURL)
         let newSidecar = InkDocument.sidecarURL(for: dest)
+        let newRel = relativePath(for: dest)
         if FileManager.default.fileExists(atPath: oldSidecar.path) {
             try? FileManager.default.moveItem(at: oldSidecar, to: newSidecar)
+            var doc = InkDocument.load(for: dest)
+            doc.name = newRel
+            try? doc.save(for: dest)
         }
-        let newRel = relativePath(for: dest)
-        if let col = coverColors.removeValue(forKey: item.relativePath) {
+
+        // Preserve remembered reading page across the rename
+        let oldPageKey = "pencilink.lastpage." + sourceURL.lastPathComponent
+        let newPageKey = "pencilink.lastpage." + dest.lastPathComponent
+        let savedPage = UserDefaults.standard.integer(forKey: oldPageKey)
+        if savedPage > 0 {
+            UserDefaults.standard.set(savedPage, forKey: newPageKey)
+            UserDefaults.standard.removeObject(forKey: oldPageKey)
+        }
+
+        if let col = coverColors.removeValue(forKey: oldRelativePath) {
             coverColors[newRel] = col
         }
-        if journalPaths.remove(item.relativePath) != nil {
+        if journalPaths.remove(oldRelativePath) != nil {
             journalPaths.insert(newRel)
         }
-        if favoritePaths.remove(item.relativePath) != nil {
+        if favoritePaths.remove(oldRelativePath) != nil {
             favoritePaths.insert(newRel)
         }
-        recentPaths = recentPaths.map { $0 == item.relativePath ? newRel : $0 }
+        recentPaths = recentPaths.map { $0 == oldRelativePath ? newRel : $0 }
         saveMetadata()
         refreshPDFList()
         return (dest, newRel, clean)

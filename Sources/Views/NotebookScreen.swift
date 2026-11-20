@@ -1,8 +1,31 @@
 import SwiftUI
 
-private enum ToolPopoverKind: Int, Identifiable {
-    case pen, highlighter, eraser, text, laser, jumpPage, sync
-    var id: Int { rawValue }
+private enum ToolPopoverKind: Equatable, Identifiable {
+    case pen
+    case highlighter
+    case eraser
+    case text
+    case laser
+    case jumpPage
+    case sync
+    case editColor(tool: DrawingTool, index: Int)
+    case addColor(tool: DrawingTool)
+    case editThickness(tool: DrawingTool, index: Int)
+
+    var id: String {
+        switch self {
+        case .pen: return "pen"
+        case .highlighter: return "highlighter"
+        case .eraser: return "eraser"
+        case .text: return "text"
+        case .laser: return "laser"
+        case .jumpPage: return "jumpPage"
+        case .sync: return "sync"
+        case .editColor(let t, let i): return "editColor-\(t.rawValue)-\(i)"
+        case .addColor(let t): return "addColor-\(t.rawValue)"
+        case .editThickness(let t, let i): return "editThick-\(t.rawValue)-\(i)"
+        }
+    }
 }
 
 struct NotebookScreen: View {
@@ -14,6 +37,7 @@ struct NotebookScreen: View {
     @EnvironmentObject var syncManager: DriveSyncManager
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var palette: ToolPaletteStore
     @ObservedObject private var toolState: NotebookToolState
     @Environment(\.colorScheme) private var colorScheme
 
@@ -23,6 +47,9 @@ struct NotebookScreen: View {
     @State private var showSyncSettings = false
     @State private var showAppSettings = false
     @State private var jumpPageInput: String = ""
+    @State private var showRenameAlert = false
+    @State private var renameDraft: String = ""
+    @State private var addColorDraft: Color = Color(red: 0.0, green: 0.48, blue: 1.0)
 
     init(tab: OpenDocumentTab, isActive: Bool, showHomeButtonInBar: Bool) {
         self.tab = tab
@@ -60,14 +87,15 @@ struct NotebookScreen: View {
                 .fill(hairlineColor)
                 .frame(height: 0.5)
 
-            // Row 2: Goodnotes Drawing Tool Bar (Centered tools | colors | diagonal stroke weights)
-            goodnotesToolBar
+            // Optional Top Drawing Tool Bar (Goodnotes mode)
+            if settings.toolbarPosition == .top {
+                goodnotesTopToolBar
+                Rectangle()
+                    .fill(hairlineColor)
+                    .frame(height: 0.5)
+            }
 
-            Rectangle()
-                .fill(hairlineColor)
-                .frame(height: 0.5)
-
-            // Optional Hobonichi Ribbon Strip (only for Hobonichi journals)
+            // Optional Hobonichi Ribbon Strip
             if toolState.isHobonichi {
                 hobonichiRibbonStrip
                 Rectangle()
@@ -75,95 +103,23 @@ struct NotebookScreen: View {
                     .frame(height: 0.5)
             }
 
-            // Full-bleed Document Canvas with subtle floating overlays (Lasso bar, Toast, Bottom Page Pill)
-            ZStack {
-                PDFNotebookRepresentable(
-                    pdfURL: tab.url,
-                    relativePath: tab.relativePath,
-                    toolState: toolState,
-                    syncManager: syncManager,
-                    isActive: isActive,
-                    controllerBox: controllerBox
-                )
-                .ignoresSafeArea(edges: .bottom)
-
-                VStack(spacing: 10) {
-                    if toolState.hasLassoSelection {
-                        lassoActionBar
-                            .padding(.top, 10)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
-                    if toolState.hasActiveTextBox {
-                        textBoxActionBar
-                            .padding(.top, toolState.hasLassoSelection ? 0 : 10)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
-                    if !toolState.toastMessage.isEmpty {
-                        Text(toolState.toastMessage)
-                            .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                            .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 6)
-                            .background(.regularMaterial)
-                            .clipShape(Capsule())
-                            .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                            .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
-                            .padding(.top, toolState.hasLassoSelection ? 0 : 10)
-                            .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                    }
-
-                    Spacer()
-
-                    // Subtle Goodnotes Bottom Page Pill (fades gently while writing)
-                    Button {
-                        jumpPageInput = "\(toolState.currentPage)"
-                        activePopover = .jumpPage
-                        Haptics.selection()
-                    } label: {
-                        HStack(spacing: 5) {
-                            if toolState.isHobonichi && !toolState.currentSlotLabel.isEmpty {
-                                Text(toolState.currentSlotLabel)
-                                    .font(.system(size: 11.5, weight: .semibold))
-                                Text("·")
-                                    .opacity(0.55)
-                                Text("\(toolState.currentPage)/\(toolState.totalPages)")
-                                    .font(.system(size: 11.5, weight: .medium))
-                                    .monospacedDigit()
-                            } else {
-                                Text("Page \(toolState.currentPage) of \(toolState.totalPages)")
-                                    .font(.system(size: 11.5, weight: .semibold))
-                                    .monospacedDigit()
-                            }
-                            if toolState.saveStatus != "Saved" {
-                                Text("· \(toolState.saveStatus)")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .foregroundColor(.primary.opacity(0.88))
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 5.5)
-                        .background(.regularMaterial)
-                        .clipShape(Capsule())
-                        .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
-                        .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
-                    }
-                    .buttonStyle(.plain)
-                    .opacity(toolState.isWriting ? 0.25 : 0.95)
-                    .animation(.easeOut(duration: 0.16), value: toolState.isWriting)
-                    .popover(isPresented: Binding(
-                        get: { activePopover == .jumpPage },
-                        set: { if !$0 { activePopover = nil } }
-                    )) {
-                        jumpPagePopover
-                    }
-                    .padding(.bottom, 12)
+            // Main Workspace: Optional Left/Right Noteshelf-style Vertical Toolbar + PDF Canvas
+            HStack(spacing: 0) {
+                if settings.toolbarPosition == .left {
+                    verticalSideToolBar
+                    Rectangle()
+                        .fill(hairlineColor)
+                        .frame(width: 0.5)
                 }
-                .animation(.easeOut(duration: 0.18), value: toolState.toastMessage)
-                .animation(.easeOut(duration: 0.18), value: toolState.hasLassoSelection)
-                .animation(.easeOut(duration: 0.18), value: toolState.hasActiveTextBox)
+
+                canvasWorkspace
+
+                if settings.toolbarPosition == .right {
+                    Rectangle()
+                        .fill(hairlineColor)
+                        .frame(width: 0.5)
+                    verticalSideToolBar
+                }
             }
         }
         .background(
@@ -178,6 +134,15 @@ struct NotebookScreen: View {
             .opacity(0)
             .allowsHitTesting(false)
         )
+        .alert("Rename Document", isPresented: $showRenameAlert) {
+            TextField("Document title", text: $renameDraft)
+            Button("Rename") {
+                performDocumentRename()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Renames the PDF locally and updates its name on Google Drive & synced devices.")
+        }
         .sheet(isPresented: $showPageOverview) {
             PageOverviewSheet(
                 toolState: toolState,
@@ -197,6 +162,133 @@ struct NotebookScreen: View {
             SettingsSheet()
                 .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
+        .onChange(of: settings.hiddenTools) { _ in
+            if !settings.isToolVisible(toolState.tool),
+               let fallback = DrawingTool.allCases.first(where: { settings.isToolVisible($0) }) {
+                selectTool(fallback)
+            }
+        }
+    }
+
+    private func performDocumentRename() {
+        let trimmed = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != tab.title else { return }
+        controllerBox.vc?.saveSynchronouslyBeforeRename()
+
+        let oldRel = tab.relativePath
+        do {
+            if let renamed = try vault.renamePDF(at: tab.url, oldRelativePath: oldRel, newTitle: trimmed) {
+                tabManager.handleRenamedDocument(
+                    oldRelativePath: oldRel,
+                    newURL: renamed.url,
+                    newRelativePath: renamed.relPath,
+                    newTitle: renamed.title
+                )
+                let newRel = renamed.relPath
+                Task {
+                    let synced = await syncManager.renameBookOnDrive(oldRelativePath: oldRel, newRelativePath: newRel)
+                    if synced {
+                        tabManager.activeTab?.toolState.showToast("Renamed & synced to Drive")
+                    } else {
+                        tabManager.activeTab?.toolState.showToast("Renamed to \(renamed.title)")
+                    }
+                }
+            }
+        } catch {
+            toolState.showToast(error.localizedDescription)
+        }
+    }
+
+    private var canvasWorkspace: some View {
+        ZStack {
+            PDFNotebookRepresentable(
+                pdfURL: tab.url,
+                relativePath: tab.relativePath,
+                toolState: toolState,
+                syncManager: syncManager,
+                isActive: isActive,
+                controllerBox: controllerBox
+            )
+            .ignoresSafeArea(edges: .bottom)
+
+            VStack(spacing: 10) {
+                if toolState.hasLassoSelection {
+                    lassoActionBar
+                        .padding(.top, 10)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
+                if toolState.hasActiveTextBox {
+                    textBoxActionBar
+                        .padding(.top, toolState.hasLassoSelection ? 0 : 10)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
+                if !toolState.toastMessage.isEmpty {
+                    Text(toolState.toastMessage)
+                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                        .foregroundColor(colorScheme == .dark ? .white : .primary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(.regularMaterial)
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
+                        .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+                        .padding(.top, toolState.hasLassoSelection || toolState.hasActiveTextBox ? 0 : 10)
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                }
+
+                Spacer()
+
+                // Subtle Goodnotes Bottom Page Pill
+                Button {
+                    jumpPageInput = "\(toolState.currentPage)"
+                    activePopover = .jumpPage
+                    Haptics.selection()
+                } label: {
+                    HStack(spacing: 5) {
+                        if toolState.isHobonichi && !toolState.currentSlotLabel.isEmpty {
+                            Text(toolState.currentSlotLabel)
+                                .font(.system(size: 11.5, weight: .semibold))
+                            Text("·")
+                                .opacity(0.55)
+                            Text("\(toolState.currentPage)/\(toolState.totalPages)")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .monospacedDigit()
+                        } else {
+                            Text("Page \(toolState.currentPage) of \(toolState.totalPages)")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .monospacedDigit()
+                        }
+                        if toolState.saveStatus != "Saved" {
+                            Text("· \(toolState.saveStatus)")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .foregroundColor(.primary.opacity(0.88))
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 5.5)
+                    .background(.regularMaterial)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.8))
+                    .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
+                }
+                .buttonStyle(.plain)
+                .opacity(toolState.isWriting ? 0.25 : 0.95)
+                .animation(.easeOut(duration: 0.16), value: toolState.isWriting)
+                .popover(isPresented: Binding(
+                    get: { activePopover == .jumpPage },
+                    set: { if !$0 { activePopover = nil } }
+                )) {
+                    jumpPagePopover
+                }
+                .padding(.bottom, 12)
+            }
+            .animation(.easeOut(duration: 0.18), value: toolState.toastMessage)
+            .animation(.easeOut(duration: 0.18), value: toolState.hasLassoSelection)
+            .animation(.easeOut(duration: 0.18), value: toolState.hasActiveTextBox)
+        }
     }
 
     private func selectTool(_ t: DrawingTool) {
@@ -212,16 +304,16 @@ struct NotebookScreen: View {
 
     private var goodnotesPrimaryBar: some View {
         HStack(spacing: 4) {
-            // Left Cluster: (Optional House icon if tab bar hidden) + Overview + Search + Bookmark + Share
             HStack(spacing: 2) {
                 if showHomeButtonInBar {
                     barIconButton(systemName: "house") {
-                        controllerBox.vc?.saveNow()
+                        controllerBox.vc?.saveNow(flushDriveImmediately: true)
                         tabManager.showLibrary()
                     }
                 }
 
                 barIconButton(systemName: "square.grid.2x2") {
+                    controllerBox.vc?.commitActiveTextBox()
                     controllerBox.vc?.clearLassoSelection(commitFirst: true)
                     openOverviewInSearch = false
                     Haptics.light()
@@ -229,6 +321,7 @@ struct NotebookScreen: View {
                 }
 
                 barIconButton(systemName: "magnifyingglass") {
+                    controllerBox.vc?.commitActiveTextBox()
                     controllerBox.vc?.clearLassoSelection(commitFirst: true)
                     openOverviewInSearch = true
                     Haptics.light()
@@ -264,11 +357,21 @@ struct NotebookScreen: View {
 
             Spacer(minLength: 8)
 
-            // Center: Clean Goodnotes Document Title + Chevron (tap to Jump to Page)
-            Button {
-                jumpPageInput = "\(toolState.currentPage)"
-                activePopover = .jumpPage
-                Haptics.selection()
+            // Center: Iconic Goodnotes Document Title + Chevron Menu (Rename + Go to Page!)
+            Menu {
+                Button {
+                    renameDraft = tab.title
+                    showRenameAlert = true
+                } label: {
+                    Label("Rename Document…", systemImage: "pencil")
+                }
+
+                Button {
+                    jumpPageInput = "\(toolState.currentPage)"
+                    activePopover = .jumpPage
+                } label: {
+                    Label("Go to Page…", systemImage: "number.square")
+                }
             } label: {
                 HStack(spacing: 4) {
                     Text(tab.title)
@@ -280,12 +383,14 @@ struct NotebookScreen: View {
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: 280)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
             Spacer(minLength: 8)
 
-            // Right Cluster: Undo + Redo + Add Page + Sync Dot + More (•••)
             HStack(spacing: 2) {
                 barIconButton(systemName: "arrow.uturn.backward", disabled: !toolState.canUndo) {
                     controllerBox.vc?.performUndo()
@@ -333,7 +438,8 @@ struct NotebookScreen: View {
                     SyncStatusPopoverView(
                         syncManager: syncManager,
                         onSyncNow: {
-                            controllerBox.vc?.saveNow()
+                            controllerBox.vc?.commitActiveTextBox()
+                            controllerBox.vc?.saveNow(flushDriveImmediately: false)
                             controllerBox.vc?.syncNowWithDrive(silent: false, forceFolderScan: true)
                         },
                         onOpenSettings: {
@@ -361,6 +467,25 @@ struct NotebookScreen: View {
                         Label("Paper Mode (\(settings.pdfReadingMode.title))", systemImage: settings.pdfReadingMode.systemImage)
                     }
 
+                    Menu {
+                        ForEach(ToolbarPosition.allCases) { pos in
+                            Button {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                                    settings.toolbarPosition = pos
+                                }
+                                Haptics.selection()
+                            } label: {
+                                if settings.toolbarPosition == pos {
+                                    Label(pos.title, systemImage: "checkmark")
+                                } else {
+                                    Text(pos.title)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Toolbar Position", systemImage: "sidebar.left")
+                    }
+
                     Button {
                         jumpPageInput = "\(toolState.currentPage)"
                         activePopover = .jumpPage
@@ -379,7 +504,7 @@ struct NotebookScreen: View {
                     Button {
                         showAppSettings = true
                     } label: {
-                        Label("Document & App Settings…", systemImage: "gearshape")
+                        Label("Customize Toolbar & Settings…", systemImage: "gearshape")
                     }
 
                     Divider()
@@ -403,94 +528,30 @@ struct NotebookScreen: View {
         .background(primaryBarBg)
     }
 
-    // MARK: - Row 2: Goodnotes Signature Centered Drawing Tool Bar
+    // MARK: - Horizontal Goodnotes Tool Bar (Top Position)
 
-    private var goodnotesToolBar: some View {
+    private var goodnotesTopToolBar: some View {
         GeometryReader { geo in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 14) {
-                    // Core Goodnotes Tool Icons (Pen, Eraser, Highlighter, Lasso, Text Box, Laser)
                     HStack(spacing: 7) {
-                        toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
-                            GoodnotesPenIcon(
-                                inkColor: Color(UIColor(hex: toolState.activePenColorHex)),
-                                isActive: toolState.tool == .pen,
-                                isDark: colorScheme == .dark
-                            )
-                        } action: {
-                            if toolState.tool == .pen { activePopover = .pen }
-                            else { selectTool(.pen) }
-                        }
-                        .popover(isPresented: Binding(
-                            get: { activePopover == .pen },
-                            set: { if !$0 { activePopover = nil } }
-                        )) { penSettingsPopover }
-
-                        toolSlotButton(active: toolState.tool == .eraser, accent: .blue) {
-                            GoodnotesEraserIcon(isActive: toolState.tool == .eraser, isDark: colorScheme == .dark)
-                        } action: {
-                            if toolState.tool == .eraser { activePopover = .eraser }
-                            else { selectTool(.eraser) }
-                        }
-                        .popover(isPresented: Binding(
-                            get: { activePopover == .eraser },
-                            set: { if !$0 { activePopover = nil } }
-                        )) { eraserSettingsPopover }
-
-                        toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
-                            GoodnotesHighlighterIcon(
-                                accentColor: Color(UIColor(hex: toolState.activeHlColorHex)),
-                                isActive: toolState.tool == .highlighter,
-                                isDark: colorScheme == .dark
-                            )
-                        } action: {
-                            if toolState.tool == .highlighter { activePopover = .highlighter }
-                            else { selectTool(.highlighter) }
-                        }
-                        .popover(isPresented: Binding(
-                            get: { activePopover == .highlighter },
-                            set: { if !$0 { activePopover = nil } }
-                        )) { highlighterSettingsPopover }
-
-                        toolSlotButton(active: toolState.tool == .lasso, accent: .blue) {
-                            GoodnotesLassoIcon(isActive: toolState.tool == .lasso, isDark: colorScheme == .dark)
-                        } action: {
-                            selectTool(.lasso)
-                        }
-
-                        toolSlotButton(active: toolState.tool == .text, accent: .blue) {
-                            GoodnotesTextIcon(isActive: toolState.tool == .text, isDark: colorScheme == .dark)
-                        } action: {
-                            if toolState.tool == .text { activePopover = .text }
-                            else { selectTool(.text) }
-                        }
-                        .popover(isPresented: Binding(
-                            get: { activePopover == .text },
-                            set: { if !$0 { activePopover = nil } }
-                        )) { textSettingsPopover }
-
-                        toolSlotButton(active: toolState.tool == .laser, accent: .red) {
-                            GoodnotesLaserIcon(
-                                laserColor: Color(UIColor(hex: toolState.laserColorHex)),
-                                isActive: toolState.tool == .laser,
-                                isDark: colorScheme == .dark
-                            )
-                        } action: {
-                            if toolState.tool == .laser { activePopover = .laser }
-                            else { selectTool(.laser) }
-                        }
-                        .popover(isPresented: Binding(
-                            get: { activePopover == .laser },
-                            set: { if !$0 { activePopover = nil } }
-                        )) { laserSettingsPopover }
+                        enabledToolButtons
                     }
 
-                    Rectangle()
-                        .fill(hairlineColor)
-                        .frame(width: 1, height: 22)
+                    if toolState.tool != .hand {
+                        Rectangle()
+                            .fill(hairlineColor)
+                            .frame(width: 1, height: 22)
 
-                    // Contextual Quick Swatches & Goodnotes Diagonal Stroke-Width / Font Controls
-                    contextualSlots
+                        contextualSlotsHorizontal
+                    } else {
+                        Rectangle()
+                            .fill(hairlineColor)
+                            .frame(width: 1, height: 22)
+                        Text("Scroll & Read Mode")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .frame(minWidth: geo.size.width, minHeight: geo.size.height)
@@ -500,104 +561,174 @@ struct NotebookScreen: View {
         .background(secondaryBarBg)
     }
 
-    @ViewBuilder
-    private var contextualSlots: some View {
-        switch toolState.tool {
-        case .pen:
-            HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    ForEach(0..<toolState.penColors.count, id: \.self) { idx in
-                        colorSwatch(hex: toolState.penColors[idx], selected: toolState.penColorIndex == idx) {
-                            if toolState.penColorIndex == idx { activePopover = .pen }
-                            else { toolState.penColorIndex = idx; Haptics.selection() }
-                        }
-                    }
+    // MARK: - Vertical Noteshelf-Style Side Tool Bar (Left / Right Position)
+
+    private var verticalSideToolBar: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 10) {
+                VStack(spacing: 6) {
+                    enabledToolButtons
                 }
 
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
+                if toolState.tool != .hand {
+                    Rectangle()
+                        .fill(hairlineColor)
+                        .frame(width: 26, height: 1)
 
+                    contextualSlotsVertical
+                }
+            }
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(width: settings.compactToolbar ? 48 : 54)
+        .background(secondaryBarBg)
+    }
+
+    // MARK: - Enabled Tool Buttons (Shared Between Horizontal & Vertical Toolbars)
+
+    @ViewBuilder
+    private var enabledToolButtons: some View {
+        if settings.isToolVisible(.hand) {
+            toolSlotButton(active: toolState.tool == .hand, accent: .blue) {
+                GoodnotesHandIcon(isActive: toolState.tool == .hand, isDark: colorScheme == .dark)
+            } action: {
+                selectTool(.hand)
+            }
+        }
+
+        if settings.isToolVisible(.pen) {
+            toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
+                GoodnotesPenIcon(
+                    inkColor: Color(UIColor(hex: palette.activePenColorHex)),
+                    isActive: toolState.tool == .pen,
+                    isDark: colorScheme == .dark
+                )
+            } action: {
+                if toolState.tool == .pen { activePopover = .pen }
+                else { selectTool(.pen) }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .pen },
+                set: { if !$0 { activePopover = nil } }
+            )) { penSettingsPopover }
+        }
+
+        if settings.isToolVisible(.eraser) {
+            toolSlotButton(active: toolState.tool == .eraser, accent: .blue) {
+                GoodnotesEraserIcon(isActive: toolState.tool == .eraser, isDark: colorScheme == .dark)
+            } action: {
+                if toolState.tool == .eraser { activePopover = .eraser }
+                else { selectTool(.eraser) }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .eraser },
+                set: { if !$0 { activePopover = nil } }
+            )) { eraserSettingsPopover }
+        }
+
+        if settings.isToolVisible(.highlighter) {
+            toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
+                GoodnotesHighlighterIcon(
+                    accentColor: Color(UIColor(hex: palette.activeHlColorHex)),
+                    isActive: toolState.tool == .highlighter,
+                    isDark: colorScheme == .dark
+                )
+            } action: {
+                if toolState.tool == .highlighter { activePopover = .highlighter }
+                else { selectTool(.highlighter) }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .highlighter },
+                set: { if !$0 { activePopover = nil } }
+            )) { highlighterSettingsPopover }
+        }
+
+        if settings.isToolVisible(.lasso) {
+            toolSlotButton(active: toolState.tool == .lasso, accent: .blue) {
+                GoodnotesLassoIcon(isActive: toolState.tool == .lasso, isDark: colorScheme == .dark)
+            } action: {
+                selectTool(.lasso)
+            }
+        }
+
+        if settings.isToolVisible(.text) {
+            toolSlotButton(active: toolState.tool == .text, accent: .blue) {
+                GoodnotesTextIcon(isActive: toolState.tool == .text, isDark: colorScheme == .dark)
+            } action: {
+                if toolState.tool == .text { activePopover = .text }
+                else { selectTool(.text) }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .text },
+                set: { if !$0 { activePopover = nil } }
+            )) { textSettingsPopover }
+        }
+
+        if settings.isToolVisible(.laser) {
+            toolSlotButton(active: toolState.tool == .laser, accent: .red) {
+                GoodnotesLaserIcon(
+                    laserColor: Color(UIColor(hex: palette.activeLaserColorHex)),
+                    isActive: toolState.tool == .laser,
+                    isDark: colorScheme == .dark
+                )
+            } action: {
+                if toolState.tool == .laser { activePopover = .laser }
+                else { selectTool(.laser) }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .laser },
+                set: { if !$0 { activePopover = nil } }
+            )) { laserSettingsPopover }
+        }
+    }
+
+    // MARK: - Contextual Swatches (+ Add Color & Tap-to-Edit) + Goodnotes 3-Circle Thickness Slots
+
+    @ViewBuilder
+    private var contextualSlotsHorizontal: some View {
+        switch toolState.tool {
+        case .hand:
+            EmptyView()
+
+        case .pen:
+            HStack(spacing: 10) {
                 HStack(spacing: 6) {
-                    ForEach(0..<toolState.penSizes.count, id: \.self) { idx in
-                        GoodnotesStrokeWeightButton(
-                            thickness: CGFloat(1.4 + Double(idx) * 1.4),
-                            selected: toolState.penSizeIndex == idx
-                        ) {
-                            if toolState.penSizeIndex == idx { activePopover = .pen }
-                            else { toolState.penSizeIndex = idx; Haptics.selection() }
-                        }
-                    }
+                    penColorSwatches
+                    addColorButton(for: .pen)
+                }
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                HStack(spacing: 5) {
+                    penThicknessCircles
                 }
             }
 
         case .highlighter:
             HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    ForEach(0..<toolState.hlColors.count, id: \.self) { idx in
-                        colorSwatch(hex: toolState.hlColors[idx], selected: toolState.hlColorIndex == idx) {
-                            if toolState.hlColorIndex == idx { activePopover = .highlighter }
-                            else { toolState.hlColorIndex = idx; Haptics.selection() }
-                        }
-                    }
-                }
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-
                 HStack(spacing: 6) {
-                    ForEach(0..<toolState.hlSizes.count, id: \.self) { idx in
-                        GoodnotesStrokeWeightButton(
-                            thickness: CGFloat(2.2 + Double(idx) * 1.7),
-                            selected: toolState.hlSizeIndex == idx
-                        ) {
-                            if toolState.hlSizeIndex == idx { activePopover = .highlighter }
-                            else { toolState.hlSizeIndex = idx; Haptics.selection() }
-                        }
-                    }
+                    hlColorSwatches
+                    addColorButton(for: .highlighter)
                 }
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-
-                Button {
-                    toolState.hlStraight.toggle()
-                    Haptics.selection()
-                    toolState.showToast(toolState.hlStraight ? "Straight Highlighter ON" : "Freehand Highlighter")
-                } label: {
-                    Image(systemName: "ruler")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(toolState.hlStraight ? .white : .primary.opacity(0.78))
-                        .frame(width: 30, height: 30)
-                        .background(toolState.hlStraight ? Color.accentColor : Color.primary.opacity(0.06))
-                        .clipShape(Circle())
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                HStack(spacing: 5) {
+                    hlThicknessCircles
                 }
-                .buttonStyle(.plain)
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                straightHighlighterToggleButton
             }
 
         case .eraser:
             HStack(spacing: 10) {
-                Picker("Mode", selection: $toolState.eraserMode) {
+                Picker("Mode", selection: $palette.eraserMode) {
                     ForEach(EraserModeOption.allCases) { m in
                         Text(m.title).tag(m)
                     }
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 128)
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-
-                HStack(spacing: 6) {
-                    ForEach(0..<toolState.eraserSizes.count, id: \.self) { idx in
-                        eraserSizeButton(diameter: CGFloat(6 + idx * 4), selected: toolState.eraserSizeIndex == idx) {
-                            toolState.eraserSizeIndex = idx
-                            Haptics.selection()
-                        }
-                    }
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                HStack(spacing: 5) {
+                    eraserThicknessCircles
                 }
             }
 
@@ -610,98 +741,24 @@ struct NotebookScreen: View {
 
         case .text:
             HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    ForEach(0..<toolState.textColors.count, id: \.self) { idx in
-                        colorSwatch(hex: toolState.textColors[idx], selected: toolState.textColorIndex == idx) {
-                            if toolState.textColorIndex == idx {
-                                activePopover = .text
-                            } else {
-                                toolState.textColorIndex = idx
-                                controllerBox.vc?.updateActiveTextBoxStyle()
-                                Haptics.selection()
-                            }
-                        }
-                    }
+                HStack(spacing: 6) {
+                    textColorSwatches
+                    addColorButton(for: .text)
                 }
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-
-                HStack(spacing: 5) {
-                    Button {
-                        toolState.textSize = max(8, toolState.textSize - 2)
-                        controllerBox.vc?.updateActiveTextBoxStyle()
-                        Haptics.selection()
-                    } label: {
-                        Image(systemName: "minus")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundColor(.primary.opacity(0.8))
-                            .frame(width: 24, height: 26)
-                            .background(Color.primary.opacity(0.06))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        activePopover = .text
-                    } label: {
-                        Text("\(Int(toolState.textSize))pt")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundColor(.primary)
-                            .frame(minWidth: 38)
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        toolState.textSize = min(72, toolState.textSize + 2)
-                        controllerBox.vc?.updateActiveTextBoxStyle()
-                        Haptics.selection()
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundColor(.primary.opacity(0.8))
-                            .frame(width: 24, height: 26)
-                            .background(Color.primary.opacity(0.06))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-
-                Button {
-                    toolState.textBold.toggle()
-                    controllerBox.vc?.updateActiveTextBoxStyle()
-                    Haptics.selection()
-                } label: {
-                    Text("B")
-                        .font(.system(size: 14, weight: .bold, design: .serif))
-                        .foregroundColor(toolState.textBold ? .white : .primary.opacity(0.8))
-                        .frame(width: 28, height: 28)
-                        .background(toolState.textBold ? Color.accentColor : Color.primary.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                }
-                .buttonStyle(.plain)
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                textSizeStepperHorizontal
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                textBoldButton
             }
 
         case .laser:
             HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    ForEach(toolState.laserColors, id: \.self) { hex in
-                        colorSwatch(hex: hex, selected: toolState.laserColorHex == hex) {
-                            toolState.laserColorHex = hex
-                            Haptics.selection()
-                        }
-                    }
+                HStack(spacing: 6) {
+                    laserColorSwatches
+                    addColorButton(for: .laser)
                 }
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 20)
-                Picker("Laser", selection: $toolState.laserTrail) {
+                Rectangle().fill(hairlineColor).frame(width: 1, height: 20)
+                Picker("Laser", selection: $palette.laserTrail) {
                     Text("Dot").tag(false)
                     Text("Trail").tag(true)
                 }
@@ -709,6 +766,593 @@ struct NotebookScreen: View {
                 .frame(width: 112)
             }
         }
+    }
+
+    @ViewBuilder
+    private var contextualSlotsVertical: some View {
+        switch toolState.tool {
+        case .hand:
+            EmptyView()
+
+        case .pen:
+            VStack(spacing: 8) {
+                VStack(spacing: 6) {
+                    penColorSwatches
+                    addColorButton(for: .pen)
+                }
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                VStack(spacing: 5) {
+                    penThicknessCircles
+                }
+            }
+
+        case .highlighter:
+            VStack(spacing: 8) {
+                VStack(spacing: 6) {
+                    hlColorSwatches
+                    addColorButton(for: .highlighter)
+                }
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                VStack(spacing: 5) {
+                    hlThicknessCircles
+                }
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                straightHighlighterToggleButton
+            }
+
+        case .eraser:
+            VStack(spacing: 8) {
+                Button {
+                    palette.eraserMode = (palette.eraserMode == .stroke) ? .pixel : .stroke
+                    Haptics.selection()
+                    toolState.showToast("Eraser: \(palette.eraserMode.title)")
+                } label: {
+                    Text(palette.eraserMode == .stroke ? "Str" : "Pxl")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.accentColor)
+                        .frame(width: 34, height: 26)
+                        .background(Color.accentColor.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                VStack(spacing: 5) {
+                    eraserThicknessCircles
+                }
+            }
+
+        case .lasso:
+            Image(systemName: "hand.draw")
+                .font(.system(size: 15))
+                .foregroundColor(.secondary)
+
+        case .text:
+            VStack(spacing: 8) {
+                VStack(spacing: 6) {
+                    textColorSwatches
+                    addColorButton(for: .text)
+                }
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                Button {
+                    activePopover = .text
+                } label: {
+                    Text("\(Int(palette.textSize))")
+                        .font(.system(size: 12, weight: .bold))
+                        .monospacedDigit()
+                        .foregroundColor(.primary)
+                        .frame(width: 32, height: 26)
+                        .background(Color.primary.opacity(0.07))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                textBoldButton
+            }
+
+        case .laser:
+            VStack(spacing: 8) {
+                VStack(spacing: 6) {
+                    laserColorSwatches
+                    addColorButton(for: .laser)
+                }
+                Rectangle().fill(hairlineColor).frame(width: 24, height: 1)
+                Button {
+                    palette.laserTrail.toggle()
+                    Haptics.selection()
+                } label: {
+                    Text(palette.laserTrail ? "Trl" : "Dot")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(palette.laserTrail ? .white : .primary)
+                        .frame(width: 34, height: 26)
+                        .background(palette.laserTrail ? Color.red : Color.primary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    // MARK: - Dynamic Color Swatch Loops (Tap Unselected -> Pick, Tap Selected -> Edit / Remove)
+
+    private var penColorSwatches: some View {
+        ForEach(Array(palette.penColors.enumerated()), id: \.offset) { idx, hex in
+            colorSwatch(hex: hex, selected: palette.penColorIndex == idx) {
+                if palette.penColorIndex == idx {
+                    activePopover = .editColor(tool: .pen, index: idx)
+                } else {
+                    palette.penColorIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editColor(tool: .pen, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                editColorPopover(tool: .pen, index: idx)
+            }
+        }
+    }
+
+    private var hlColorSwatches: some View {
+        ForEach(Array(palette.hlColors.enumerated()), id: \.offset) { idx, hex in
+            colorSwatch(hex: hex, selected: palette.hlColorIndex == idx) {
+                if palette.hlColorIndex == idx {
+                    activePopover = .editColor(tool: .highlighter, index: idx)
+                } else {
+                    palette.hlColorIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editColor(tool: .highlighter, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                editColorPopover(tool: .highlighter, index: idx)
+            }
+        }
+    }
+
+    private var textColorSwatches: some View {
+        ForEach(Array(palette.textColors.enumerated()), id: \.offset) { idx, hex in
+            colorSwatch(hex: hex, selected: palette.textColorIndex == idx) {
+                if palette.textColorIndex == idx {
+                    activePopover = .editColor(tool: .text, index: idx)
+                } else {
+                    palette.textColorIndex = idx
+                    controllerBox.vc?.updateActiveTextBoxStyle()
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editColor(tool: .text, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                editColorPopover(tool: .text, index: idx)
+            }
+        }
+    }
+
+    private var laserColorSwatches: some View {
+        ForEach(Array(palette.laserColors.enumerated()), id: \.offset) { idx, hex in
+            colorSwatch(hex: hex, selected: palette.laserColorIndex == idx) {
+                if palette.laserColorIndex == idx {
+                    activePopover = .editColor(tool: .laser, index: idx)
+                } else {
+                    palette.laserColorIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editColor(tool: .laser, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                editColorPopover(tool: .laser, index: idx)
+            }
+        }
+    }
+
+    private func addColorButton(for tool: DrawingTool) -> some View {
+        Button {
+            addColorDraft = (tool == .highlighter)
+                ? Color(UIColor(hex: "#74c7ff"))
+                : Color(UIColor(hex: "#af52de"))
+            activePopover = .addColor(tool: tool)
+            Haptics.selection()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(.primary.opacity(0.72))
+                .frame(width: 24, height: 24)
+                .background(Color.primary.opacity(0.08))
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.7))
+        }
+        .buttonStyle(.plain)
+        .frame(width: 28, height: 28)
+        .popover(isPresented: Binding(
+            get: { activePopover == .addColor(tool: tool) },
+            set: { if !$0 { activePopover = nil } }
+        )) {
+            addColorPopover(for: tool)
+        }
+    }
+
+    // MARK: - Goodnotes 3-Circle Thickness Buttons (Tap Selected -> Customize Exact pt!)
+
+    private var penThicknessCircles: some View {
+        ForEach(0..<3, id: \.self) { idx in
+            let pt = palette.penSizes[idx]
+            let diameter = circleDiameter(value: pt, minVal: 0.6, maxVal: 12.0)
+            GoodnotesThicknessCircleButton(
+                diameter: diameter,
+                selected: palette.penSizeIndex == idx,
+                fillColor: Color(UIColor(hex: palette.activePenColorHex))
+            ) {
+                if palette.penSizeIndex == idx {
+                    activePopover = .editThickness(tool: .pen, index: idx)
+                } else {
+                    palette.penSizeIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editThickness(tool: .pen, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                thicknessSlotPopover(tool: .pen, index: idx)
+            }
+        }
+    }
+
+    private var hlThicknessCircles: some View {
+        ForEach(0..<3, id: \.self) { idx in
+            let pt = palette.hlSizes[idx]
+            let diameter = circleDiameter(value: pt, minVal: 6.0, maxVal: 44.0)
+            GoodnotesThicknessCircleButton(
+                diameter: diameter,
+                selected: palette.hlSizeIndex == idx,
+                fillColor: Color(UIColor(hex: palette.activeHlColorHex))
+            ) {
+                if palette.hlSizeIndex == idx {
+                    activePopover = .editThickness(tool: .highlighter, index: idx)
+                } else {
+                    palette.hlSizeIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editThickness(tool: .highlighter, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                thicknessSlotPopover(tool: .highlighter, index: idx)
+            }
+        }
+    }
+
+    private var eraserThicknessCircles: some View {
+        ForEach(0..<3, id: \.self) { idx in
+            let pt = palette.eraserSizes[idx]
+            let diameter = circleDiameter(value: pt, minVal: 6.0, maxVal: 64.0)
+            GoodnotesThicknessCircleButton(
+                diameter: diameter,
+                selected: palette.eraserSizeIndex == idx,
+                fillColor: Color.primary.opacity(0.75)
+            ) {
+                if palette.eraserSizeIndex == idx {
+                    activePopover = .editThickness(tool: .eraser, index: idx)
+                } else {
+                    palette.eraserSizeIndex = idx
+                    Haptics.selection()
+                }
+            }
+            .popover(isPresented: Binding(
+                get: { activePopover == .editThickness(tool: .eraser, index: idx) },
+                set: { if !$0 { activePopover = nil } }
+            )) {
+                thicknessSlotPopover(tool: .eraser, index: idx)
+            }
+        }
+    }
+
+    private func circleDiameter(value: Double, minVal: Double, maxVal: Double) -> CGFloat {
+        let clamped = max(minVal, min(maxVal, value))
+        let frac = (clamped - minVal) / max(0.001, maxVal - minVal)
+        return CGFloat(5.5 + frac * 12.5)
+    }
+
+    private var straightHighlighterToggleButton: some View {
+        Button {
+            palette.hlStraight.toggle()
+            Haptics.selection()
+            toolState.showToast(palette.hlStraight ? "Straight Highlighter ON" : "Freehand Highlighter")
+        } label: {
+            Image(systemName: "ruler")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(palette.hlStraight ? .white : .primary.opacity(0.78))
+                .frame(width: 30, height: 30)
+                .background(palette.hlStraight ? Color.accentColor : Color.primary.opacity(0.06))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var textSizeStepperHorizontal: some View {
+        HStack(spacing: 5) {
+            Button {
+                palette.textSize = max(8, palette.textSize - 2)
+                controllerBox.vc?.updateActiveTextBoxStyle()
+                Haptics.selection()
+            } label: {
+                Image(systemName: "minus")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.primary.opacity(0.8))
+                    .frame(width: 24, height: 26)
+                    .background(Color.primary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                activePopover = .text
+            } label: {
+                Text("\(Int(palette.textSize))pt")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundColor(.primary)
+                    .frame(minWidth: 38)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                palette.textSize = min(72, palette.textSize + 2)
+                controllerBox.vc?.updateActiveTextBoxStyle()
+                Haptics.selection()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.primary.opacity(0.8))
+                    .frame(width: 24, height: 26)
+                    .background(Color.primary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var textBoldButton: some View {
+        Button {
+            palette.textBold.toggle()
+            controllerBox.vc?.updateActiveTextBoxStyle()
+            Haptics.selection()
+        } label: {
+            Text("B")
+                .font(.system(size: 14, weight: .bold, design: .serif))
+                .foregroundColor(palette.textBold ? .white : .primary.opacity(0.8))
+                .frame(width: 28, height: 28)
+                .background(palette.textBold ? Color.accentColor : Color.primary.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Edit Color, Add Color, & Thickness Customizer Popovers
+
+    private func colorBinding(for tool: DrawingTool, index: Int) -> Binding<Color> {
+        Binding(
+            get: {
+                let hex: String
+                switch tool {
+                case .pen: hex = palette.penColors.indices.contains(index) ? palette.penColors[index] : "#1c1c1e"
+                case .highlighter: hex = palette.hlColors.indices.contains(index) ? palette.hlColors[index] : "#ffde59"
+                case .text: hex = palette.textColors.indices.contains(index) ? palette.textColors[index] : "#1c1c1e"
+                case .laser: hex = palette.laserColors.indices.contains(index) ? palette.laserColors[index] : "#ff3b30"
+                default: hex = "#1c1c1e"
+                }
+                return Color(UIColor(hex: hex))
+            },
+            set: { newCol in
+                let hex = UIColor(newCol).toHexString()
+                switch tool {
+                case .pen:
+                    if palette.penColors.indices.contains(index) { palette.penColors[index] = hex }
+                case .highlighter:
+                    if palette.hlColors.indices.contains(index) { palette.hlColors[index] = hex }
+                case .text:
+                    if palette.textColors.indices.contains(index) {
+                        palette.textColors[index] = hex
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                    }
+                case .laser:
+                    if palette.laserColors.indices.contains(index) { palette.laserColors[index] = hex }
+                default: break
+                }
+            }
+        )
+    }
+
+    private func editColorPopover(tool: DrawingTool, index: Int) -> some View {
+        let presets = (tool == .highlighter) ? palette.quickHighlighterPresets : palette.quickInkPresets
+        let canRemove: Bool = {
+            switch tool {
+            case .pen: return palette.penColors.count > 1
+            case .highlighter: return palette.hlColors.count > 1
+            case .text: return palette.textColors.count > 1
+            case .laser: return palette.laserColors.count > 1
+            default: return false
+            }
+        }()
+
+        return VStack(alignment: .leading, spacing: 14) {
+            Text("Edit Color Slot").font(.headline)
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 6), spacing: 10) {
+                ForEach(presets, id: \.self) { hex in
+                    Button {
+                        colorBinding(for: tool, index: index).wrappedValue = Color(UIColor(hex: hex))
+                        Haptics.selection()
+                    } label: {
+                        Circle()
+                            .fill(Color(UIColor(hex: hex)))
+                            .frame(width: 28, height: 28)
+                            .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 0.8))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            ColorPicker("Custom Color", selection: colorBinding(for: tool, index: index), supportsOpacity: false)
+                .font(.subheadline.weight(.medium))
+
+            if canRemove {
+                Divider()
+                Button(role: .destructive) {
+                    switch tool {
+                    case .pen: palette.removePenColor(at: index)
+                    case .highlighter: palette.removeHlColor(at: index)
+                    case .text:
+                        palette.removeTextColor(at: index)
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                    case .laser: palette.removeLaserColor(at: index)
+                    default: break
+                    }
+                    activePopover = nil
+                    Haptics.light()
+                } label: {
+                    Label("Remove Swatch", systemImage: "trash")
+                        .font(.subheadline.weight(.medium))
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 264)
+    }
+
+    private func addColorPopover(for tool: DrawingTool) -> some View {
+        let presets = (tool == .highlighter) ? palette.quickHighlighterPresets : palette.quickInkPresets
+
+        return VStack(alignment: .leading, spacing: 14) {
+            Text("Add Color to Palette").font(.headline)
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 6), spacing: 10) {
+                ForEach(presets, id: \.self) { hex in
+                    Button {
+                        addColorHex(hex, to: tool)
+                        activePopover = nil
+                        Haptics.selection()
+                    } label: {
+                        Circle()
+                            .fill(Color(UIColor(hex: hex)))
+                            .frame(width: 28, height: 28)
+                            .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 0.8))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Divider()
+
+            ColorPicker("Pick Custom Color", selection: $addColorDraft, supportsOpacity: false)
+                .font(.subheadline.weight(.medium))
+
+            Button {
+                let hex = UIColor(addColorDraft).toHexString()
+                addColorHex(hex, to: tool)
+                activePopover = nil
+                Haptics.selection()
+            } label: {
+                Text("Add Color")
+                    .font(.subheadline.bold())
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(16)
+        .frame(width: 264)
+    }
+
+    private func addColorHex(_ hex: String, to tool: DrawingTool) {
+        switch tool {
+        case .pen: palette.addPenColor(hex)
+        case .highlighter: palette.addHlColor(hex)
+        case .text:
+            palette.addTextColor(hex)
+            controllerBox.vc?.updateActiveTextBoxStyle()
+        case .laser: palette.addLaserColor(hex)
+        default: break
+        }
+    }
+
+    private func thicknessSlotPopover(tool: DrawingTool, index: Int) -> some View {
+        let isPen = (tool == .pen)
+        let isHL = (tool == .highlighter)
+        let minVal: Double = isPen ? 0.5 : 6.0
+        let maxVal: Double = isPen ? 12.0 : (isHL ? 44.0 : 64.0)
+        let stepVal: Double = isPen ? 0.1 : 1.0
+        let presets: [Double] = isPen ? [0.8, 1.4, 2.6, 4.5, 7.0] : (isHL ? [10, 16, 22, 30, 38] : [10, 18, 28, 42, 56])
+        let slotTitle = ["Slot 1 (Fine)", "Slot 2 (Medium)", "Slot 3 (Thick)"][max(0, min(2, index))]
+
+        let valBinding = Binding<Double>(
+            get: {
+                if isPen { return palette.penSizes[index] }
+                if isHL { return palette.hlSizes[index] }
+                return palette.eraserSizes[index]
+            },
+            set: { v in
+                if isPen { palette.penSizes[index] = (v * 10).rounded() / 10 }
+                else if isHL { palette.hlSizes[index] = v.rounded() }
+                else { palette.eraserSizes[index] = v.rounded() }
+            }
+        )
+
+        let previewColor: Color = isPen
+            ? Color(UIColor(hex: palette.activePenColorHex))
+            : (isHL ? Color(UIColor(hex: palette.activeHlColorHex)) : .primary)
+
+        let curVal = valBinding.wrappedValue
+        let previewDiam = max(5, min(32, CGFloat(isPen ? curVal * 2.5 : curVal * 0.55)))
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(slotTitle).font(.headline)
+                Spacer()
+                Text(isPen ? String(format: "%.1f pt", curVal) : String(format: "%.0f pt", curVal))
+                    .font(.subheadline.bold())
+                    .monospacedDigit()
+                    .foregroundColor(.accentColor)
+            }
+
+            HStack {
+                Spacer()
+                Circle()
+                    .fill(previewColor)
+                    .frame(width: previewDiam, height: previewDiam)
+                    .overlay(Circle().stroke(Color.primary.opacity(0.14), lineWidth: 0.7))
+                Spacer()
+            }
+            .frame(height: 36)
+
+            Slider(value: valBinding, in: minVal...maxVal, step: stepVal)
+
+            HStack(spacing: 6) {
+                ForEach(presets, id: \.self) { p in
+                    Button {
+                        valBinding.wrappedValue = p
+                        Haptics.selection()
+                    } label: {
+                        Text(isPen ? String(format: "%.1f", p) : "\(Int(p))")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundColor(.primary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color.primary.opacity(0.08))
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 268)
     }
 
     // MARK: - Hobonichi Two-Ribbon Strip
@@ -766,11 +1410,11 @@ struct NotebookScreen: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Goodnotes Floating Lasso Action Pill
+    // MARK: - Floating Lasso & Text Box Action Pills
 
     private var lassoActionBar: some View {
         HStack(spacing: 8) {
-            ForEach(toolState.penColors, id: \.self) { hex in
+            ForEach(Array(palette.penColors.prefix(6)), id: \.self) { hex in
                 Button {
                     controllerBox.vc?.lassoRecolor(hex: hex)
                     Haptics.selection()
@@ -819,8 +1463,6 @@ struct NotebookScreen: View {
         .buttonStyle(.plain)
     }
 
-
-    // Floating Action Pill while typing/editing a Text Box
     private var textBoxActionBar: some View {
         HStack(spacing: 8) {
             Text("Drag top bar to move · Drag edge dot to resize")
@@ -852,19 +1494,21 @@ struct NotebookScreen: View {
         .shadow(color: .black.opacity(0.20), radius: 10, y: 4)
     }
 
+    // MARK: - Tool Settings Popovers
+
     private var textSettingsPopover: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Text Box Style").font(.headline)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Font").font(.caption.bold()).foregroundColor(.secondary)
-                Picker("Font", selection: $toolState.textFont) {
+                Picker("Font", selection: $palette.textFont) {
                     ForEach(TextFontOption.allCases) { f in
                         Text(f.title).tag(f)
                     }
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: toolState.textFont) { _ in
+                .onChange(of: palette.textFont) { _ in
                     controllerBox.vc?.updateActiveTextBoxStyle()
                 }
             }
@@ -873,42 +1517,29 @@ struct NotebookScreen: View {
                 HStack {
                     Text("Font Size").font(.caption.bold()).foregroundColor(.secondary)
                     Spacer()
-                    Text("\(Int(toolState.textSize)) pt")
+                    Text("\(Int(palette.textSize)) pt")
                         .font(.caption.bold())
                         .foregroundColor(.accentColor)
                 }
-                Slider(value: $toolState.textSize, in: 8...72, step: 1)
-                    .onChange(of: toolState.textSize) { _ in
+                Slider(value: $palette.textSize, in: 8...72, step: 1)
+                    .onChange(of: palette.textSize) { _ in
                         controllerBox.vc?.updateActiveTextBoxStyle()
                     }
             }
 
-            Toggle("Bold Text", isOn: $toolState.textBold)
+            Toggle("Bold Text", isOn: $palette.textBold)
                 .font(.subheadline.weight(.medium))
-                .onChange(of: toolState.textBold) { _ in
+                .onChange(of: palette.textBold) { _ in
                     controllerBox.vc?.updateActiveTextBoxStyle()
                 }
-
-            ColorPicker(
-                "Text Color",
-                selection: Binding(
-                    get: { Color(UIColor(hex: toolState.activeTextColorHex)) },
-                    set: {
-                        toolState.textColors[toolState.textColorIndex] = UIColor($0).toHexString()
-                        controllerBox.vc?.updateActiveTextBoxStyle()
-                    }
-                ),
-                supportsOpacity: false
-            )
-            .font(.subheadline.weight(.medium))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Box Background").font(.caption.bold()).foregroundColor(.secondary)
                 HStack(spacing: 8) {
-                    ForEach(toolState.textBgPresets, id: \.hex) { preset in
-                        let selected = (toolState.textBgHex == preset.hex)
+                    ForEach(palette.textBgPresets, id: \.hex) { preset in
+                        let selected = (palette.textBgHex == preset.hex)
                         Button {
-                            toolState.textBgHex = preset.hex
+                            palette.textBgHex = preset.hex
                             controllerBox.vc?.updateActiveTextBoxStyle()
                             Haptics.selection()
                         } label: {
@@ -933,13 +1564,11 @@ struct NotebookScreen: View {
         .frame(width: 300)
     }
 
-    // MARK: - Tool Settings Popovers (Goodnotes Style)
-
     private var penSettingsPopover: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Pen Style").font(.headline)
 
-            Picker("Pen Style", selection: $toolState.penStyle) {
+            Picker("Pen Style", selection: $palette.penStyle) {
                 ForEach(PenStyleOption.allCases) { style in
                     Text(style.title).tag(style)
                 }
@@ -950,10 +1579,10 @@ struct NotebookScreen: View {
                 HStack {
                     Text("Stabilization").font(.caption.bold()).foregroundColor(.secondary)
                     Spacer()
-                    Text(toolState.penSmooth == 0 ? "Off" : "Level \(toolState.penSmooth)")
+                    Text(palette.penSmooth == 0 ? "Off" : "Level \(palette.penSmooth)")
                         .font(.caption.bold()).foregroundColor(.accentColor)
                 }
-                Picker("Stabilization", selection: $toolState.penSmooth) {
+                Picker("Stabilization", selection: $palette.penSmooth) {
                     ForEach(0...5, id: \.self) { lvl in
                         Text(lvl == 0 ? "Off" : "\(lvl)").tag(lvl)
                     }
@@ -961,35 +1590,12 @@ struct NotebookScreen: View {
                 .pickerStyle(.segmented)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Stroke Thickness").font(.caption.bold()).foregroundColor(.secondary)
-                    Spacer()
-                    Text(String(format: "%.1f pt", toolState.activePenSize))
-                        .font(.caption.bold()).foregroundColor(.accentColor)
-                }
-                Slider(
-                    value: Binding(
-                        get: { toolState.activePenSize },
-                        set: { toolState.penSizes[toolState.penSizeIndex] = ($0 * 10).rounded() / 10 }
-                    ),
-                    in: 0.6...12.0,
-                    step: 0.2
-                )
-            }
-
-            ColorPicker(
-                "Custom Color",
-                selection: Binding(
-                    get: { Color(UIColor(hex: toolState.activePenColorHex)) },
-                    set: { toolState.penColors[toolState.penColorIndex] = UIColor($0).toHexString() }
-                ),
-                supportsOpacity: false
-            )
-            .font(.subheadline.weight(.medium))
-
-            Toggle("Draw and Hold for Shapes", isOn: $toolState.holdToShape)
+            Toggle("Draw and Hold for Shapes", isOn: $palette.holdToShape)
                 .font(.subheadline.weight(.medium))
+
+            Text("Tip: Tap a selected color or thickness circle on the toolbar to customize it.")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
         .padding(18)
         .frame(width: 300)
@@ -998,35 +1604,11 @@ struct NotebookScreen: View {
     private var highlighterSettingsPopover: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Highlighter").font(.headline)
-            Toggle("Draw in Straight Line", isOn: $toolState.hlStraight)
+            Toggle("Draw in Straight Line", isOn: $palette.hlStraight)
                 .font(.subheadline.weight(.medium))
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Width").font(.caption.bold()).foregroundColor(.secondary)
-                    Spacer()
-                    Text(String(format: "%.0f pt", toolState.activeHlSize))
-                        .font(.caption.bold()).foregroundColor(.accentColor)
-                }
-                Slider(
-                    value: Binding(
-                        get: { toolState.activeHlSize },
-                        set: { toolState.hlSizes[toolState.hlSizeIndex] = $0.rounded() }
-                    ),
-                    in: 6.0...44.0,
-                    step: 1.0
-                )
-            }
-
-            ColorPicker(
-                "Custom Color",
-                selection: Binding(
-                    get: { Color(UIColor(hex: toolState.activeHlColorHex)) },
-                    set: { toolState.hlColors[toolState.hlColorIndex] = UIColor($0).toHexString() }
-                ),
-                supportsOpacity: false
-            )
-            .font(.subheadline.weight(.medium))
+            Text("Tip: Tap a selected color or thickness circle on the toolbar to customize it.")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
         .padding(18)
         .frame(width: 280)
@@ -1036,32 +1618,15 @@ struct NotebookScreen: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Eraser").font(.headline)
 
-            Picker("Eraser Mode", selection: $toolState.eraserMode) {
+            Picker("Eraser Mode", selection: $palette.eraserMode) {
                 ForEach(EraserModeOption.allCases) { m in
                     Text(m.title).tag(m)
                 }
             }
             .pickerStyle(.segmented)
 
-            Toggle("Erase Highlighter Only", isOn: $toolState.eraseHlOnly)
+            Toggle("Erase Highlighter Only", isOn: $palette.eraseHlOnly)
                 .font(.subheadline.weight(.medium))
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Size").font(.caption.bold()).foregroundColor(.secondary)
-                    Spacer()
-                    Text(String(format: "%.0f pt", toolState.eraserSizes[toolState.eraserSizeIndex]))
-                        .font(.caption.bold()).foregroundColor(.accentColor)
-                }
-                Slider(
-                    value: Binding(
-                        get: { toolState.eraserSizes[toolState.eraserSizeIndex] },
-                        set: { toolState.eraserSizes[toolState.eraserSizeIndex] = $0.rounded() }
-                    ),
-                    in: 6.0...64.0,
-                    step: 2.0
-                )
-            }
         }
         .padding(18)
         .frame(width: 280)
@@ -1070,19 +1635,11 @@ struct NotebookScreen: View {
     private var laserSettingsPopover: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Laser Pointer").font(.headline)
-            Picker("Mode", selection: $toolState.laserTrail) {
+            Picker("Mode", selection: $palette.laserTrail) {
                 Text("Dot").tag(false)
                 Text("Trail").tag(true)
             }
             .pickerStyle(.segmented)
-
-            HStack(spacing: 12) {
-                ForEach(toolState.laserColors, id: \.self) { hex in
-                    colorSwatch(hex: hex, selected: toolState.laserColorHex == hex) {
-                        toolState.laserColorHex = hex
-                    }
-                }
-            }
         }
         .padding(18)
         .frame(width: 240)
@@ -1164,7 +1721,7 @@ struct NotebookScreen: View {
                     .frame(width: 22, height: 22)
                     .overlay(
                         Circle()
-                            .stroke(Color.primary.opacity(0.16), lineWidth: 0.7)
+                            .stroke(Color.primary.opacity(0.18), lineWidth: 0.7)
                     )
                 if selected {
                     Circle()
@@ -1176,45 +1733,51 @@ struct NotebookScreen: View {
         }
         .buttonStyle(.plain)
     }
-
-    private func eraserSizeButton(diameter: CGFloat, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            ZStack {
-                Circle()
-                    .fill(selected ? Color.accentColor.opacity(0.16) : Color.clear)
-                    .frame(width: 30, height: 30)
-                Circle()
-                    .fill(selected ? Color.accentColor : Color.primary.opacity(0.65))
-                    .frame(width: diameter, height: diameter)
-            }
-        }
-        .buttonStyle(.plain)
-    }
 }
 
-/// Iconic Goodnotes diagonal stroke-weight icon (thin / medium / thick)
-private struct GoodnotesStrokeWeightButton: View {
-    let thickness: CGFloat
+/// Clean Goodnotes-style proportional solid circle thickness button!
+private struct GoodnotesThicknessCircleButton: View {
+    let diameter: CGFloat
     let selected: Bool
+    let fillColor: Color
     let action: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Button(action: action) {
             ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                Circle()
                     .fill(selected ? Color.accentColor.opacity(0.16) : Color.clear)
                     .frame(width: 30, height: 30)
-                Capsule()
-                    .fill(selected ? Color.accentColor : Color.primary.opacity(0.75))
-                    .frame(width: 15, height: thickness)
-                    .rotationEffect(.degrees(-45))
+                if selected {
+                    Circle()
+                        .stroke(Color.accentColor.opacity(0.75), lineWidth: 1.5)
+                        .frame(width: 30, height: 30)
+                }
+                Circle()
+                    .fill(selected ? Color.accentColor : (colorScheme == .dark ? Color.white.opacity(0.84) : Color(white: 0.22)))
+                    .frame(width: diameter, height: diameter)
             }
+            .frame(width: 32, height: 32)
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
     }
 }
 
-// MARK: - Crisp Goodnotes-Style Adaptive Tool Icons (Light & Dark Mode)
+// MARK: - Crisp Goodnotes-Style Adaptive Tool Icons
+
+private struct GoodnotesHandIcon: View {
+    let isActive: Bool
+    let isDark: Bool
+
+    var body: some View {
+        Image(systemName: isActive ? "hand.raised.fill" : "hand.raised")
+            .font(.system(size: 16.5, weight: .regular))
+            .foregroundColor(isActive ? (isDark ? .white : .blue) : (isDark ? .white.opacity(0.86) : Color(white: 0.22)))
+    }
+}
 
 private struct GoodnotesPenIcon: View {
     let inkColor: Color
@@ -1340,6 +1903,38 @@ private struct GoodnotesLassoIcon: View {
     }
 }
 
+private struct GoodnotesTextIcon: View {
+    let isActive: Bool
+    let isDark: Bool
+
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width, h = size.height
+            let stroke: Color = isActive ? (isDark ? .white : .blue) : (isDark ? .white.opacity(0.86) : Color(white: 0.22))
+
+            let boxRect = CGRect(x: w * 0.12, y: h * 0.14, width: w * 0.76, height: h * 0.72)
+            let boxPath = Path(roundedRect: boxRect, cornerRadius: 3.5)
+            ctx.stroke(boxPath, with: .color(stroke.opacity(0.82)), style: StrokeStyle(lineWidth: 1.35, lineCap: .round, dash: [3.0, 2.2]))
+
+            var tTop = Path()
+            tTop.move(to: CGPoint(x: w * 0.32, y: h * 0.34))
+            tTop.addLine(to: CGPoint(x: w * 0.68, y: h * 0.34))
+            ctx.stroke(tTop, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
+
+            var tStem = Path()
+            tStem.move(to: CGPoint(x: w * 0.50, y: h * 0.34))
+            tStem.addLine(to: CGPoint(x: w * 0.50, y: h * 0.70))
+            ctx.stroke(tStem, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
+
+            var tBase = Path()
+            tBase.move(to: CGPoint(x: w * 0.42, y: h * 0.70))
+            tBase.addLine(to: CGPoint(x: w * 0.58, y: h * 0.70))
+            ctx.stroke(tBase, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+        }
+        .frame(width: 22, height: 22)
+    }
+}
+
 private struct GoodnotesLaserIcon: View {
     let laserColor: Color
     let isActive: Bool
@@ -1366,41 +1961,6 @@ private struct GoodnotesLaserIcon: View {
             let coreR: CGFloat = 2.8
             let core = Path(ellipseIn: CGRect(x: cx - coreR, y: cy - coreR, width: coreR * 2, height: coreR * 2))
             ctx.fill(core, with: .color(dot))
-        }
-        .frame(width: 22, height: 22)
-    }
-}
-
-
-private struct GoodnotesTextIcon: View {
-    let isActive: Bool
-    let isDark: Bool
-
-    var body: some View {
-        Canvas { ctx, size in
-            let w = size.width, h = size.height
-            let stroke: Color = isActive ? (isDark ? .white : .blue) : (isDark ? .white.opacity(0.86) : Color(white: 0.22))
-
-            // Dashed square text-box outline (classic Goodnotes Text Tool icon!)
-            let boxRect = CGRect(x: w * 0.12, y: h * 0.14, width: w * 0.76, height: h * 0.72)
-            let boxPath = Path(roundedRect: boxRect, cornerRadius: 3.5)
-            ctx.stroke(boxPath, with: .color(stroke.opacity(0.82)), style: StrokeStyle(lineWidth: 1.35, lineCap: .round, dash: [3.0, 2.2]))
-
-            // Crisp serif-like T in the center
-            var tTop = Path()
-            tTop.move(to: CGPoint(x: w * 0.32, y: h * 0.34))
-            tTop.addLine(to: CGPoint(x: w * 0.68, y: h * 0.34))
-            ctx.stroke(tTop, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
-
-            var tStem = Path()
-            tStem.move(to: CGPoint(x: w * 0.50, y: h * 0.34))
-            tStem.addLine(to: CGPoint(x: w * 0.50, y: h * 0.70))
-            ctx.stroke(tStem, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
-
-            var tBase = Path()
-            tBase.move(to: CGPoint(x: w * 0.42, y: h * 0.70))
-            tBase.addLine(to: CGPoint(x: w * 0.58, y: h * 0.70))
-            ctx.stroke(tBase, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
         }
         .frame(width: 22, height: 22)
     }

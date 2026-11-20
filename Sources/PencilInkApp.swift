@@ -6,6 +6,7 @@ struct PencilInkApp: App {
     @StateObject private var syncManager = DriveSyncManager()
     @StateObject private var tabManager = TabManager()
     @StateObject private var settings = AppSettings.shared
+    @StateObject private var palette = ToolPaletteStore.shared
 
     var body: some Scene {
         WindowGroup {
@@ -14,6 +15,7 @@ struct PencilInkApp: App {
                 .environmentObject(syncManager)
                 .environmentObject(tabManager)
                 .environmentObject(settings)
+                .environmentObject(palette)
                 .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
     }

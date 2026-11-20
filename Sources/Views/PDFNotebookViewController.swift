@@ -17,13 +17,40 @@ struct PDFSearchHit: Identifiable, Hashable {
     let snippet: String
 }
 
-enum DrawingTool: String {
+enum DrawingTool: String, CaseIterable, Identifiable {
+    case hand
     case pen
-    case highlighter
     case eraser
+    case highlighter
     case lasso
     case text
     case laser
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .hand: return "Scroll / Hand Mode"
+        case .pen: return "Pen"
+        case .eraser: return "Eraser"
+        case .highlighter: return "Highlighter"
+        case .lasso: return "Lasso Select"
+        case .text: return "Text Box"
+        case .laser: return "Laser Pointer"
+        }
+    }
+
+    var settingsIcon: String {
+        switch self {
+        case .hand: return "hand.raised"
+        case .pen: return "pencil.tip"
+        case .eraser: return "eraser"
+        case .highlighter: return "highlighter"
+        case .lasso: return "lasso"
+        case .text: return "textbox"
+        case .laser: return "scope"
+        }
+    }
 }
 
 enum TextFontOption: String, CaseIterable, Identifiable {
@@ -66,45 +93,11 @@ enum EraserModeOption: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 final class NotebookToolState: ObservableObject {
     @Published var tool: DrawingTool = .pen
-    @Published var penStyle: PenStyleOption = .fountain { didSet { persist() } }
-    @Published var penSmooth: Int = 3 { didSet { persist() } }
-    @Published var penColors: [String] = ["#1c1c1e", "#007aff", "#ff3b30", "#30d158"] { didSet { persist() } }
-    @Published var penColorIndex: Int = 0 { didSet { persist() } }
-    @Published var penSizes: [Double] = [1.6, 2.8, 5.2] { didSet { persist() } }
-    @Published var penSizeIndex: Int = 1 { didSet { persist() } }
-    @Published var holdToShape: Bool = true { didSet { persist() } }
 
-    @Published var hlColors: [String] = ["#ffde59", "#69e6a6", "#ff94af"] { didSet { persist() } }
-    @Published var hlColorIndex: Int = 0 { didSet { persist() } }
-    @Published var hlSizes: [Double] = [12.0, 18.0, 28.0] { didSet { persist() } }
-    @Published var hlSizeIndex: Int = 1 { didSet { persist() } }
-    @Published var hlStraight: Bool = false { didSet { persist() } }
-
-    @Published var eraserMode: EraserModeOption = .stroke { didSet { persist() } }
-    @Published var eraserSizes: [Double] = [10.0, 20.0, 38.0] { didSet { persist() } }
-    @Published var eraserSizeIndex: Int = 1 { didSet { persist() } }
-    @Published var eraseHlOnly: Bool = false { didSet { persist() } }
-
-    @Published var textColors: [String] = ["#1c1c1e", "#007aff", "#ff3b30", "#2f855a"] { didSet { persist() } }
-    @Published var textColorIndex: Int = 0 { didSet { persist() } }
-    @Published var textSize: Double = 16.0 { didSet { persist() } }
-    @Published var textFont: TextFontOption = .sans { didSet { persist() } }
-    @Published var textBold: Bool = false { didSet { persist() } }
-    @Published var textBgHex: String = "" { didSet { persist() } }
-    let textBgPresets: [(name: String, hex: String)] = [
-        ("None", ""),
-        ("Cream", "#fff6d6"),
-        ("Sky", "#e6f2ff"),
-        ("Rose", "#fdeaf0")
-    ]
-
-    @Published var laserColorHex: String = "#ff3b30" { didSet { persist() } }
-    @Published var laserTrail: Bool = true { didSet { persist() } }
-    let laserColors: [String] = ["#ff3b30", "#0a84ff", "#30d158", "#ff9f0a"]
-
-    // Live UI State
+    // Live Per-Tab UI State
     @Published var canUndo: Bool = false
     @Published var canRedo: Bool = false
     @Published var currentPage: Int = 1
@@ -112,7 +105,7 @@ final class NotebookToolState: ObservableObject {
     @Published var saveStatus: String = "Saved"
     @Published var toastMessage: String = ""
 
-    // Lasso & Page Overview State
+    // Lasso, Text Box & Page Overview State
     @Published var hasLassoSelection: Bool = false
     @Published var lassoSelectedCount: Int = 0
     @Published var hasLassoClipboard: Bool = false
@@ -127,36 +120,53 @@ final class NotebookToolState: ObservableObject {
     var previousTool: DrawingTool = .pen
 
     private var toastWorkItem: DispatchWorkItem?
-    private var loadingPrefs = false
-    private let prefsKey = "pencilink.native.prefs.v2"
 
-    var activePenColorHex: String {
-        penColors[max(0, min(penColors.count - 1, penColorIndex))]
-    }
-    var activePenSize: Double {
-        penSizes[max(0, min(penSizes.count - 1, penSizeIndex))]
-    }
-    var activeHlColorHex: String {
-        hlColors[max(0, min(hlColors.count - 1, hlColorIndex))]
-    }
-    var activeHlSize: Double {
-        hlSizes[max(0, min(hlSizes.count - 1, hlSizeIndex))]
-    }
-    var activeEraserRadius: Double {
-        eraserSizes[max(0, min(eraserSizes.count - 1, eraserSizeIndex))] * 0.5
-    }
-    var activeTextColorHex: String {
-        textColors[max(0, min(textColors.count - 1, textColorIndex))]
-    }
+    // Shared Cross-File Palette Proxies (all tabs & future files share these seamlessly!)
+    var palette: ToolPaletteStore { ToolPaletteStore.shared }
+
+    var penStyle: PenStyleOption { get { palette.penStyle } set { palette.penStyle = newValue } }
+    var penSmooth: Int { get { palette.penSmooth } set { palette.penSmooth = newValue } }
+    var penColors: [String] { get { palette.penColors } set { palette.penColors = newValue } }
+    var penColorIndex: Int { get { palette.penColorIndex } set { palette.penColorIndex = newValue } }
+    var penSizes: [Double] { get { palette.penSizes } set { palette.penSizes = newValue } }
+    var penSizeIndex: Int { get { palette.penSizeIndex } set { palette.penSizeIndex = newValue } }
+    var holdToShape: Bool { get { palette.holdToShape } set { palette.holdToShape = newValue } }
+
+    var hlColors: [String] { get { palette.hlColors } set { palette.hlColors = newValue } }
+    var hlColorIndex: Int { get { palette.hlColorIndex } set { palette.hlColorIndex = newValue } }
+    var hlSizes: [Double] { get { palette.hlSizes } set { palette.hlSizes = newValue } }
+    var hlSizeIndex: Int { get { palette.hlSizeIndex } set { palette.hlSizeIndex = newValue } }
+    var hlStraight: Bool { get { palette.hlStraight } set { palette.hlStraight = newValue } }
+
+    var eraserMode: EraserModeOption { get { palette.eraserMode } set { palette.eraserMode = newValue } }
+    var eraserSizes: [Double] { get { palette.eraserSizes } set { palette.eraserSizes = newValue } }
+    var eraserSizeIndex: Int { get { palette.eraserSizeIndex } set { palette.eraserSizeIndex = newValue } }
+    var eraseHlOnly: Bool { get { palette.eraseHlOnly } set { palette.eraseHlOnly = newValue } }
+
+    var textColors: [String] { get { palette.textColors } set { palette.textColors = newValue } }
+    var textColorIndex: Int { get { palette.textColorIndex } set { palette.textColorIndex = newValue } }
+    var textSize: Double { get { palette.textSize } set { palette.textSize = newValue } }
+    var textFont: TextFontOption { get { palette.textFont } set { palette.textFont = newValue } }
+    var textBold: Bool { get { palette.textBold } set { palette.textBold = newValue } }
+    var textBgHex: String { get { palette.textBgHex } set { palette.textBgHex = newValue } }
+
+    var laserColorHex: String { palette.activeLaserColorHex }
+    var laserTrail: Bool { get { palette.laserTrail } set { palette.laserTrail = newValue } }
+
+    var activePenColorHex: String { palette.activePenColorHex }
+    var activePenSize: Double { palette.activePenSize }
+    var activeHlColorHex: String { palette.activeHlColorHex }
+    var activeHlSize: Double { palette.activeHlSize }
+    var activeEraserRadius: Double { palette.activeEraserRadius }
+    var activeTextColorHex: String { palette.activeTextColorHex }
+
     var isCurrentPageBookmarked: Bool {
         let idx = currentPage - 1
         guard idx >= 0 && idx < pageSlots.count else { return false }
         return bookmarkedKeys.contains(pageSlots[idx].key)
     }
 
-    init() {
-        loadPrefs()
-    }
+    init() {}
 
     func showToast(_ message: String) {
         DispatchQueue.main.async {
@@ -166,98 +176,7 @@ final class NotebookToolState: ObservableObject {
                 self?.toastMessage = ""
             }
             self.toastWorkItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
-        }
-    }
-
-    private struct SavedPrefs: Codable {
-        var penStyle: String
-        var penSmooth: Int
-        var penColors: [String]
-        var penColorIndex: Int
-        var penSizes: [Double]
-        var penSizeIndex: Int
-        var holdToShape: Bool
-        var hlColors: [String]
-        var hlColorIndex: Int
-        var hlSizes: [Double]
-        var hlSizeIndex: Int
-        var hlStraight: Bool
-        var eraserMode: String
-        var eraserSizes: [Double]
-        var eraserSizeIndex: Int
-        var eraseHlOnly: Bool
-        var laserColorHex: String
-        var laserTrail: Bool
-        var textColors: [String]?
-        var textColorIndex: Int?
-        var textSize: Double?
-        var textFont: String?
-        var textBold: Bool?
-        var textBgHex: String?
-    }
-
-    private func loadPrefs() {
-        guard let data = UserDefaults.standard.data(forKey: prefsKey),
-              let p = try? JSONDecoder().decode(SavedPrefs.self, from: data) else { return }
-        loadingPrefs = true
-        defer { loadingPrefs = false }
-        penStyle = PenStyleOption(rawValue: p.penStyle) ?? .fountain
-        penSmooth = max(0, min(5, p.penSmooth))
-        if p.penColors.count == 4 { penColors = p.penColors }
-        penColorIndex = max(0, min(penColors.count - 1, p.penColorIndex))
-        if p.penSizes.count == 3 { penSizes = p.penSizes }
-        penSizeIndex = max(0, min(penSizes.count - 1, p.penSizeIndex))
-        holdToShape = p.holdToShape
-        if p.hlColors.count == 3 { hlColors = p.hlColors }
-        hlColorIndex = max(0, min(hlColors.count - 1, p.hlColorIndex))
-        if p.hlSizes.count == 3 { hlSizes = p.hlSizes }
-        hlSizeIndex = max(0, min(hlSizes.count - 1, p.hlSizeIndex))
-        hlStraight = p.hlStraight
-        eraserMode = EraserModeOption(rawValue: p.eraserMode) ?? .stroke
-        if p.eraserSizes.count == 3 { eraserSizes = p.eraserSizes }
-        eraserSizeIndex = max(0, min(eraserSizes.count - 1, p.eraserSizeIndex))
-        eraseHlOnly = p.eraseHlOnly
-        laserColorHex = p.laserColorHex
-        laserTrail = p.laserTrail
-        if let tc = p.textColors, tc.count == 4 { textColors = tc }
-        if let tci = p.textColorIndex { textColorIndex = max(0, min(textColors.count - 1, tci)) }
-        if let ts = p.textSize { textSize = max(8, min(72, ts)) }
-        if let tf = p.textFont, let parsed = TextFontOption(rawValue: tf) { textFont = parsed }
-        if let tb = p.textBold { textBold = tb }
-        if let tbg = p.textBgHex { textBgHex = tbg }
-    }
-
-    private func persist() {
-        guard !loadingPrefs else { return }
-        let p = SavedPrefs(
-            penStyle: penStyle.rawValue,
-            penSmooth: penSmooth,
-            penColors: penColors,
-            penColorIndex: penColorIndex,
-            penSizes: penSizes,
-            penSizeIndex: penSizeIndex,
-            holdToShape: holdToShape,
-            hlColors: hlColors,
-            hlColorIndex: hlColorIndex,
-            hlSizes: hlSizes,
-            hlSizeIndex: hlSizeIndex,
-            hlStraight: hlStraight,
-            eraserMode: eraserMode.rawValue,
-            eraserSizes: eraserSizes,
-            eraserSizeIndex: eraserSizeIndex,
-            eraseHlOnly: eraseHlOnly,
-            laserColorHex: laserColorHex,
-            laserTrail: laserTrail,
-            textColors: textColors,
-            textColorIndex: textColorIndex,
-            textSize: textSize,
-            textFont: textFont.rawValue,
-            textBold: textBold,
-            textBgHex: textBgHex
-        )
-        if let data = try? JSONEncoder().encode(p) {
-            UserDefaults.standard.set(data, forKey: prefsKey)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: item)
         }
     }
 }
@@ -531,9 +450,12 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var redoStack: [UndoAction] = []
     private var saveWorkItem: DispatchWorkItem?
     private var isDirty = false
-    private var syncPollTimer: Timer?
+    private var idleCheckWorkItem: DispatchWorkItem?
+    private var lastBackgroundedAt: Date?
+    private var lastDriveSyncCheckAt: Date?
     private var pendingRemoteDoc: InkDocument?
     private var foregroundObserver: NSObjectProtocol?
+    private var activeObserver: NSObjectProtocol?
     private var resignActiveObserver: NSObjectProtocol?
     private var memoryWarningObserver: NSObjectProtocol?
     private var settingsCancellables = Set<AnyCancellable>()
@@ -570,8 +492,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     deinit {
         stopLaserLoop()
-        syncPollTimer?.invalidate()
+        idleCheckWorkItem?.cancel()
         if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = activeObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = resignActiveObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = memoryWarningObserver { NotificationCenter.default.removeObserver(obs) }
     }
@@ -596,15 +519,28 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.isTabActive else { return }
-            self.syncNowWithDrive(silent: true, forceFolderScan: true)
+            self?.handleReturnedToApp()
+        }
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleReturnedToApp()
         }
         resignActiveObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.saveNow()
+            guard let self else { return }
+            self.lastBackgroundedAt = Date()
+            self.idleCheckWorkItem?.cancel()
+            self.idleCheckWorkItem = nil
+            // Flush any finished work when leaving the app without interrupting open text mid-typing
+            if self.isDirty && self.activeTextEditor == nil {
+                self.saveNow(flushDriveImmediately: true)
+            }
         }
         memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -694,12 +630,18 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             }
             .store(in: &settingsCancellables)
 
-        settings.$syncPollSeconds
+        settings.$syncMode
             .dropFirst()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] mode in
                 guard let self, self.isTabActive else { return }
-                self.startLiveDriveSync()
+                if mode == .smart {
+                    self.startLiveDriveSync()
+                } else {
+                    self.idleCheckWorkItem?.cancel()
+                    self.idleCheckWorkItem = nil
+                    self.syncManager?.cancelScheduledSync(for: self.relativePath)
+                }
             }
             .store(in: &settingsCancellables)
     }
@@ -727,12 +669,12 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             updateVisiblePages(forceSharp: true)
             startLiveDriveSync()
         } else {
-            syncPollTimer?.invalidate()
-            syncPollTimer = nil
+            idleCheckWorkItem?.cancel()
+            idleCheckWorkItem = nil
             cancelHoldTimer()
             commitActiveTextBox()
             clearLassoSelection(commitFirst: true)
-            saveNow()
+            saveNow(flushDriveImmediately: true)
             evictOffscreenBitmaps(keepOnlyVisible: false)
         }
     }
@@ -784,16 +726,41 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
+    func cancelAllPendingIO() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        idleCheckWorkItem?.cancel()
+        idleCheckWorkItem = nil
+        isDirty = false
+        syncManager?.cancelScheduledSync(for: relativePath)
+    }
+
+    /// Synchronously commits any pending edits to disk BEFORE moving/renaming the file on disk.
+    func saveSynchronouslyBeforeRename() {
+        commitActiveTextBox()
+        clearLassoSelection(commitFirst: true)
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        idleCheckWorkItem?.cancel()
+        idleCheckWorkItem = nil
+        syncManager?.cancelScheduledSync(for: relativePath)
+        guard isDirty else { return }
+        isDirty = false
+        var snapshot = inkDoc
+        snapshot.name = relativePath
+        try? snapshot.save(for: pdfURL)
+        toolState.saveStatus = "Saved"
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        syncPollTimer?.invalidate()
-        syncPollTimer = nil
+        idleCheckWorkItem?.cancel()
+        idleCheckWorkItem = nil
         cancelHoldTimer()
         commitActiveTextBox()
         clearLassoSelection(commitFirst: true)
         stopLaserLoop()
-        saveNow()
-        syncNowWithDrive(silent: true)
+        saveNow(flushDriveImmediately: true)
     }
 
     private func setupScrollView() {
@@ -813,11 +780,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             return self.activePageView != nil || self.laserDown
         }
 
-        // NATIVE UIKIT 1-FINGER SCROLL + 2-FINGER PINCH-ZOOM (Fingers ONLY; Pencil NEVER scrolls!)
-        scrollView.panGestureRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        // Scroll pan touch types adapt automatically: Hand Mode lets stylus/mouse/finger pan smoothly!
         scrollView.panGestureRecognizer.minimumNumberOfTouches = 1
         scrollView.panGestureRecognizer.maximumNumberOfTouches = 1
         scrollView.pinchGestureRecognizer?.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        updateScrollPanTouchTypes()
         view.addSubview(scrollView)
 
         NSLayoutConstraint.activate([
@@ -842,8 +809,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                     return false
                 }
             }
-            // Text tool uses dedicated tap gesture (works with finger, stylus, AND Mac mouse)
-            if self.toolState.tool == .text {
+            // Hand / Scrolling mode & Text tool let scroll/tap gestures handle touches directly!
+            if self.toolState.tool == .hand || self.toolState.tool == .text {
                 return false
             }
             return true
@@ -924,7 +891,22 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
+    func updateScrollPanTouchTypes() {
+        if toolState.tool == .hand {
+            scrollView.panGestureRecognizer.allowedTouchTypes = [
+                NSNumber(value: UITouch.TouchType.direct.rawValue),
+                NSNumber(value: UITouch.TouchType.pencil.rawValue),
+                NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+            ]
+        } else {
+            scrollView.panGestureRecognizer.allowedTouchTypes = [
+                NSNumber(value: UITouch.TouchType.direct.rawValue)
+            ]
+        }
+    }
+
     func onToolChanged(to newTool: DrawingTool) {
+        updateScrollPanTouchTypes()
         if newTool != .lasso && lassoSelection != nil {
             clearLassoSelection(commitFirst: true)
         }
@@ -1582,7 +1564,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                     self?.presentShareSheet(items: [outURL])
                 }
             } catch {
-                self?.toolState.showToast("PNG export failed")
+                DispatchQueue.main.async { self?.toolState.showToast("PNG export failed") }
             }
         }
     }
@@ -1622,7 +1604,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                     self?.presentShareSheet(items: [outURL])
                 }
             } catch {
-                self?.toolState.showToast("PDF export failed")
+                DispatchQueue.main.async { self?.toolState.showToast("PDF export failed") }
             }
         }
     }
@@ -1715,9 +1697,17 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             originalBox: original,
             smartDarkInk: (!pv.isHobonichiSlot && currentReadingMode == .dark)
         )
+        editor.onChanged = { [weak self] _ in
+            // User is actively typing/moving text box -> never sync mid-typing!
+            guard let self else { return }
+            self.idleCheckWorkItem?.cancel()
+            self.syncManager?.cancelScheduledSync(for: self.relativePath)
+        }
         editor.onCommitRequested = { [weak self] in
             self?.commitActiveTextBox()
         }
+        idleCheckWorkItem?.cancel()
+        syncManager?.cancelScheduledSync(for: relativePath)
         documentContainer.addSubview(editor)
         activeTextEditor = editor
         pv.setHiddenTextBoxID(original?.id)
@@ -2122,6 +2112,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let docPt = touch.preciseLocation(in: documentContainer)
         guard let pv = pageView(at: docPt) else { return }
         activePageView = pv
+        // Pause pending Drive uploads/checks while stylus is actively on screen!
+        idleCheckWorkItem?.cancel()
+        syncManager?.cancelScheduledSync(for: relativePath)
         if !toolState.isWriting {
             DispatchQueue.main.async { self.toolState.isWriting = true }
         }
@@ -2543,6 +2536,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             pv.clearLiveOverlay()
         }
         activePageView = nil
+        if toolState.isWriting {
+            DispatchQueue.main.async { self.toolState.isWriting = false }
+        }
         activeSmoother = nil
         activeStartPoint = nil
         holdAnchor = nil
@@ -2812,39 +2808,98 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         isDirty = true
         DispatchQueue.main.async { self.toolState.saveStatus = "Saving…" }
         saveWorkItem?.cancel()
+        idleCheckWorkItem?.cancel()
+        syncManager?.cancelScheduledSync(for: relativePath)
         let item = DispatchWorkItem { [weak self] in
-            self?.saveNow()
+            self?.saveNow(flushDriveImmediately: false)
         }
         saveWorkItem = item
-        // Fast 0.35s local save debounce for snappy sync
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+        // Save locally after 0.75s pause; Drive upload batches cleanly after 4.0s of idle!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: item)
+    }
+
+    private func handleReturnedToApp() {
+        guard isTabActive,
+              AppSettings.shared.syncMode == .smart,
+              let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
+        // Only check Drive on return if we were away or haven't checked recently (>= 12s)
+        let now = Date()
+        let awayLongEnough = lastBackgroundedAt.map { now.timeIntervalSince($0) >= 8.0 } ?? false
+        let staleCheck = lastDriveSyncCheckAt.map { now.timeIntervalSince($0) >= 15.0 } ?? true
+        lastBackgroundedAt = nil
+        if awayLongEnough || staleCheck {
+            syncNowWithDrive(silent: true, forceFolderScan: true)
+            scheduleNextIdleCheck(stage: 0)
+        }
+    }
+
+    /// Adaptive idle pull backoff (60s -> 3m -> 10m -> sleep) — zero wasteful 3.5s/5s/10s polling!
+    private func scheduleNextIdleCheck(stage: Int) {
+        idleCheckWorkItem?.cancel()
+        idleCheckWorkItem = nil
+        guard isTabActive,
+              AppSettings.shared.syncMode == .smart,
+              let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
+        let delays: [TimeInterval] = [60.0, 180.0, 600.0]
+        guard stage >= 0 && stage < delays.count else { return }
+        let delay = delays[stage]
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                // Never interrupt active drawing or active text-box typing!
+                guard self.isTabActive,
+                      AppSettings.shared.syncMode == .smart,
+                      self.activePageView == nil,
+                      self.activeTextEditor == nil,
+                      !self.laserDown,
+                      !self.isDirty,
+                      let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else {
+                    self.scheduleNextIdleCheck(stage: stage)
+                    return
+                }
+                self.syncNowWithDrive(silent: true, forceFolderScan: false) { [weak self] gotRemoteUpdate in
+                    guard let self else { return }
+                    // If remote changes arrived, reset backoff; otherwise back off cleanly to save battery
+                    self.scheduleNextIdleCheck(stage: gotRemoteUpdate ? 0 : stage + 1)
+                }
+            }
+        }
+        idleCheckWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     func startLiveDriveSync() {
-        syncPollTimer?.invalidate()
-        syncPollTimer = nil
-        guard isTabActive, let sm = syncManager, sm.config.isConnected else { return }
-        // Full folder scan + pull latest remote deltas immediately on open / tab focus
-        syncNowWithDrive(silent: true, forceFolderScan: true)
-        let interval = AppSettings.shared.syncPollSeconds
-        guard interval >= 2.0 else { return }
-        syncPollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                guard self.isTabActive, self.activePageView == nil, !self.laserDown, !self.isDirty,
-                      let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else { return }
-                self.syncNowWithDrive(silent: true, forceFolderScan: false)
-            }
+        idleCheckWorkItem?.cancel()
+        idleCheckWorkItem = nil
+        guard isTabActive,
+              AppSettings.shared.syncMode == .smart,
+              let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
+        // Check once cleanly on open / tab focus, then switch to adaptive idle checks (no constant polling!)
+        let recentlyChecked = lastDriveSyncCheckAt.map { Date().timeIntervalSince($0) < 10.0 } ?? false
+        if !recentlyChecked {
+            syncNowWithDrive(silent: true, forceFolderScan: true)
         }
+        scheduleNextIdleCheck(stage: 0)
     }
 
-    func syncNowWithDrive(silent: Bool = false, forceFolderScan: Bool = false) {
-        guard let sm = syncManager else { return }
+    func syncNowWithDrive(
+        silent: Bool = false,
+        forceFolderScan: Bool = false,
+        onComplete: ((Bool) -> Void)? = nil
+    ) {
+        guard let sm = syncManager else {
+            onComplete?(false)
+            return
+        }
         let snap = inkDoc
         let url = pdfURL
         let rel = relativePath
+        lastDriveSyncCheckAt = Date()
         Task { @MainActor in
-            guard sm.config.isConnected else { return }
+            guard sm.config.isConnected else {
+                onComplete?(false)
+                return
+            }
             if let (merged, changed) = await sm.syncBook(
                 pdfURL: url,
                 relativePath: rel,
@@ -2857,6 +2912,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 } else if !silent {
                     self.toolState.showToast("Up to date with Google Drive")
                 }
+                onComplete?(changed)
+            } else {
+                onComplete?(false)
             }
         }
     }
@@ -2933,7 +2991,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 
-    func saveNow() {
+    func saveNow(flushDriveImmediately: Bool = false) {
         saveWorkItem?.cancel()
         saveWorkItem = nil
         guard isDirty else { return }
@@ -2948,13 +3006,23 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.toolState.saveStatus = "Saved"
-                    if let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync {
+                    guard let sm = self.syncManager,
+                          sm.config.isConnected,
+                          sm.config.autoSync,
+                          AppSettings.shared.syncMode == .smart else { return }
+                    if flushDriveImmediately {
+                        sm.cancelScheduledSync(for: rel)
+                        self.syncNowWithDrive(silent: true, forceFolderScan: false)
+                    } else if self.activePageView == nil && self.activeTextEditor == nil {
+                        // Batch edits and push cleanly 4 seconds after you stop writing/typing!
                         sm.scheduleBookSync(
                             pdfURL: targetURL,
                             relativePath: rel,
+                            delaySeconds: 4.0,
                             localDocProvider: { [weak self] in self?.inkDoc ?? snapshot },
                             onMerged: { [weak self] merged in self?.applyRemoteMergedDocument(merged) }
                         )
+                        self.scheduleNextIdleCheck(stage: 0)
                     }
                 }
             } catch {

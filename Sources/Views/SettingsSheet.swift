@@ -15,8 +15,12 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                #if !targetEnvironment(macCatalyst)
                 Section("Document Editing") {
+                    settingsRow(icon: "hand.raised.fill", color: .blue) {
+                        Toggle("Start PDFs in Scroll / Hand Mode", isOn: $settings.startInHandMode)
+                    }
+
+                    #if !targetEnvironment(macCatalyst)
                     settingsRow(icon: "pencil.tip", color: .blue) {
                         Picker("Apple Pencil Double-Tap", selection: $settings.pencilDoubleTap) {
                             ForEach(PencilDoubleTapAction.allCases) { act in
@@ -36,8 +40,36 @@ struct SettingsSheet: View {
                     settingsRow(icon: "waveform", color: .teal) {
                         Toggle("Haptic Feedback", isOn: $settings.hapticsEnabled)
                     }
+                    #endif
                 }
-                #endif
+
+                Section("Toolbar Customization") {
+                    settingsRow(icon: "sidebar.left", color: .indigo) {
+                        Picker("Toolbar Position", selection: $settings.toolbarPosition) {
+                            ForEach(ToolbarPosition.allCases) { pos in
+                                Text(pos.title).tag(pos)
+                            }
+                        }
+                    }
+
+                    settingsRow(icon: "slider.horizontal.3", color: .gray) {
+                        Toggle("Compact Drawing Bar", isOn: $settings.compactToolbar)
+                    }
+
+                    NavigationLink {
+                        ToolbarToolsCustomizationView()
+                    } label: {
+                        HStack(spacing: 12) {
+                            settingsIconBadge("wrench.and.screwdriver.fill", color: .blue)
+                            Text("Show / Hide Toolbar Tools")
+                            Spacer()
+                            let enabledCount = DrawingTool.allCases.filter { settings.isToolVisible($0) }.count
+                            Text("\(enabledCount)/\(DrawingTool.allCases.count)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
 
                 Section("Appearance & Reading") {
                     settingsRow(icon: "circle.lefthalf.filled", color: .blue) {
@@ -56,9 +88,11 @@ struct SettingsSheet: View {
                         }
                     }
 
+                    #if !targetEnvironment(macCatalyst)
                     settingsRow(icon: "sun.max.fill", color: .yellow) {
                         Toggle("Keep Screen Awake", isOn: $settings.keepScreenAwake)
                     }
+                    #endif
                 }
 
                 Section("Tabs & Workspace") {
@@ -68,10 +102,6 @@ struct SettingsSheet: View {
 
                     settingsRow(icon: "arrow.clockwise.circle", color: .blue) {
                         Toggle("Restore Open Tabs on Launch", isOn: $settings.restoreTabsOnLaunch)
-                    }
-
-                    settingsRow(icon: "slider.horizontal.3", color: .gray) {
-                        Toggle("Compact Drawing Bar", isOn: $settings.compactToolbar)
                     }
 
                     if !tabManager.tabs.isEmpty {
@@ -84,7 +114,10 @@ struct SettingsSheet: View {
                     }
                 }
 
-                Section("Cloud Sync") {
+                Section(
+                    header: Text("Cloud Sync"),
+                    footer: Text("Smart Sync never interrupts while you write or type, batches uploads 4 seconds after you finish, and checks Google Drive when you return or step away.")
+                ) {
                     Button {
                         showSyncSheet = true
                     } label: {
@@ -105,12 +138,11 @@ struct SettingsSheet: View {
                         }
                     }
 
-                    settingsRow(icon: "clock.arrow.circlepath", color: .green) {
-                        Picker("Live Sync Interval", selection: $settings.syncPollSeconds) {
-                            Text("Fast (3.5s)").tag(3.5)
-                            Text("Balanced (5s)").tag(5.0)
-                            Text("Battery Saver (10s)").tag(10.0)
-                            Text("Manual Only").tag(0.0)
+                    settingsRow(icon: "bolt.horizontal.icloud.fill", color: .green) {
+                        Picker("Sync Mode", selection: $settings.syncMode) {
+                            ForEach(SyncBehaviorMode.allCases) { m in
+                                Text(m.title).tag(m)
+                            }
                         }
                     }
                 }
@@ -164,7 +196,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v1.2.0")
+                        Text("v1.3.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }
@@ -210,5 +242,37 @@ struct SettingsSheet: View {
         case .error: return .red
         case .disconnected: return .gray
         }
+    }
+}
+
+/// Dedicated Toolbar Customization sub-screen (add/remove any tool & reset layout).
+struct ToolbarToolsCustomizationView: View {
+    @EnvironmentObject var settings: AppSettings
+
+    var body: some View {
+        Form {
+            Section(
+                header: Text("Visible Drawing Tools"),
+                footer: Text("Toggle tools on or off to keep your toolbar minimal. At least one tool must remain visible.")
+            ) {
+                ForEach(DrawingTool.allCases) { tool in
+                    Toggle(isOn: Binding(
+                        get: { settings.isToolVisible(tool) },
+                        set: { settings.setToolVisible(tool, visible: $0) }
+                    )) {
+                        Label(tool.displayName, systemImage: tool.settingsIcon)
+                    }
+                }
+            }
+
+            Section {
+                Button("Reset Toolbar to Defaults") {
+                    settings.resetToolbarDefaults()
+                }
+                .foregroundColor(.accentColor)
+            }
+        }
+        .navigationTitle("Toolbar Tools")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

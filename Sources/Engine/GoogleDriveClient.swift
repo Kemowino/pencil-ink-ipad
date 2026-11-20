@@ -454,6 +454,19 @@ actor GoogleDriveClient {
         return try JSONDecoder().decode(DriveFileMeta.self, from: data)
     }
 
+    func renameFile(fileID: String, newName: String) async throws -> DriveFileMeta {
+        let url = URL(string: "\(Self.apiBase)/files/\(fileID)?fields=\(Self.fields)")!
+        let payload: [String: Any] = ["name": newName]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, status) = try await authedRequest(url: url, method: "PATCH", contentType: "application/json", body: body)
+        guard status >= 200 && status < 300 else {
+            throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+        }
+        let meta = try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        metaCache[fileID] = meta
+        return meta
+    }
+
     func trash(fileID: String) async throws {
         let url = URL(string: "\(Self.apiBase)/files/\(fileID)?fields=id")!
         let body = Data("{\"trashed\":true}".utf8)

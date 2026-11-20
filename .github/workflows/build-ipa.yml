@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.2.0}"
+          TAG="v${VER:-1.3.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Universal Intel & Apple Silicon macOS App + iPadOS IPA, Text Box Tool with live Drive sync, and Authentic Goodnotes 6 Rounded Folder Tabs." \
+              --notes "Pencil Ink Native $TAG — Hand/Scrolling Mode + Default Startup Toggle, Animated Documents/Journals Home Switcher, Smart Activity-Aware Drive Sync, Customizable Dynamic Color Palettes (+ Add / Edit / Remove), Goodnotes Circle Thickness Slots Shared Across Files, Customizable Toolbar (Top / Left Side / Right Side & Toggle Tools), and Top-Bar Document Rename Synced to Google Drive." \
               --latest
           fi
