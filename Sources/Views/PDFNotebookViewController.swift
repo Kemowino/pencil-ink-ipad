@@ -348,7 +348,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = UIColor(red: 0.118, green: 0.122, blue: 0.141, alpha: 1.0)
+        view.backgroundColor = UIColor { trait in
+            trait.userInterfaceStyle == .dark
+                ? UIColor(red: 0.11, green: 0.114, blue: 0.129, alpha: 1.0)
+                : UIColor(red: 0.902, green: 0.910, blue: 0.929, alpha: 1.0)
+        }
         currentReadingMode = AppSettings.shared.pdfReadingMode
         setupScrollView()
         setupTapUndoGestures()
@@ -651,7 +655,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let idx = max(0, min(pageFrames.count - 1, pageNumber - 1))
         guard idx >= 0, idx < pageFrames.count else { return }
         let zoom = max(0.1, scrollView.zoomScale)
-        let targetY = max(0, pageFrames[idx].minY * zoom - 76)
+        let targetY = max(0, pageFrames[idx].minY * zoom - 16)
         let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height + scrollView.contentInset.bottom)
         scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: min(targetY, maxY)), animated: animated)
         updateCurrentPageLabel()
@@ -706,9 +710,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         isHoboDoc = HobonichiEngine.isHobonichi(doc: inkDoc, pdfPageCount: pdfPageSizes.count, firstPageSize: pdfPageSizes.first)
         pageSlots = inkDoc.buildPageSlots(pdfPageSizes: pdfPageSizes, defaultSize: defSize)
 
-        let gap: CGFloat = 14
-        let topPad: CGFloat = 80
-        let bottomPad: CGFloat = 90
+        let gap: CGFloat = 18
+        let topPad: CGFloat = 22
+        let bottomPad: CGFloat = 76
         var maxW: CGFloat = 595
         for s in pageSlots {
             if s.size.width > maxW { maxW = s.size.width }

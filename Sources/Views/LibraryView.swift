@@ -7,18 +7,17 @@ private enum ActivePickerMode {
     case importPDFCopy
 }
 
-private enum LibraryTab: String, CaseIterable {
-    case documents = "Documents"
-    case favorites = "Favorites"
-    case journals = "Journals"
-}
-
 private enum LibrarySort: String, CaseIterable, Identifiable {
-    case modified = "Recently Modified"
-    case name = "Title (A–Z)"
-    case annotated = "Annotated First"
+    case modified = "Date"
+    case name = "Name"
+    case annotated = "Annotated"
 
     var id: String { rawValue }
+}
+
+private enum LibraryDisplayMode: String {
+    case grid
+    case list
 }
 
 private struct BreadcrumbItem: Identifiable {
@@ -32,9 +31,10 @@ struct LibraryView: View {
     @EnvironmentObject var syncManager: DriveSyncManager
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var settings: AppSettings
+    @Environment(\.colorScheme) private var colorScheme
 
-    @State private var activeTab: LibraryTab = .documents
     @State private var sortOption: LibrarySort = .modified
+    @State private var displayMode: LibraryDisplayMode = .grid
     @State private var currentFolder: String = ""
     @State private var searchText: String = ""
 
@@ -53,26 +53,11 @@ struct LibraryView: View {
         pickerMode == .folder ? [.folder] : [.pdf]
     }
 
-    private var openTabIDs: Set<String> {
-        Set(tabManager.tabs.map { $0.id })
-    }
-
-    private var recentItems: [PDFItem] {
-        guard activeTab == .documents, currentFolder.isEmpty, searchText.trimmingCharacters(in: .whitespaces).isEmpty else {
-            return []
-        }
-        var out: [PDFItem] = []
-        for rel in vault.recentPaths {
-            if let item = vault.pdfs.first(where: { $0.relativePath == rel }) {
-                out.append(item)
-            }
-            if out.count >= 6 { break }
-        }
-        return out
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var visibleFolders: [FolderItem] {
-        guard activeTab == .documents else { return [] }
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !q.isEmpty {
             return vault.allFolders.filter { $0.name.lowercased().contains(q) }
@@ -80,46 +65,31 @@ struct LibraryView: View {
         return vault.allFolders.filter { folder in
             let parent = (folder.relativePath as NSString).deletingLastPathComponent
             let normParent = (parent == "." || parent == "/") ? "" : parent
-            if currentFolder.isEmpty && folder.relativePath == "Journals" { return false }
             return normParent == currentFolder
         }
     }
 
     private var visiblePDFs: [PDFItem] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var list: [PDFItem]
-        switch activeTab {
-        case .favorites:
-            list = vault.pdfs.filter { vault.isFavorite($0.relativePath) }
-            if !q.isEmpty {
-                list = list.filter { $0.name.lowercased().contains(q) || $0.relativeFolder.lowercased().contains(q) }
+        let filtered: [PDFItem]
+        if !q.isEmpty {
+            filtered = vault.pdfs.filter {
+                $0.name.lowercased().contains(q) || $0.relativeFolder.lowercased().contains(q)
             }
-        case .journals:
-            list = vault.pdfs.filter { $0.isHobonichi }
-            if !q.isEmpty {
-                list = list.filter { $0.name.lowercased().contains(q) }
-            }
-        case .documents:
-            if !q.isEmpty {
-                list = vault.pdfs.filter {
-                    $0.name.lowercased().contains(q) || $0.relativeFolder.lowercased().contains(q)
-                }
-            } else {
-                list = vault.pdfs.filter { item in
-                    let folder = (item.relativeFolder == "." || item.relativeFolder == "/") ? "" : item.relativeFolder
-                    if currentFolder.isEmpty && item.isHobonichi { return false }
-                    return folder == currentFolder
-                }
+        } else {
+            filtered = vault.pdfs.filter { item in
+                let folder = (item.relativeFolder == "." || item.relativeFolder == "/") ? "" : item.relativeFolder
+                return folder == currentFolder
             }
         }
 
         switch sortOption {
         case .modified:
-            return list.sorted { $0.modifiedAt > $1.modifiedAt }
+            return filtered.sorted { $0.modifiedAt > $1.modifiedAt }
         case .name:
-            return list.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         case .annotated:
-            return list.sorted {
+            return filtered.sorted {
                 if $0.hasInk != $1.hasInk { return $0.hasInk && !$1.hasInk }
                 return $0.modifiedAt > $1.modifiedAt
             }
@@ -136,41 +106,80 @@ struct LibraryView: View {
         }
     }
 
-    private let folderColumns = [GridItem(.adaptive(minimum: 195, maximum: 280), spacing: 14)]
-    private let bookColumns = [GridItem(.adaptive(minimum: 155, maximum: 210), spacing: 20)]
+    private var pageBackground: Color {
+        colorScheme == .dark
+            ? Color(red: 0.105, green: 0.108, blue: 0.120)
+            : Color(red: 0.965, green: 0.968, blue: 0.978)
+    }
+
+    private let gridColumns = [
+        GridItem(.adaptive(minimum: 158, maximum: 196), spacing: 26, alignment: .top)
+    ]
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                if !vault.statusMessage.isEmpty {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "info.circle.fill").foregroundColor(.orange)
-                        Text(vault.statusMessage).font(.caption)
-                        Spacer()
-                        Button { vault.statusMessage = "" } label: {
-                            Image(systemName: "xmark").font(.caption.bold()).foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.14))
-                }
+            ZStack {
+                pageBackground.ignoresSafeArea()
 
-                if vault.vaultURL == nil {
-                    emptyVaultView
-                } else {
-                    // Header Controls: Segmented Tabs + Sort Menu + Breadcrumbs
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 12) {
-                            Picker("Section", selection: $activeTab) {
-                                ForEach(LibraryTab.allCases, id: \.self) { t in
-                                    Text(t.rawValue).tag(t)
-                                }
+                VStack(spacing: 0) {
+                    if !vault.statusMessage.isEmpty {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "info.circle.fill").foregroundColor(.orange)
+                            Text(vault.statusMessage).font(.caption)
+                            Spacer()
+                            Button { vault.statusMessage = "" } label: {
+                                Image(systemName: "xmark").font(.caption.bold()).foregroundColor(.secondary)
                             }
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 330)
+                        }
+                        .padding(12)
+                        .background(Color.orange.opacity(0.14))
+                    }
+
+                    if vault.vaultURL == nil {
+                        emptyVaultView
+                    } else {
+                        // Subtle Goodnotes Sub-Header: Breadcrumbs (left) + Sort & View Toggle (right)
+                        HStack(spacing: 12) {
+                            if !currentFolder.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 5) {
+                                        Button {
+                                            withAnimation(.easeOut(duration: 0.18)) { currentFolder = "" }
+                                            Haptics.selection()
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "chevron.left")
+                                                    .font(.system(size: 12, weight: .semibold))
+                                                Text("Documents")
+                                            }
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundColor(.accentColor)
+                                        }
+                                        .buttonStyle(.plain)
+
+                                        ForEach(breadcrumbParts) { crumb in
+                                            Image(systemName: "chevron.right")
+                                                .font(.system(size: 10, weight: .semibold))
+                                                .foregroundColor(.secondary.opacity(0.7))
+                                            Button(crumb.name) {
+                                                withAnimation(.easeOut(duration: 0.18)) { currentFolder = crumb.path }
+                                                Haptics.selection()
+                                            }
+                                            .buttonStyle(.plain)
+                                            .font(.system(size: 14, weight: crumb.path == currentFolder ? .semibold : .regular))
+                                            .foregroundColor(crumb.path == currentFolder ? .primary : .accentColor)
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text("\(visibleFolders.count + visiblePDFs.count) items")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(.secondary)
+                            }
 
                             Spacer()
 
+                            // Goodnotes Sort Dropdown
                             Menu {
                                 ForEach(LibrarySort.allCases) { opt in
                                     Button {
@@ -178,206 +187,70 @@ struct LibraryView: View {
                                         Haptics.selection()
                                     } label: {
                                         if sortOption == opt {
-                                            Label(opt.rawValue, systemImage: "checkmark")
+                                            Label("Sort by \(opt.rawValue)", systemImage: "checkmark")
                                         } else {
-                                            Text(opt.rawValue)
+                                            Text("Sort by \(opt.rawValue)")
                                         }
                                     }
                                 }
                             } label: {
-                                HStack(spacing: 5) {
-                                    Image(systemName: "arrow.up.arrow.down")
-                                        .font(.system(size: 12, weight: .semibold))
+                                HStack(spacing: 4) {
                                     Text(sortOption.rawValue)
-                                        .font(.system(size: 12.5, weight: .semibold))
+                                        .font(.system(size: 13, weight: .medium))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 10, weight: .semibold))
                                 }
                                 .foregroundColor(.secondary)
                                 .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(Color.primary.opacity(0.06))
+                                .padding(.vertical, 5)
+                                .background(Color.primary.opacity(0.05))
                                 .clipShape(Capsule())
                             }
-                        }
 
-                        if activeTab == .documents && !currentFolder.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 6) {
-                                    Button("Documents") {
-                                        withAnimation(.easeOut(duration: 0.2)) { currentFolder = "" }
-                                    }
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundColor(.blue)
-                                    ForEach(breadcrumbParts) { crumb in
-                                        Image(systemName: "chevron.right")
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                        Button(crumb.name) {
-                                            withAnimation(.easeOut(duration: 0.2)) { currentFolder = crumb.path }
-                                        }
-                                        .font(.subheadline.weight(crumb.path == currentFolder ? .bold : .semibold))
-                                        .foregroundColor(crumb.path == currentFolder ? .primary : .blue)
-                                    }
+                            // Goodnotes Grid / List View Switcher
+                            Button {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    displayMode = (displayMode == .grid) ? .list : .grid
                                 }
+                                Haptics.selection()
+                            } label: {
+                                Image(systemName: displayMode == .grid ? "list.bullet" : "square.grid.2x2")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 30, height: 30)
+                                    .background(Color.primary.opacity(0.05))
+                                    .clipShape(Circle())
                             }
+                            .buttonStyle(.plain)
                         }
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 10)
+                        .padding(.horizontal, 24)
+                        .padding(.top, 4)
+                        .padding(.bottom, 10)
 
-                    if visibleFolders.isEmpty && visiblePDFs.isEmpty && recentItems.isEmpty {
-                        emptyFolderState
-                    } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 26) {
-                                // Quick Continue Studying / Recent Books Strip
-                                if !recentItems.isEmpty {
-                                    VStack(alignment: .leading, spacing: 10) {
-                                        Text("Continue Studying")
-                                            .font(.headline)
-                                            .foregroundColor(.primary)
-                                        ScrollView(.horizontal, showsIndicators: false) {
-                                            HStack(spacing: 14) {
-                                                ForEach(recentItems) { item in
-                                                    RecentBookPill(
-                                                        item: item,
-                                                        isOpenInTab: openTabIDs.contains(item.id),
-                                                        vault: vault
-                                                    ) {
-                                                        openItem(item)
-                                                    }
-                                                }
-                                            }
-                                            .padding(.vertical, 2)
-                                        }
-                                    }
-                                }
-
-                                if !visibleFolders.isEmpty {
-                                    VStack(alignment: .leading, spacing: 12) {
-                                        Text("Folders (\(visibleFolders.count))")
-                                            .font(.headline)
-                                            .foregroundColor(.primary)
-                                        LazyVGrid(columns: folderColumns, spacing: 14) {
-                                            ForEach(visibleFolders) { folder in
-                                                folderCard(folder)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !visiblePDFs.isEmpty {
-                                    VStack(alignment: .leading, spacing: 14) {
-                                        Text(sectionTitle)
-                                            .font(.headline)
-                                            .foregroundColor(.primary)
-
-                                        LazyVGrid(columns: bookColumns, spacing: 24) {
-                                            ForEach(visiblePDFs) { item in
-                                                BookCoverCard(
-                                                    item: item,
-                                                    isFavorite: vault.isFavorite(item.relativePath),
-                                                    isOpenInTab: openTabIDs.contains(item.id),
-                                                    vault: vault,
-                                                    onOpen: { openItem(item) },
-                                                    onToggleFavorite: {
-                                                        vault.toggleFavorite(item.relativePath)
-                                                        Haptics.light()
-                                                    },
-                                                    onRename: {
-                                                        renameText = item.name
-                                                        renamingItem = item
-                                                    },
-                                                    onCycleColor: {
-                                                        vault.cycleCoverColor(for: item)
-                                                        Haptics.selection()
-                                                    },
-                                                    onDuplicate: {
-                                                        try? vault.duplicatePDF(item)
-                                                        Haptics.light()
-                                                    },
-                                                    onDelete: {
-                                                        tabManager.handleDeletedDocument(relativePath: item.relativePath)
-                                                        try? vault.deletePDF(item)
-                                                        Haptics.light()
-                                                    }
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 20)
-                            .padding(.top, 8)
-                            .padding(.bottom, 44)
-                        }
-                        .refreshable {
-                            vault.refreshPDFList()
-                            if syncManager.config.isConnected {
-                                await syncManager.syncAllAnnotatedBooks(vault: vault)
-                            }
+                        if displayMode == .grid {
+                            goodnotesGridView
+                        } else {
+                            goodnotesListView
                         }
                     }
                 }
             }
-            .navigationTitle(navigationHeaderTitle)
-            .searchable(text: $searchText, prompt: "Search notebooks & folders")
+            .navigationTitle(currentFolder.isEmpty ? "Documents" : (currentFolder as NSString).lastPathComponent)
+            .navigationBarTitleDisplayMode(.large)
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search documents & folders")
             .toolbar {
+                // Clean, minimal Goodnotes top-right icons (NO ugly "+ New" button!)
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     SyncStatusDotButton(syncManager: syncManager) {
                         showSyncSettings = true
-                    }
-
-                    if vault.vaultURL != nil {
-                        Menu {
-                            Button {
-                                showNewNotebook = true
-                            } label: {
-                                Label("New Notebook…", systemImage: "book.closed")
-                            }
-                            Button {
-                                showNewHobonichi = true
-                            } label: {
-                                Label("New Hobonichi Journal…", systemImage: "calendar")
-                            }
-                            Divider()
-                            Button {
-                                pickerMode = .importPDFCopy
-                                showImporter = true
-                            } label: {
-                                Label("Import PDF into Folder…", systemImage: "square.and.arrow.down")
-                            }
-                            Button {
-                                pickerMode = .openSinglePDF
-                                showImporter = true
-                            } label: {
-                                Label("Open Single PDF In-Place…", systemImage: "doc")
-                            }
-                            Divider()
-                            Button {
-                                newFolderName = ""
-                                showNewFolderAlert = true
-                            } label: {
-                                Label("New Folder…", systemImage: "folder.badge.plus")
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "plus")
-                                Text("New")
-                            }
-                            .font(.subheadline.bold())
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.blue)
-                            .clipShape(Capsule())
-                        }
                     }
 
                     Button {
                         showAppSettings = true
                     } label: {
                         Image(systemName: "gearshape")
-                            .font(.system(size: 16, weight: .semibold))
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundColor(.primary.opacity(0.82))
                     }
                 }
             }
@@ -400,7 +273,7 @@ struct LibraryView: View {
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
         }
         .sheet(isPresented: $showNewHobonichi) {
-            NewHobonichiSheet(vault: vault, targetFolder: activeTab == .journals ? "Journals" : currentFolder) { url, rel in
+            NewHobonichiSheet(vault: vault, targetFolder: currentFolder) { url, rel in
                 tabManager.openDocument(url: url, relativePath: rel, isHobonichi: true, vault: vault)
             }
             .preferredColorScheme(settings.appTheme.preferredColorScheme)
@@ -474,18 +347,250 @@ struct LibraryView: View {
         }
     }
 
-    private var navigationHeaderTitle: String {
-        if activeTab == .documents && !currentFolder.isEmpty {
-            return (currentFolder as NSString).lastPathComponent
+    // MARK: - Goodnotes Unified Grid View (+ New... first tile -> Folders -> Documents)
+
+    private var goodnotesGridView: some View {
+        ScrollView {
+            LazyVGrid(columns: gridColumns, spacing: 28) {
+                // Iconic Goodnotes dashed "+ New..." first card (hidden only while actively filtering search)
+                if !isSearching {
+                    goodnotesNewTile
+                }
+
+                // Folders seamlessly integrated in the same grid (classic Goodnotes style)
+                ForEach(visibleFolders) { folder in
+                    GoodnotesFolderTile(folder: folder) {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            currentFolder = folder.relativePath
+                        }
+                        Haptics.selection()
+                    }
+                }
+
+                // Documents & Journals (Portrait AND Landscape strictly bounded — ZERO overlap!)
+                ForEach(visiblePDFs) { item in
+                    GoodnotesDocumentTile(
+                        item: item,
+                        vault: vault,
+                        onOpen: { openItem(item) },
+                        onRename: {
+                            renameText = item.name
+                            renamingItem = item
+                        },
+                        onCycleColor: {
+                            vault.cycleCoverColor(for: item)
+                            Haptics.selection()
+                        },
+                        onDuplicate: {
+                            try? vault.duplicatePDF(item)
+                            Haptics.light()
+                        },
+                        onDelete: {
+                            tabManager.handleDeletedDocument(relativePath: item.relativePath)
+                            try? vault.deletePDF(item)
+                            Haptics.light()
+                        }
+                    )
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 10)
+            .padding(.bottom, 48)
         }
-        return "Pencil Ink"
+        .refreshable {
+            vault.refreshPDFList()
+            if syncManager.config.isConnected {
+                await syncManager.syncAllAnnotatedBooks(vault: vault)
+            }
+        }
     }
 
-    private var sectionTitle: String {
-        switch activeTab {
-        case .favorites: return "Favorites (\(visiblePDFs.count))"
-        case .journals: return "Hobonichi Weeks Journals (\(visiblePDFs.count))"
-        case .documents: return "Documents (\(visiblePDFs.count))"
+    // MARK: - Goodnotes Clean List View
+
+    private var goodnotesListView: some View {
+        List {
+            if !isSearching {
+                Section {
+                    Menu {
+                        newCreationMenuItems
+                    } label: {
+                        Label("New Notebook, Folder, or Import…", systemImage: "plus.circle.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.accentColor)
+                    }
+                }
+            }
+
+            if !visibleFolders.isEmpty {
+                Section("Folders") {
+                    ForEach(visibleFolders) { folder in
+                        Button {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                currentFolder = folder.relativePath
+                            }
+                            Haptics.selection()
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "folder.fill")
+                                    .font(.system(size: 22))
+                                    .foregroundColor(Color(red: 0.27, green: 0.65, blue: 0.96))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(folder.name)
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundColor(.primary)
+                                    Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "document" : "documents")")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+            }
+
+            Section("Documents") {
+                ForEach(visiblePDFs) { item in
+                    HStack(spacing: 12) {
+                        Button {
+                            openItem(item)
+                        } label: {
+                            HStack(spacing: 12) {
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .fill(Color(HobonichiEngine.palette(for: item.name, customID: vault.coverColors[item.relativePath]).bgColor))
+                                    .frame(width: 32, height: 42)
+                                    .overlay(
+                                        Image(systemName: item.isHobonichi ? "calendar" : "doc.text")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.9))
+                                    )
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name)
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundColor(.primary)
+                                        .lineLimit(1)
+                                    HStack(spacing: 6) {
+                                        Text(item.modifiedAt.formatted(date: .abbreviated, time: .shortened))
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        if item.hasInk {
+                                            Text("· Annotated")
+                                                .font(.caption.weight(.medium))
+                                                .foregroundColor(.accentColor)
+                                        }
+                                    }
+                                }
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Menu {
+                            Button { openItem(item) } label: { Label("Open", systemImage: "book.open") }
+                            Button { vault.cycleCoverColor(for: item) } label: { Label("Change Cover Color", systemImage: "paintpalette") }
+                            Button { renameText = item.name; renamingItem = item } label: { Label("Rename…", systemImage: "pencil") }
+                            Button { try? vault.duplicatePDF(item) } label: { Label("Duplicate", systemImage: "doc.on.doc") }
+                            Divider()
+                            Button(role: .destructive) {
+                                tabManager.handleDeletedDocument(relativePath: item.relativePath)
+                                try? vault.deletePDF(item)
+                            } label: { Label("Delete", systemImage: "trash") }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.system(size: 18))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .refreshable {
+            vault.refreshPDFList()
+            if syncManager.config.isConnected {
+                await syncManager.syncAllAnnotatedBooks(vault: vault)
+            }
+        }
+    }
+
+    // MARK: - Iconic Goodnotes Dashed "+ New..." Tile
+
+    private var goodnotesNewTile: some View {
+        Menu {
+            newCreationMenuItems
+        } label: {
+            VStack(spacing: 10) {
+                Color.clear
+                    .frame(height: 176)
+                    .overlay(alignment: .bottom) {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(
+                                Color.accentColor.opacity(0.65),
+                                style: StrokeStyle(lineWidth: 1.6, dash: [6, 5])
+                            )
+                            .background(
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .fill(Color.accentColor.opacity(colorScheme == .dark ? 0.06 : 0.035))
+                            )
+                            .overlay(
+                                VStack(spacing: 8) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 30, weight: .light))
+                                        .foregroundColor(.accentColor)
+                                    Text("New...")
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(.accentColor)
+                                }
+                            )
+                            .aspectRatio(0.74, contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: 176)
+                    }
+
+                // Spacer matching the title/date height of sibling tiles
+                Text(" ")
+                    .font(.system(size: 13.5, weight: .medium))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var newCreationMenuItems: some View {
+        Button {
+            showNewNotebook = true
+        } label: {
+            Label("Notebook", systemImage: "book.closed")
+        }
+        Button {
+            showNewHobonichi = true
+        } label: {
+            Label("Hobonichi Journal", systemImage: "calendar")
+        }
+        Button {
+            newFolderName = ""
+            showNewFolderAlert = true
+        } label: {
+            Label("Folder", systemImage: "folder.badge.plus")
+        }
+        Divider()
+        Button {
+            pickerMode = .importPDFCopy
+            showImporter = true
+        } label: {
+            Label("Import PDF…", systemImage: "square.and.arrow.down")
+        }
+        Button {
+            pickerMode = .openSinglePDF
+            showImporter = true
+        } label: {
+            Label("Open PDF In-Place…", systemImage: "doc")
         }
     }
 
@@ -499,85 +604,12 @@ struct LibraryView: View {
         )
     }
 
-    private func folderCard(_ folder: FolderItem) -> some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.2)) {
-                currentFolder = folder.relativePath
-            }
-            Haptics.selection()
-        } label: {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.blue.opacity(0.16))
-                        .frame(width: 40, height: 40)
-                    Image(systemName: "folder.fill")
-                        .font(.system(size: 19))
-                        .foregroundColor(.blue)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(folder.name)
-                        .font(.system(size: 14.5, weight: .bold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                    Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "document" : "documents")")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.secondary)
-            }
-            .padding(12)
-            .background(Color(UIColor.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.08), lineWidth: 0.8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var emptyFolderState: some View {
-        VStack(spacing: 14) {
-            Spacer()
-            Image(systemName: activeTab == .favorites ? "star" : (activeTab == .journals ? "calendar" : "books.vertical"))
-                .font(.system(size: 46))
-                .foregroundColor(.blue.opacity(0.8))
-            Text(activeTab == .favorites ? "No Favorite Documents" : (activeTab == .journals ? "No Hobonichi Journals Yet" : "No Documents Here"))
-                .font(.headline)
-            Text(activeTab == .favorites
-                 ? "Tap ••• on any notebook or textbook and choose Add to Favorites to pin it here."
-                 : (activeTab == .journals
-                    ? "Create an ever-expanding Hobonichi Techo Weeks journal with monthly grids, weekly spreads, and back notes."
-                    : "Tap + New above to create a notebook, Hobonichi journal, or import a PDF."))
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-            if activeTab != .favorites {
-                HStack(spacing: 12) {
-                    if activeTab == .journals {
-                        Button("New Hobonichi Journal") { showNewHobonichi = true }
-                            .buttonStyle(.borderedProminent)
-                    } else {
-                        Button("New Notebook") { showNewNotebook = true }
-                            .buttonStyle(.borderedProminent)
-                        Button("New Hobonichi") { showNewHobonichi = true }
-                            .buttonStyle(.bordered)
-                    }
-                }
-                .padding(.top, 4)
-            }
-            Spacer()
-        }
-    }
-
     private var emptyVaultView: some View {
         VStack(spacing: 16) {
             Spacer()
             Image(systemName: "books.vertical.fill")
                 .font(.system(size: 56))
-                .foregroundColor(.blue)
+                .foregroundColor(.accentColor)
             Text("Connect Your Obsidian Vault")
                 .font(.title2.bold())
             Text("Pick your Obsidian vault folder once. Pencil Ink opens your PDFs in-place and syncs strokes directly with Obsidian & Google Drive.")
@@ -611,68 +643,113 @@ struct LibraryView: View {
     }
 }
 
-private struct RecentBookPill: View {
-    let item: PDFItem
-    let isOpenInTab: Bool
-    @ObservedObject var vault: VaultManager
-    let onOpen: () -> Void
+// MARK: - Authentic Goodnotes Sky-Blue Folder Tile
 
-    private var palette: CoverPalette {
-        HobonichiEngine.palette(for: item.name, customID: vault.coverColors[item.relativePath])
-    }
+private struct GoodnotesFolderTile: View {
+    let folder: FolderItem
+    let onOpen: () -> Void
 
     var body: some View {
         Button(action: onOpen) {
-            HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color(palette.bgColor))
-                    .frame(width: 30, height: 38)
-                    .overlay(
-                        Image(systemName: item.isHobonichi ? "calendar" : "doc.richtext")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.92))
-                    )
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.name)
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                    HStack(spacing: 5) {
-                        if !item.relativeFolder.isEmpty {
-                            Text(item.relativeFolder)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-                        if isOpenInTab {
-                            Text("· Open")
-                                .font(.caption2.bold())
-                                .foregroundColor(.blue)
-                        }
+            VStack(spacing: 10) {
+                Color.clear
+                    .frame(height: 176)
+                    .overlay(alignment: .bottom) {
+                        GoodnotesFolderArtwork(count: folder.pdfCount)
+                            .frame(maxWidth: 148, maxHeight: 122)
+                            .padding(.bottom, 6)
                     }
+
+                VStack(spacing: 2) {
+                    Text(folder.name)
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundColor(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                    Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "item" : "items")")
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.secondary)
                 }
-                .frame(maxWidth: 175, alignment: .leading)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(Color(UIColor.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(isOpenInTab ? Color.blue.opacity(0.45) : Color.primary.opacity(0.08), lineWidth: 1)
-            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 }
 
-private struct BookCoverCard: View {
+private struct GoodnotesFolderArtwork: View {
+    let count: Int
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            ZStack(alignment: .bottom) {
+                // Back folder tab
+                Path { p in
+                    let r: CGFloat = 10
+                    let tabW = w * 0.42
+                    let tabH = h * 0.16
+                    p.move(to: CGPoint(x: 0, y: r))
+                    p.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 0, y: 0))
+                    p.addLine(to: CGPoint(x: tabW - r, y: 0))
+                    p.addQuadCurve(to: CGPoint(x: tabW + 8, y: tabH), control: CGPoint(x: tabW + 2, y: 0))
+                    p.addLine(to: CGPoint(x: w - r, y: tabH))
+                    p.addQuadCurve(to: CGPoint(x: w, y: tabH + r), control: CGPoint(x: w, y: tabH))
+                    p.addLine(to: CGPoint(x: w, y: h - r))
+                    p.addQuadCurve(to: CGPoint(x: w - r, y: h), control: CGPoint(x: w, y: h))
+                    p.addLine(to: CGPoint(x: r, y: h))
+                    p.addQuadCurve(to: CGPoint(x: 0, y: h - r), control: CGPoint(x: 0, y: h))
+                    p.closeSubpath()
+                }
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.25, green: 0.62, blue: 0.94),
+                            Color(red: 0.19, green: 0.53, blue: 0.87)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+                // Subtle white sheet peeking inside folder
+                if count > 0 {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.white.opacity(0.88))
+                        .frame(width: w * 0.86, height: h * 0.72)
+                        .offset(y: -h * 0.13)
+                }
+
+                // Front Goodnotes blue folder flap
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.36, green: 0.73, blue: 0.99),
+                                Color(red: 0.22, green: 0.59, blue: 0.93)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(width: w, height: h * 0.78)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
+                    )
+            }
+            .shadow(color: Color.black.opacity(0.22), radius: 7, y: 4)
+        }
+    }
+}
+
+// MARK: - Goodnotes Document Tile (Landscape & Portrait — Strictly Bounded, Zero Overlap!)
+
+private struct GoodnotesDocumentTile: View {
     let item: PDFItem
-    let isFavorite: Bool
-    let isOpenInTab: Bool
     @ObservedObject var vault: VaultManager
     let onOpen: () -> Void
-    let onToggleFavorite: () -> Void
     let onRename: () -> Void
     let onCycleColor: () -> Void
     let onDuplicate: () -> Void
@@ -685,136 +762,132 @@ private struct BookCoverCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(spacing: 10) {
+            // Fixed-height stage with GeometryReader so BOTH portrait and landscape PDFs
+            // respect their true aspect ratio and NEVER exceed the column width!
             Button(action: onOpen) {
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .fill(Color(palette.bgColor))
+                GeometryReader { geo in
+                    let maxW = max(40, geo.size.width)
+                    let maxH = max(40, geo.size.height)
 
-                    if let img = thumb {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .clipped()
-                    } else {
-                        VStack {
-                            VStack(spacing: 5) {
-                                if item.isHobonichi {
-                                    Text("HOBONICHI WEEKS")
-                                        .font(.system(size: 8.5, weight: .heavy))
-                                        .tracking(1.0)
-                                        .foregroundColor(Color(red: 0.61, green: 0.49, blue: 0.33))
+                    ZStack(alignment: .bottom) {
+                        Color.clear
+                        if let img = thumb {
+                            let ratio = max(0.55, min(1.85, img.size.width / max(1, img.size.height)))
+                            let size = fittedSize(aspect: ratio, maxW: maxW, maxH: maxH)
+                            let isLandscape = ratio > 1.08
+
+                            ZStack(alignment: .topTrailing) {
+                                Image(uiImage: img)
+                                    .resizable()
+                                    .interpolation(.high)
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: size.width, height: size.height)
+                                    .background(Color.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: isLandscape ? 7 : 9, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: isLandscape ? 7 : 9, style: .continuous)
+                                            .stroke(Color.black.opacity(0.10), lineWidth: 0.7)
+                                    )
+                                    .shadow(color: Color.black.opacity(0.22), radius: 7, y: 4)
+
+                                if item.hasInk {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                        .frame(width: 9, height: 9)
+                                        .overlay(Circle().stroke(Color.white, lineWidth: 1.5))
+                                        .padding(6)
                                 }
-                                Text(item.name)
-                                    .font(.system(size: 12.5, weight: .bold))
-                                    .foregroundColor(Color(white: 0.12))
-                                    .multilineTextAlignment(.center)
-                                    .lineLimit(3)
-                                Capsule()
-                                    .fill(Color.black.opacity(0.15))
-                                    .frame(width: 44, height: 2)
                             }
-                            .padding(.vertical, 11)
-                            .padding(.horizontal, 10)
-                            .frame(maxWidth: .infinity)
-                            .background(Color.white.opacity(0.93))
-                            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                            .shadow(color: .black.opacity(0.2), radius: 5, y: 2)
-                            Spacer()
-                        }
-                        .padding(.top, 22)
-                        .padding(.leading, 24)
-                        .padding(.trailing, 14)
-                    }
+                        } else {
+                            // Crisp Goodnotes / Hobonichi Fabric Cover
+                            let ratio: CGFloat = item.isHobonichi ? 0.74 : 0.74
+                            let size = fittedSize(aspect: ratio, maxW: maxW, maxH: maxH)
 
-                    // Realistic Book Spine Gradient
-                    LinearGradient(
-                        colors: [
-                            Color.black.opacity(0.28),
-                            Color.white.opacity(0.14),
-                            Color.black.opacity(0.08),
-                            Color.black.opacity(0.32),
-                            Color.white.opacity(0.10)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: 15)
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .fill(Color(palette.bgColor))
 
-                    // Top-right status badges (Favorite / Annotated / Open Tab)
-                    VStack {
-                        HStack(spacing: 4) {
-                            Spacer()
-                            if isOpenInTab {
-                                Text("OPEN")
-                                    .font(.system(size: 8.5, weight: .heavy))
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 3)
-                                    .background(Color.blue)
-                                    .clipShape(Capsule())
+                                VStack {
+                                    VStack(spacing: 4) {
+                                        if item.isHobonichi {
+                                            Text("HOBONICHI")
+                                                .font(.system(size: 7.5, weight: .heavy))
+                                                .tracking(1.1)
+                                                .foregroundColor(Color(red: 0.61, green: 0.49, blue: 0.33))
+                                        }
+                                        Text(item.name)
+                                            .font(.system(size: 11.5, weight: .semibold))
+                                            .foregroundColor(Color(white: 0.14))
+                                            .multilineTextAlignment(.center)
+                                            .lineLimit(3)
+                                    }
+                                    .padding(.vertical, 9)
+                                    .padding(.horizontal, 8)
+                                    .frame(maxWidth: .infinity)
+                                    .background(Color.white.opacity(0.94))
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    Spacer()
+                                }
+                                .padding(.top, 20)
+                                .padding(.leading, 20)
+                                .padding(.trailing, 12)
+
+                                // Tactile spine crease
+                                LinearGradient(
+                                    colors: [
+                                        Color.black.opacity(0.26),
+                                        Color.white.opacity(0.14),
+                                        Color.black.opacity(0.22),
+                                        Color.clear
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                                .frame(width: 13)
                             }
-                            if isFavorite {
-                                Image(systemName: "star.fill")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.yellow)
-                                    .padding(4)
-                                    .background(Circle().fill(Color.black.opacity(0.55)))
-                            }
-                            if item.hasInk {
-                                Image(systemName: "pencil.tip.crop.circle.fill")
-                                    .font(.system(size: 17))
-                                    .foregroundColor(.blue)
-                                    .background(Circle().fill(Color.white).padding(2))
-                            }
+                            .frame(width: size.width, height: size.height)
+                            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .stroke(Color.white.opacity(0.14), lineWidth: 0.7)
+                            )
+                            .shadow(color: Color.black.opacity(0.24), radius: 7, y: 4)
                         }
-                        .padding(7)
-                        Spacer()
                     }
+                    .frame(width: maxW, height: maxH, alignment: .bottom)
                 }
-                .aspectRatio(3.0 / 4.0, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(
-                            isOpenInTab
-                                ? Color.blue.opacity(0.75)
-                                : (item.isHobonichi ? Color.yellow.opacity(0.42) : Color.primary.opacity(0.12)),
-                            lineWidth: isOpenInTab ? 2 : 1
-                        )
-                )
-                .shadow(color: .black.opacity(0.30), radius: 8, y: 4)
+                .frame(height: 176)
+                .clipped()
             }
             .buttonStyle(.plain)
 
-            HStack(alignment: .top, spacing: 4) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.name)
-                        .font(.system(size: 13.5, weight: .bold))
-                        .foregroundColor(.primary)
-                        .lineLimit(2)
-                    Text(item.modifiedAt.formatted(date: .abbreviated, time: .omitted))
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                Spacer(minLength: 2)
+            // Iconic Goodnotes Centered Title + Dropdown Chevron (`Title ⌄`) + Subtle Date
+            VStack(spacing: 2) {
                 Menu {
-                    Button { onOpen() } label: { Label("Open in Tab", systemImage: "book.open") }
-                    Button { onToggleFavorite() } label: {
-                        Label(isFavorite ? "Remove from Favorites" : "Add to Favorites", systemImage: isFavorite ? "star.slash" : "star")
-                    }
+                    Button { onOpen() } label: { Label("Open", systemImage: "book.open") }
                     Button { onCycleColor() } label: { Label("Change Cover Color", systemImage: "paintpalette") }
                     Button { onRename() } label: { Label("Rename…", systemImage: "pencil") }
                     Button { onDuplicate() } label: { Label("Duplicate", systemImage: "doc.on.doc") }
                     Divider()
-                    Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+                    Button(role: .destructive) { onDelete() } label: { Label("Move to Trash", systemImage: "trash") }
                 } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(.secondary)
-                        .frame(width: 26, height: 26)
+                    HStack(spacing: 3) {
+                        Text(item.name)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundColor(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
                 }
+                .buttonStyle(.plain)
+
+                Text(item.modifiedAt.formatted(date: .abbreviated, time: .omitted))
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.secondary)
             }
         }
         .onAppear {
@@ -828,5 +901,15 @@ private struct BookCoverCard: View {
                 }
             }
         }
+    }
+
+    private func fittedSize(aspect: CGFloat, maxW: CGFloat, maxH: CGFloat) -> CGSize {
+        var w = maxW
+        var h = w / aspect
+        if h > maxH {
+            h = maxH
+            w = h * aspect
+        }
+        return CGSize(width: max(20, w), height: max(20, h))
     }
 }

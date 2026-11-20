@@ -55,12 +55,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.0.0}"
+          TAG="v${VER:-1.1.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Goodnotes-style Document Tabs, PDF Reading Modes (Dark/Sepia), Outline & Search, Apple Pencil Double-Tap, Visual Bookshelf, Hobonichi Weeks, and Live Bidirectional Google Drive CRDT Sync." \
+              --notes "Pencil Ink Native $TAG — Complete Goodnotes-style UI Redesign (Library Grid with + New Tile & Fixed Landscape PDFs, House Icon Flat Tabs, Edge-to-Edge Split Toolbar, Goodnotes Page Overview, and Adaptive Light/Dark Themes)." \
               --latest
           fi
