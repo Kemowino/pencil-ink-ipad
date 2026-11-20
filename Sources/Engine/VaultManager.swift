@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import PDFKit
+import UIKit
 
 struct PDFItem: Identifiable, Hashable {
     let id: String
@@ -336,7 +337,7 @@ final class VaultManager: ObservableObject {
     }
 
     func refreshPDFListAsync() async {
-        await withCheckedContinuation { cont in
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             refreshPDFList {
                 cont.resume()
             }

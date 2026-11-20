@@ -785,7 +785,7 @@ struct LibraryView: View {
                         Label("LiveContainer Detected", systemImage: "shippingbox.fill")
                             .font(.caption.bold())
                             .foregroundColor(.accentColor)
-                        Text("• To pick an external Obsidian folder: long-press Pencil Ink in LiveContainer → Settings → enable "Fix File Picker" first.\n• Or tap Use LiveContainer App Folder below and paste your Device Key — all PDFs & annotations will sync automatically from Google Drive.")
+                        Text("• To pick an external Obsidian folder: long-press Pencil Ink in LiveContainer → Settings → enable \"Fix File Picker\" first.\n• Or tap Use LiveContainer App Folder below and paste your Device Key — all PDFs & annotations will sync automatically from Google Drive.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -800,7 +800,7 @@ struct LibraryView: View {
                     pickerMode = .folder
                     showImporter = true
                 } label: {
-                    Text(vault.lastSavedVaultName.isEmpty ? "Choose Vault Folder" : "Reconnect "\(vault.lastSavedVaultName)"")
+                    Text(vault.lastSavedVaultName.isEmpty ? "Choose Vault Folder" : "Reconnect \"\(vault.lastSavedVaultName)\"")
                         .font(.headline)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
