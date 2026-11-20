@@ -104,6 +104,17 @@ final class PageCanvasView: UIView {
         staticInkView.setNeedsDisplay()
     }
 
+    func setTextBoxes(_ boxes: [InkTextBox], hiddenID: String? = nil) {
+        staticInkView.textBoxes = boxes
+        staticInkView.hiddenTextBoxID = hiddenID
+        staticInkView.setNeedsDisplay()
+    }
+
+    func setHiddenTextBoxID(_ id: String?) {
+        staticInkView.hiddenTextBoxID = id
+        staticInkView.setNeedsDisplay()
+    }
+
     func setHiddenStrokeIDs(_ ids: Set<String>) {
         staticInkView.hiddenStrokeIDs = ids
         staticInkView.setNeedsDisplay()
@@ -179,11 +190,12 @@ final class PageCanvasView: UIView {
     }
 
     func refreshVectorScale(for zoomScale: CGFloat) {
-        let targetScale = min(UIScreen.main.scale * max(1.0, zoomScale), 3.0)
+        let screenScale = max(1.0, traitCollection.displayScale > 0 ? traitCollection.displayScale : 2.0)
+        let targetScale = min(screenScale * max(1.0, zoomScale), 3.0)
         if abs(staticInkView.contentScaleFactor - targetScale) > 0.25 {
             staticInkView.contentScaleFactor = targetScale
             staticInkView.setNeedsDisplay()
-            liveOverlayView.contentScaleFactor = min(UIScreen.main.scale * max(1.0, zoomScale), 2.5)
+            liveOverlayView.contentScaleFactor = min(screenScale * max(1.0, zoomScale), 2.5)
         }
         if let tv = templateView, abs(tv.contentScaleFactor - targetScale) > 0.25 {
             tv.contentScaleFactor = targetScale
@@ -404,10 +416,52 @@ final class PageCanvasView: UIView {
     }
 
     /// Renders a complete composite image (PDF/template + ink strokes) for thumbnails or PNG sharing.
+    static func drawTextBoxes(
+        _ boxes: [InkTextBox],
+        in ctx: CGContext,
+        hiddenID: String? = nil,
+        smartDarkInk: Bool = false
+    ) {
+        guard !boxes.isEmpty else { return }
+        ctx.saveGState()
+        UIGraphicsPushContext(ctx)
+        defer {
+            UIGraphicsPopContext()
+            ctx.restoreGState()
+        }
+
+        for box in boxes {
+            if box.id == hiddenID { continue }
+            let trimmed = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            let rect = box.measuredRect()
+
+            if let bgHex = box.bgColor, !bgHex.isEmpty {
+                let bgCol = UIColor(hex: bgHex).withAlphaComponent(smartDarkInk ? 0.24 : 0.85)
+                let path = UIBezierPath(roundedRect: rect, cornerRadius: 5)
+                bgCol.setFill()
+                path.fill()
+            }
+
+            let textColor = displayColor(for: box.color, smartDark: smartDarkInk)
+            let font = box.resolvedUIFont()
+            let para = NSMutableParagraphStyle()
+            para.lineBreakMode = .byWordWrapping
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: textColor,
+                .paragraphStyle: para
+            ]
+            let drawRect = rect.insetBy(dx: 6, dy: 4)
+            (box.text as NSString).draw(with: drawRect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attrs, context: nil)
+        }
+    }
+
     static func renderCompositeImage(
         slot: PageSlot,
         pdfDoc: PDFDocument?,
         strokes: [InkStroke],
+        textBoxes: [InkTextBox] = [],
         scale: CGFloat,
         hoboDoc: InkDocument? = nil,
         hoboAllSlots: [PageSlot] = [],
@@ -421,6 +475,7 @@ final class PageCanvasView: UIView {
             let ctx = rendererCtx.cgContext
             drawSlotBackground(slot: slot, pdfDoc: pdfDoc, in: ctx, hoboDoc: hoboDoc, hoboAllSlots: hoboAllSlots, isHobo: isHobo)
             drawStrokes(strokes, in: ctx)
+            drawTextBoxes(textBoxes, in: ctx)
         }
     }
 }
@@ -429,11 +484,18 @@ private final class StaticInkView: UIView {
     var pageSize: CGSize = .zero
     var strokes: [InkStroke] = []
     var hiddenStrokeIDs: Set<String> = []
+    var textBoxes: [InkTextBox] = []
+    var hiddenTextBoxID: String? = nil
     var smartDarkInk: Bool = false
 
     override func draw(_ rect: CGRect) {
-        guard !strokes.isEmpty, let ctx = UIGraphicsGetCurrentContext() else { return }
-        PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs, smartDarkInk: smartDarkInk)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        if !strokes.isEmpty {
+            PageCanvasView.drawStrokes(strokes, in: ctx, clipRect: rect, hiddenIDs: hiddenStrokeIDs, smartDarkInk: smartDarkInk)
+        }
+        if !textBoxes.isEmpty {
+            PageCanvasView.drawTextBoxes(textBoxes, in: ctx, hiddenID: hiddenTextBoxID, smartDarkInk: smartDarkInk)
+        }
     }
 }
 

@@ -77,7 +77,9 @@ final class AppSettings: ObservableObject {
     @Published var hapticsEnabled: Bool = true { didSet { persist() } }
     @Published var keepScreenAwake: Bool = false {
         didSet {
+            #if !targetEnvironment(macCatalyst)
             UIApplication.shared.isIdleTimerDisabled = keepScreenAwake
+            #endif
             persist()
         }
     }
@@ -103,7 +105,9 @@ final class AppSettings: ObservableObject {
 
     private init() {
         load()
+        #if !targetEnvironment(macCatalyst)
         UIApplication.shared.isIdleTimerDisabled = keepScreenAwake
+        #endif
     }
 
     private func load() {
@@ -148,22 +152,28 @@ final class AppSettings: ObservableObject {
 enum Haptics {
     @MainActor
     static func light() {
+        #if !targetEnvironment(macCatalyst)
         guard AppSettings.shared.hapticsEnabled else { return }
         let g = UIImpactFeedbackGenerator(style: .light)
         g.impactOccurred()
+        #endif
     }
 
     @MainActor
     static func selection() {
+        #if !targetEnvironment(macCatalyst)
         guard AppSettings.shared.hapticsEnabled else { return }
         let g = UISelectionFeedbackGenerator()
         g.selectionChanged()
+        #endif
     }
 
     @MainActor
     static func success() {
+        #if !targetEnvironment(macCatalyst)
         guard AppSettings.shared.hapticsEnabled else { return }
         let g = UINotificationFeedbackGenerator()
         g.notificationOccurred(.success)
+        #endif
     }
 }

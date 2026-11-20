@@ -22,7 +22,22 @@ enum DrawingTool: String {
     case highlighter
     case eraser
     case lasso
+    case text
     case laser
+}
+
+enum TextFontOption: String, CaseIterable, Identifiable {
+    case sans = "sans"
+    case serif = "serif"
+    case mono = "mono"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .sans: return "Sans"
+        case .serif: return "Serif"
+        case .mono: return "Mono"
+        }
+    }
 }
 
 enum PenStyleOption: String, CaseIterable, Identifiable {
@@ -72,6 +87,19 @@ final class NotebookToolState: ObservableObject {
     @Published var eraserSizeIndex: Int = 1 { didSet { persist() } }
     @Published var eraseHlOnly: Bool = false { didSet { persist() } }
 
+    @Published var textColors: [String] = ["#1c1c1e", "#007aff", "#ff3b30", "#2f855a"] { didSet { persist() } }
+    @Published var textColorIndex: Int = 0 { didSet { persist() } }
+    @Published var textSize: Double = 16.0 { didSet { persist() } }
+    @Published var textFont: TextFontOption = .sans { didSet { persist() } }
+    @Published var textBold: Bool = false { didSet { persist() } }
+    @Published var textBgHex: String = "" { didSet { persist() } }
+    let textBgPresets: [(name: String, hex: String)] = [
+        ("None", ""),
+        ("Cream", "#fff6d6"),
+        ("Sky", "#e6f2ff"),
+        ("Rose", "#fdeaf0")
+    ]
+
     @Published var laserColorHex: String = "#ff3b30" { didSet { persist() } }
     @Published var laserTrail: Bool = true { didSet { persist() } }
     let laserColors: [String] = ["#ff3b30", "#0a84ff", "#30d158", "#ff9f0a"]
@@ -88,6 +116,7 @@ final class NotebookToolState: ObservableObject {
     @Published var hasLassoSelection: Bool = false
     @Published var lassoSelectedCount: Int = 0
     @Published var hasLassoClipboard: Bool = false
+    @Published var hasActiveTextBox: Bool = false
     @Published var pageSlots: [PageSlot] = []
     @Published var bookmarkedKeys: Set<String> = []
     @Published var removedPagesCount: Int = 0
@@ -115,6 +144,9 @@ final class NotebookToolState: ObservableObject {
     }
     var activeEraserRadius: Double {
         eraserSizes[max(0, min(eraserSizes.count - 1, eraserSizeIndex))] * 0.5
+    }
+    var activeTextColorHex: String {
+        textColors[max(0, min(textColors.count - 1, textColorIndex))]
     }
     var isCurrentPageBookmarked: Bool {
         let idx = currentPage - 1
@@ -157,6 +189,12 @@ final class NotebookToolState: ObservableObject {
         var eraseHlOnly: Bool
         var laserColorHex: String
         var laserTrail: Bool
+        var textColors: [String]?
+        var textColorIndex: Int?
+        var textSize: Double?
+        var textFont: String?
+        var textBold: Bool?
+        var textBgHex: String?
     }
 
     private func loadPrefs() {
@@ -182,6 +220,12 @@ final class NotebookToolState: ObservableObject {
         eraseHlOnly = p.eraseHlOnly
         laserColorHex = p.laserColorHex
         laserTrail = p.laserTrail
+        if let tc = p.textColors, tc.count == 4 { textColors = tc }
+        if let tci = p.textColorIndex { textColorIndex = max(0, min(textColors.count - 1, tci)) }
+        if let ts = p.textSize { textSize = max(8, min(72, ts)) }
+        if let tf = p.textFont, let parsed = TextFontOption(rawValue: tf) { textFont = parsed }
+        if let tb = p.textBold { textBold = tb }
+        if let tbg = p.textBgHex { textBgHex = tbg }
     }
 
     private func persist() {
@@ -204,7 +248,13 @@ final class NotebookToolState: ObservableObject {
             eraserSizeIndex: eraserSizeIndex,
             eraseHlOnly: eraseHlOnly,
             laserColorHex: laserColorHex,
-            laserTrail: laserTrail
+            laserTrail: laserTrail,
+            textColors: textColors,
+            textColorIndex: textColorIndex,
+            textSize: textSize,
+            textFont: textFont.rawValue,
+            textBold: textBold,
+            textBgHex: textBgHex
         )
         if let data = try? JSONEncoder().encode(p) {
             UserDefaults.standard.set(data, forKey: prefsKey)
@@ -214,6 +264,7 @@ final class NotebookToolState: ObservableObject {
 
 private enum UndoAction {
     case strokes(pageKey: String, added: [InkStroke], removed: [InkStroke])
+    case texts(pageKey: String, added: [InkTextBox], removed: [InkTextBox])
     case addBlank(blank: BlankPage, strokes: [InkStroke])
     case deleteBlank(blank: BlankPage, strokes: [InkStroke])
     case setRemoved(pdfN: Int, newRemoved: Bool)
@@ -240,7 +291,183 @@ private final class InkScrollView: UIScrollView {
     }
 }
 
-final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
+
+/// Interactive Goodnotes-style inline text box editor hosted directly on `documentContainer`.
+private final class InlineTextBoxEditorView: UIView, UITextViewDelegate {
+    var pageKey: String
+    var pageFrame: CGRect
+    var box: InkTextBox
+    var originalBox: InkTextBox?
+    var smartDarkInk: Bool
+
+    var onChanged: ((InkTextBox) -> Void)?
+    var onCommitRequested: (() -> Void)?
+
+    private let dragBar = UIView()
+    private let gripPill = UIView()
+    private let textView = UITextView()
+    private let resizeHandle = UIView()
+    private let borderLayer = CAShapeLayer()
+    private let dragBarHeight: CGFloat = 18
+
+    private var dragStartOrigin: CGPoint = .zero
+    private var resizeStartWidth: CGFloat = 220
+
+    init(pageKey: String, pageFrame: CGRect, box: InkTextBox, originalBox: InkTextBox?, smartDarkInk: Bool) {
+        self.pageKey = pageKey
+        self.pageFrame = pageFrame
+        self.box = box
+        self.originalBox = originalBox
+        self.smartDarkInk = smartDarkInk
+        super.init(frame: .zero)
+        setupUI()
+        applyStyling()
+        updateFrameFromBox()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func setupUI() {
+        backgroundColor = .clear
+        clipsToBounds = false
+
+        borderLayer.fillColor = UIColor.clear.cgColor
+        borderLayer.strokeColor = UIColor.systemBlue.cgColor
+        borderLayer.lineWidth = 1.4
+        borderLayer.lineDashPattern = [5, 3]
+        layer.addSublayer(borderLayer)
+
+        // Top drag bar to reposition text box smoothly
+        dragBar.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.16)
+        dragBar.layer.cornerRadius = 5
+        dragBar.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        dragBar.isUserInteractionEnabled = true
+        addSubview(dragBar)
+
+        gripPill.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.7)
+        gripPill.layer.cornerRadius = 1.5
+        dragBar.addSubview(gripPill)
+
+        let dragPan = UIPanGestureRecognizer(target: self, action: #selector(handleDragPan(_:)))
+        dragPan.maximumNumberOfTouches = 1
+        dragBar.addGestureRecognizer(dragPan)
+
+        // Live UITextView
+        textView.delegate = self
+        textView.backgroundColor = .clear
+        textView.isScrollEnabled = false
+        textView.textContainerInset = UIEdgeInsets(top: 4, left: 6, bottom: 4, right: 6)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.autocorrectionType = .default
+        textView.spellCheckingType = .default
+        textView.text = box.text
+        addSubview(textView)
+
+        // Right-edge circular resize handle
+        resizeHandle.backgroundColor = .white
+        resizeHandle.layer.borderColor = UIColor.systemBlue.cgColor
+        resizeHandle.layer.borderWidth = 2.0
+        resizeHandle.layer.cornerRadius = 8
+        resizeHandle.isUserInteractionEnabled = true
+        addSubview(resizeHandle)
+
+        let resizePan = UIPanGestureRecognizer(target: self, action: #selector(handleResizePan(_:)))
+        resizePan.maximumNumberOfTouches = 1
+        resizeHandle.addGestureRecognizer(resizePan)
+    }
+
+    func focusTextView() {
+        textView.becomeFirstResponder()
+    }
+
+    func applyStyling() {
+        textView.font = box.resolvedUIFont()
+        textView.textColor = PageCanvasView.displayColor(for: box.color, smartDark: smartDarkInk)
+        textView.tintColor = UIColor.systemBlue
+        if let bgHex = box.bgColor, !bgHex.isEmpty {
+            textView.backgroundColor = UIColor(hex: bgHex).withAlphaComponent(smartDarkInk ? 0.24 : 0.88)
+            textView.layer.cornerRadius = 5
+        } else {
+            textView.backgroundColor = UIColor.systemBlue.withAlphaComponent(smartDarkInk ? 0.08 : 0.04)
+            textView.layer.cornerRadius = 5
+        }
+        updateFrameFromBox()
+    }
+
+    func updateFrameFromBox() {
+        box.text = textView.text ?? ""
+        let measured = box.measuredRect()
+        let totalW = max(72, measured.width)
+        let bodyH = max(32, measured.height)
+        frame = CGRect(
+            x: pageFrame.minX + CGFloat(box.x),
+            y: pageFrame.minY + CGFloat(box.y) - dragBarHeight,
+            width: totalW,
+            height: bodyH + dragBarHeight
+        )
+        dragBar.frame = CGRect(x: 0, y: 0, width: totalW, height: dragBarHeight)
+        gripPill.frame = CGRect(x: (totalW - 28) * 0.5, y: (dragBarHeight - 3) * 0.5, width: 28, height: 3)
+        textView.frame = CGRect(x: 0, y: dragBarHeight, width: totalW, height: bodyH)
+        resizeHandle.frame = CGRect(x: totalW - 8, y: dragBarHeight + (bodyH - 16) * 0.5, width: 16, height: 16)
+        borderLayer.path = UIBezierPath(roundedRect: CGRect(x: 0, y: 0, width: totalW, height: bodyH + dragBarHeight), cornerRadius: 5).cgPath
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        box.text = textView.text ?? ""
+        box.t = Int64(Date().timeIntervalSince1970 * 1000)
+        updateFrameFromBox()
+        onChanged?(box)
+    }
+
+    @objc private func handleDragPan(_ gr: UIPanGestureRecognizer) {
+        guard let parent = superview else { return }
+        switch gr.state {
+        case .began:
+            dragStartOrigin = CGPoint(x: CGFloat(box.x), y: CGFloat(box.y))
+        case .changed:
+            let tr = gr.translation(in: parent)
+            let nx = max(4, min(pageFrame.width - CGFloat(box.w) - 4, dragStartOrigin.x + tr.x))
+            let ny = max(4, min(pageFrame.height - 28, dragStartOrigin.y + tr.y))
+            box.x = (Double(nx) * 100).rounded() / 100
+            box.y = (Double(ny) * 100).rounded() / 100
+            box.t = Int64(Date().timeIntervalSince1970 * 1000)
+            updateFrameFromBox()
+            onChanged?(box)
+        default:
+            break
+        }
+    }
+
+    @objc private func handleResizePan(_ gr: UIPanGestureRecognizer) {
+        guard let parent = superview else { return }
+        switch gr.state {
+        case .began:
+            resizeStartWidth = CGFloat(box.w)
+        case .changed:
+            let tr = gr.translation(in: parent)
+            let maxAvail = max(90, pageFrame.width - CGFloat(box.x) - 6)
+            let nw = max(76, min(maxAvail, resizeStartWidth + tr.x))
+            box.w = (Double(nw) * 100).rounded() / 100
+            box.t = Int64(Date().timeIntervalSince1970 * 1000)
+            updateFrameFromBox()
+            onChanged?(box)
+        default:
+            break
+        }
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Allow tapping/dragging the protruding right-edge resize handle cleanly
+        if resizeHandle.frame.insetBy(dx: -10, dy: -10).contains(point) {
+            return resizeHandle
+        }
+        return super.hitTest(point, with: event)
+    }
+}
+
+final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     let pdfURL: URL
     let relativePath: String
     let toolState: NotebookToolState
@@ -290,6 +517,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var lassoSelection: LassoSelection?
     private var lassoClipboard: LassoClipboard?
 
+    // Active Inline Text Box Editor
+    private var activeTextEditor: InlineTextBoxEditorView?
+
     // Laser Pointer state
     private var laserPageView: PageCanvasView?
     private var laserPoints: [LaserPoint] = []
@@ -307,7 +537,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private var resignActiveObserver: NSObjectProtocol?
     private var memoryWarningObserver: NSObjectProtocol?
     private var settingsCancellables = Set<AnyCancellable>()
-    private var isTabActive: Bool = true
+    fileprivate var isTabActive: Bool = true
     private var currentReadingMode: PDFReadingMode = .original
     private var isHoboDoc: Bool = false
     private var lastHoboPlannerKey: String? = nil
@@ -386,32 +616,61 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func setupPencilInteraction() {
+        #if !targetEnvironment(macCatalyst)
         let interaction = UIPencilInteraction()
         interaction.delegate = self
         view.addInteraction(interaction)
+        #endif
     }
 
-    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
-        guard isTabActive else { return }
-        let action = AppSettings.shared.pencilDoubleTap
-        switch action {
-        case .off:
-            return
-        case .switchEraser:
-            let next: DrawingTool = (toolState.tool == .eraser) ? .pen : .eraser
-            toolState.previousTool = toolState.tool
-            toolState.tool = next
-            onToolChanged(to: next)
-            Haptics.light()
-            toolState.showToast(next == .eraser ? "Eraser" : "Pen")
-        case .switchLastTool:
-            let cur = toolState.tool
-            let prev = (toolState.previousTool == cur) ? .eraser : toolState.previousTool
-            toolState.previousTool = cur
-            toolState.tool = prev
-            onToolChanged(to: prev)
-            Haptics.light()
-            toolState.showToast(prev.rawValue.capitalized)
+
+
+    // MARK: - Mac & iPad Hardware Keyboard Shortcuts
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override var keyCommands: [UIKeyCommand]? {
+        [
+            UIKeyCommand(input: "z", modifierFlags: .command, action: #selector(kbUndo)),
+            UIKeyCommand(input: "z", modifierFlags: [.command, .shift], action: #selector(kbRedo)),
+            UIKeyCommand(input: "=", modifierFlags: .command, action: #selector(kbZoomIn)),
+            UIKeyCommand(input: "+", modifierFlags: .command, action: #selector(kbZoomIn)),
+            UIKeyCommand(input: "-", modifierFlags: .command, action: #selector(kbZoomOut)),
+            UIKeyCommand(input: "0", modifierFlags: .command, action: #selector(kbResetZoom)),
+            UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(kbEscape)),
+            UIKeyCommand(input: "\r", modifierFlags: .command, action: #selector(kbEscape))
+        ]
+    }
+
+    @objc private func kbUndo() {
+        guard activeTextEditor == nil else { return }
+        performUndo()
+    }
+
+    @objc private func kbRedo() {
+        guard activeTextEditor == nil else { return }
+        performRedo()
+    }
+
+    @objc private func kbZoomIn() {
+        let next = min(scrollView.maximumZoomScale, scrollView.zoomScale * 1.25)
+        scrollView.setZoomScale(next, animated: true)
+    }
+
+    @objc private func kbZoomOut() {
+        let next = max(scrollView.minimumZoomScale, scrollView.zoomScale / 1.25)
+        scrollView.setZoomScale(next, animated: true)
+    }
+
+    @objc private func kbResetZoom() {
+        resetZoom()
+    }
+
+    @objc private func kbEscape() {
+        if activeTextEditor != nil {
+            commitActiveTextBox()
+        } else if lassoSelection != nil {
+            clearLassoSelection(commitFirst: true)
         }
     }
 
@@ -471,6 +730,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             syncPollTimer?.invalidate()
             syncPollTimer = nil
             cancelHoldTimer()
+            commitActiveTextBox()
             clearLassoSelection(commitFirst: true)
             saveNow()
             evictOffscreenBitmaps(keepOnlyVisible: false)
@@ -529,6 +789,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         syncPollTimer?.invalidate()
         syncPollTimer = nil
         cancelHoldTimer()
+        commitActiveTextBox()
         clearLassoSelection(commitFirst: true)
         stopLaserLoop()
         saveNow()
@@ -572,6 +833,21 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
         pencilRecognizer.pencilOnly = true
         pencilRecognizer.delegate = self
+        pencilRecognizer.shouldAcceptTouch = { [weak self] touch in
+            guard let self else { return false }
+            // Never steal touches inside an active inline Text Box editor!
+            if let ed = self.activeTextEditor {
+                let pt = touch.location(in: ed)
+                if ed.bounds.insetBy(dx: -16, dy: -16).contains(pt) {
+                    return false
+                }
+            }
+            // Text tool uses dedicated tap gesture (works with finger, stylus, AND Mac mouse)
+            if self.toolState.tool == .text {
+                return false
+            }
+            return true
+        }
         pencilRecognizer.onPencilBegan = { [weak self] touch, event in
             self?.handlePencilBegan(touch, event: event)
         }
@@ -612,6 +888,15 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         twoFingerTap.require(toFail: threeFingerTap)
         scrollView.addGestureRecognizer(twoFingerTap)
         scrollView.addGestureRecognizer(threeFingerTap)
+
+        let textTap = UITapGestureRecognizer(target: self, action: #selector(handleTextToolTap(_:)))
+        textTap.numberOfTouchesRequired = 1
+        textTap.numberOfTapsRequired = 1
+        textTap.cancelsTouchesInView = false
+        textTap.delaysTouchesBegan = false
+        textTap.delaysTouchesEnded = false
+        textTap.delegate = self
+        scrollView.addGestureRecognizer(textTap)
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -642,6 +927,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     func onToolChanged(to newTool: DrawingTool) {
         if newTool != .lasso && lassoSelection != nil {
             clearLassoSelection(commitFirst: true)
+        }
+        if newTool != .text && activeTextEditor != nil {
+            commitActiveTextBox()
         }
     }
 
@@ -728,6 +1016,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             pv.frame = frame
             if let strokes = inkDoc.pages[slot.key], !strokes.isEmpty {
                 pv.setStrokes(strokes)
+            }
+            if let tBoxes = inkDoc.texts[slot.key], !tBoxes.isEmpty {
+                pv.setTextBoxes(tBoxes)
             }
             if let cached = preservedBitmaps[slot.key] {
                 pv.applyRenderedImage(cached.image, zoomScale: cached.zoom)
@@ -976,6 +1267,15 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
         if !copiedStrokes.isEmpty {
             inkDoc.pages[InkDocument.blankKey(blank.id)] = copiedStrokes
+        }
+        let srcTexts = inkDoc.texts[slot.key] ?? []
+        if !srcTexts.isEmpty {
+            let copiedTexts: [InkTextBox] = srcTexts.map { tb in
+                var c = tb
+                c.id = InkStroke.newID()
+                return c
+            }
+            inkDoc.texts[InkDocument.blankKey(blank.id)] = copiedTexts
         }
         pushUndo(.addBlank(blank: blank, strokes: copiedStrokes))
         rebuildPageViews(focusKey: InkDocument.blankKey(blank.id))
@@ -1246,12 +1546,13 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     func renderThumbnailAsync(for slot: PageSlot, targetWidth: CGFloat, completion: @escaping (UIImage?) -> Void) {
         let doc = pdfDoc
         let strokes = inkDoc.pages[slot.key] ?? []
+        let tBoxes = inkDoc.texts[slot.key] ?? []
         let hDoc = inkDoc
         let hSlots = pageSlots
         let hobo = isHoboDoc
         let scale = max(0.25, targetWidth / max(1, slot.size.width))
         renderQueue.async {
-            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: scale, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, textBoxes: tBoxes, scale: scale, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
             DispatchQueue.main.async {
                 completion(img)
             }
@@ -1259,9 +1560,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func exportCurrentPagePNG() {
+        commitActiveTextBox()
         clearLassoSelection(commitFirst: true)
         guard let slot = pageSlots[safe: toolState.currentPage - 1] else { return }
         let strokes = inkDoc.pages[slot.key] ?? []
+        let tBoxes = inkDoc.texts[slot.key] ?? []
         let doc = pdfDoc
         let hDoc = inkDoc
         let hSlots = pageSlots
@@ -1270,7 +1573,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let baseName = pdfURL.deletingPathExtension().lastPathComponent
         toolState.showToast("Rendering PNG…")
         renderQueue.async { [weak self] in
-            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, scale: 2.0, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
+            let img = PageCanvasView.renderCompositeImage(slot: slot, pdfDoc: doc, strokes: strokes, textBoxes: tBoxes, scale: 2.0, hoboDoc: hDoc, hoboAllSlots: hSlots, isHobo: hobo)
             guard let data = img.pngData() else { return }
             let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName) - Page \(pageNum).png")
             do {
@@ -1285,6 +1588,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func exportAnnotatedPDF() {
+        commitActiveTextBox()
         clearLassoSelection(commitFirst: true)
         let slots = pageSlots
         guard !slots.isEmpty else { return }
@@ -1292,6 +1596,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         let hDoc = inkDoc
         let hobo = isHoboDoc
         let pagesCopy = inkDoc.pages
+        let textsCopy = inkDoc.texts
         let baseName = pdfURL.deletingPathExtension().lastPathComponent
         toolState.showToast("Exporting PDF (\(slots.count) pages)…")
         renderQueue.async { [weak self] in
@@ -1307,6 +1612,9 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                         PageCanvasView.drawSlotBackground(slot: slot, pdfDoc: doc, in: cg, hoboDoc: hDoc, hoboAllSlots: slots, isHobo: hobo)
                         if let strokes = pagesCopy[slot.key], !strokes.isEmpty {
                             PageCanvasView.drawStrokes(strokes, in: cg)
+                        }
+                        if let tBoxes = textsCopy[slot.key], !tBoxes.isEmpty {
+                            PageCanvasView.drawTextBoxes(tBoxes, in: cg)
                         }
                     }
                 }
@@ -1327,6 +1635,208 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             pop.permittedArrowDirections = .up
         }
         present(avc, animated: true)
+    }
+
+
+    // MARK: - Text Box Tool (Create, Inline Edit, Drag, Resize, Style, Duplicate, Delete)
+
+    private func syncTextBoxUIState() {
+        let active = (activeTextEditor != nil)
+        DispatchQueue.main.async {
+            self.toolState.hasActiveTextBox = active
+        }
+    }
+
+    @objc private func handleTextToolTap(_ gr: UITapGestureRecognizer) {
+        guard gr.state == .ended else { return }
+
+        // If an editor is open and user tapped inside it, let UITextView handle cursor placement
+        if let ed = activeTextEditor {
+            let ptInEd = gr.location(in: ed)
+            if ed.bounds.insetBy(dx: -16, dy: -16).contains(ptInEd) {
+                return
+            }
+            // Tapped outside the open text box -> commit it cleanly!
+            commitActiveTextBox()
+            if toolState.tool != .text { return }
+        }
+
+        guard toolState.tool == .text else { return }
+        let docPt = gr.location(in: documentContainer)
+        guard let idx = pageFrames.firstIndex(where: { $0.contains(docPt) }) else { return }
+        let pv = pageViews[idx]
+        let frame = pageFrames[idx]
+        let localPt = CGPoint(x: docPt.x - frame.minX, y: docPt.y - frame.minY)
+
+        // Check if user tapped an existing text box on this page (topmost first)
+        let existing = inkDoc.texts[pv.pageKey] ?? []
+        for tb in existing.reversed() {
+            if tb.measuredRect().insetBy(dx: -8, dy: -8).contains(localPt) {
+                openTextBoxEditor(for: tb, original: tb, on: pv, pageFrame: frame)
+                return
+            }
+        }
+
+        // Otherwise create a brand new text box right where the user tapped!
+        let boxW = min(240.0, max(120.0, Double(pv.pageSize.width) - 24.0))
+        let clampedX = max(10.0, min(Double(pv.pageSize.width) - boxW - 10.0, Double(localPt.x) - 10.0))
+        let clampedY = max(10.0, min(Double(pv.pageSize.height) - 36.0, Double(localPt.y) - 10.0))
+        let fresh = InkTextBox(
+            x: (clampedX * 100).rounded() / 100,
+            y: (clampedY * 100).rounded() / 100,
+            w: (boxW * 100).rounded() / 100,
+            text: "",
+            fontSize: toolState.textSize,
+            color: toolState.activeTextColorHex,
+            fontName: toolState.textFont.rawValue,
+            bold: toolState.textBold,
+            bgColor: toolState.textBgHex.isEmpty ? nil : toolState.textBgHex
+        )
+        openTextBoxEditor(for: fresh, original: nil, on: pv, pageFrame: frame)
+    }
+
+    private func openTextBoxEditor(for box: InkTextBox, original: InkTextBox?, on pv: PageCanvasView, pageFrame: CGRect) {
+        commitActiveTextBox()
+        clearLassoSelection(commitFirst: true)
+
+        // Sync toolbar controls to the selected text box's properties
+        if let idx = toolState.textColors.firstIndex(where: { $0.caseInsensitiveCompare(box.color) == .orderedSame }) {
+            toolState.textColorIndex = idx
+        }
+        toolState.textSize = box.fontSize
+        toolState.textFont = TextFontOption(rawValue: box.fontName ?? "sans") ?? .sans
+        toolState.textBold = (box.bold == true)
+        toolState.textBgHex = box.bgColor ?? ""
+
+        let editor = InlineTextBoxEditorView(
+            pageKey: pv.pageKey,
+            pageFrame: pageFrame,
+            box: box,
+            originalBox: original,
+            smartDarkInk: (!pv.isHobonichiSlot && currentReadingMode == .dark)
+        )
+        editor.onCommitRequested = { [weak self] in
+            self?.commitActiveTextBox()
+        }
+        documentContainer.addSubview(editor)
+        activeTextEditor = editor
+        pv.setHiddenTextBoxID(original?.id)
+        syncTextBoxUIState()
+        editor.focusTextView()
+    }
+
+    func updateActiveTextBoxStyle() {
+        guard let ed = activeTextEditor else { return }
+        ed.box.color = toolState.activeTextColorHex
+        ed.box.fontSize = toolState.textSize
+        ed.box.fontName = toolState.textFont.rawValue
+        ed.box.bold = toolState.textBold
+        ed.box.bgColor = toolState.textBgHex.isEmpty ? nil : toolState.textBgHex
+        ed.box.t = Int64(Date().timeIntervalSince1970 * 1000)
+        ed.applyStyling()
+    }
+
+    func commitActiveTextBox() {
+        guard let ed = activeTextEditor else { return }
+        activeTextEditor = nil
+        ed.resignFirstResponder()
+        ed.removeFromSuperview()
+        syncTextBoxUIState()
+
+        let key = ed.pageKey
+        let original = ed.originalBox
+        var finalBox = ed.box
+        let cleaned = finalBox.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var list = inkDoc.texts[key] ?? []
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        if cleaned.isEmpty {
+            // Empty box: discard if new, or delete if editing an existing box
+            if let orig = original {
+                list.removeAll { $0.id == orig.id }
+                inkDoc.deleted[orig.id] = nowMs
+                if list.isEmpty { inkDoc.texts.removeValue(forKey: key) }
+                else { inkDoc.texts[key] = list }
+                pageView(forKey: key)?.setTextBoxes(list, hiddenID: nil)
+                pushUndo(.texts(pageKey: key, added: [], removed: [orig]))
+                scheduleSave()
+            } else {
+                pageView(forKey: key)?.setHiddenTextBoxID(nil)
+            }
+            return
+        }
+
+        finalBox.t = nowMs
+        if let orig = original {
+            let changed = (orig.text != finalBox.text
+                           || orig.x != finalBox.x || orig.y != finalBox.y || orig.w != finalBox.w
+                           || orig.fontSize != finalBox.fontSize || orig.color != finalBox.color
+                           || orig.fontName != finalBox.fontName || orig.bold != finalBox.bold
+                           || orig.bgColor != finalBox.bgColor)
+            if changed {
+                list.removeAll { $0.id == orig.id }
+                list.append(finalBox)
+                inkDoc.texts[key] = list
+                pageView(forKey: key)?.setTextBoxes(list, hiddenID: nil)
+                pushUndo(.texts(pageKey: key, added: [finalBox], removed: [orig]))
+                scheduleSave()
+            } else {
+                pageView(forKey: key)?.setHiddenTextBoxID(nil)
+            }
+        } else {
+            list.append(finalBox)
+            inkDoc.texts[key] = list
+            pageView(forKey: key)?.setTextBoxes(list, hiddenID: nil)
+            pushUndo(.texts(pageKey: key, added: [finalBox], removed: []))
+            scheduleSave()
+        }
+    }
+
+    func duplicateActiveTextBox() {
+        guard let ed = activeTextEditor else { return }
+        let key = ed.pageKey
+        let pFrame = ed.pageFrame
+        var copy = ed.box
+        commitActiveTextBox()
+        guard !copy.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let pv = pageView(forKey: key) else { return }
+        copy.id = InkStroke.newID()
+        copy.t = Int64(Date().timeIntervalSince1970 * 1000)
+        copy.x = min(Double(pv.pageSize.width) - copy.w - 6, copy.x + 16)
+        copy.y = min(Double(pv.pageSize.height) - 32, copy.y + 16)
+        var list = inkDoc.texts[key] ?? []
+        list.append(copy)
+        inkDoc.texts[key] = list
+        pv.setTextBoxes(list)
+        pushUndo(.texts(pageKey: key, added: [copy], removed: []))
+        scheduleSave()
+        openTextBoxEditor(for: copy, original: copy, on: pv, pageFrame: pFrame)
+        toolState.showToast("Text box duplicated")
+    }
+
+    func deleteActiveTextBox() {
+        guard let ed = activeTextEditor else { return }
+        let key = ed.pageKey
+        let orig = ed.originalBox
+        activeTextEditor = nil
+        ed.removeFromSuperview()
+        syncTextBoxUIState()
+
+        if let orig = orig {
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            var list = inkDoc.texts[key] ?? []
+            list.removeAll { $0.id == orig.id }
+            inkDoc.deleted[orig.id] = nowMs
+            if list.isEmpty { inkDoc.texts.removeValue(forKey: key) }
+            else { inkDoc.texts[key] = list }
+            pageView(forKey: key)?.setTextBoxes(list, hiddenID: nil)
+            pushUndo(.texts(pageKey: key, added: [], removed: [orig]))
+            scheduleSave()
+            toolState.showToast("Text box deleted")
+        } else {
+            pageView(forKey: key)?.setHiddenTextBoxID(nil)
+        }
     }
 
     // MARK: - Lasso Operations (Called from Floating Action Bar & Pencil)
@@ -2199,6 +2709,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func performUndo() {
+        commitActiveTextBox()
         clearLassoSelection(commitFirst: false)
         guard let action = undoStack.popLast() else { return }
         applyUndo(action, isRedo: false)
@@ -2208,6 +2719,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     func performRedo() {
+        commitActiveTextBox()
         clearLassoSelection(commitFirst: false)
         guard let action = redoStack.popLast() else { return }
         applyUndo(action, isRedo: true)
@@ -2236,6 +2748,25 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             if list.isEmpty { inkDoc.pages.removeValue(forKey: pageKey) }
             else { inkDoc.pages[pageKey] = list }
             pageView(forKey: pageKey)?.setStrokes(list)
+
+        case let .texts(pageKey, added, removed):
+            let toRemove = isRedo ? removed : added
+            let toAdd = isRedo ? added : removed
+            var list = inkDoc.texts[pageKey] ?? []
+            let remIds = Set(toRemove.map { $0.id })
+            if !remIds.isEmpty {
+                list.removeAll { remIds.contains($0.id) }
+                for id in remIds { inkDoc.deleted[id] = nowMs }
+            }
+            for tb in toAdd {
+                inkDoc.deleted.removeValue(forKey: tb.id)
+                list.removeAll { $0.id == tb.id }
+                list.append(tb)
+            }
+            list.sort { $0.t < $1.t }
+            if list.isEmpty { inkDoc.texts.removeValue(forKey: pageKey) }
+            else { inkDoc.texts[pageKey] = list }
+            pageView(forKey: pageKey)?.setTextBoxes(list)
 
         case let .addBlank(blank, strokes):
             if isRedo {
@@ -2357,20 +2888,45 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             }
         }
 
+        // Preserve any brand-new local text boxes created mid-flight
+        for (pageKey, localBoxes) in inkDoc.texts {
+            var cur = combined.texts[pageKey] ?? []
+            var changed = false
+            for tb in localBoxes where combined.deleted[tb.id] == nil {
+                if let idx = cur.firstIndex(where: { $0.id == tb.id }) {
+                    if tb.t > cur[idx].t { cur[idx] = tb; changed = true }
+                } else {
+                    cur.append(tb); changed = true
+                }
+            }
+            if changed {
+                cur.sort { $0.t != $1.t ? $0.t < $1.t : $0.id < $1.id }
+                combined.texts[pageKey] = cur
+            }
+        }
+
         let structureChanged = (inkDoc.blanks != combined.blanks || inkDoc.removed != combined.removed)
         let oldPages = inkDoc.pages
+        let oldTexts = inkDoc.texts
         inkDoc = combined
 
         if structureChanged {
+            commitActiveTextBox()
             clearLassoSelection(commitFirst: false)
             rebuildPageViews(focusKey: nil)
         } else {
             let hidden = lassoSelection?.hiddenStrokeIDs ?? []
+            let activeTextID = activeTextEditor?.originalBox?.id
             for pv in pageViews {
                 let newStrokes = inkDoc.pages[pv.pageKey] ?? []
                 let oldStrokes = oldPages[pv.pageKey] ?? []
                 if newStrokes.count != oldStrokes.count || Set(newStrokes.map { $0.id }) != Set(oldStrokes.map { $0.id }) {
                     pv.setStrokes(newStrokes, hiddenIDs: (lassoSelection?.pageKey == pv.pageKey) ? hidden : [])
+                }
+                let newTexts = inkDoc.texts[pv.pageKey] ?? []
+                let oldT = oldTexts[pv.pageKey] ?? []
+                if newTexts != oldT {
+                    pv.setTextBoxes(newTexts, hiddenID: (activeTextEditor?.pageKey == pv.pageKey) ? activeTextID : nil)
                 }
             }
             syncDocumentMetadataToUI()
@@ -2409,6 +2965,35 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
     }
 }
+
+
+#if !targetEnvironment(macCatalyst)
+extension PDFNotebookViewController: UIPencilInteractionDelegate {
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        guard isTabActive else { return }
+        let action = AppSettings.shared.pencilDoubleTap
+        switch action {
+        case .off:
+            return
+        case .switchEraser:
+            let next: DrawingTool = (toolState.tool == .eraser) ? .pen : .eraser
+            toolState.previousTool = toolState.tool
+            toolState.tool = next
+            onToolChanged(to: next)
+            Haptics.light()
+            toolState.showToast(next == .eraser ? "Eraser" : "Pen")
+        case .switchLastTool:
+            let cur = toolState.tool
+            let prev = (toolState.previousTool == cur) ? .eraser : toolState.previousTool
+            toolState.previousTool = cur
+            toolState.tool = prev
+            onToolChanged(to: prev)
+            Haptics.light()
+            toolState.showToast(prev.rawValue.capitalized)
+        }
+    }
+}
+#endif
 
 private extension Array {
     subscript(safe index: Int) -> Element? {

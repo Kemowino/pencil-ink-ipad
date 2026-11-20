@@ -202,6 +202,24 @@ enum WireCodec {
         }
     }
 
+    struct TextBoxesLogPayload: Codable {
+        var v: Int
+        var texts: [String: [InkTextBox]]
+
+        init(v: Int = 1, texts: [String: [InkTextBox]]) {
+            self.v = v
+            self.texts = texts
+        }
+
+        enum CodingKeys: String, CodingKey { case v, texts }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            v = (try? c.decode(Int.self, forKey: .v)) ?? 1
+            texts = (try? c.decode([String: [InkTextBox]].self, forKey: .texts)) ?? [:]
+        }
+    }
+
     static func encodePageShard(key: String, strokes: [InkStroke]) throws -> Data {
         let payload = PageShardPayload(v: 1, key: key, s: strokes.map { CompactStroke(from: $0) })
         let raw = try JSONEncoder().encode(payload)

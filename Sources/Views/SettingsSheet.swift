@@ -15,6 +15,7 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                #if !targetEnvironment(macCatalyst)
                 Section("Document Editing") {
                     settingsRow(icon: "pencil.tip", color: .blue) {
                         Picker("Apple Pencil Double-Tap", selection: $settings.pencilDoubleTap) {
@@ -36,6 +37,7 @@ struct SettingsSheet: View {
                         Toggle("Haptic Feedback", isOn: $settings.hapticsEnabled)
                     }
                 }
+                #endif
 
                 Section("Appearance & Reading") {
                     settingsRow(icon: "circle.lefthalf.filled", color: .blue) {
@@ -162,7 +164,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v1.1.0")
+                        Text("v1.2.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }

@@ -200,7 +200,7 @@ final class VaultManager: ObservableObject {
 
         do {
             let bookmark = try url.bookmarkData(
-                options: .minimalBookmark,
+                options: [],
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )

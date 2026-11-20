@@ -9,7 +9,10 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     TARGETED_DEVICE_FAMILY: "1,2"
+    SUPPORTS_MACCATALYST: YES
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
 targets:
   PencilInkNative:
     type: application
@@ -23,8 +26,8 @@ targets:
       properties:
         CFBundleDisplayName: Pencil Ink
         CFBundleName: PencilInkNative
-        CFBundleShortVersionString: "1.1.0"
-        CFBundleVersion: "12"
+        CFBundleShortVersionString: "1.2.0"
+        CFBundleVersion: "13"
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         UISupportsDocumentBrowser: true

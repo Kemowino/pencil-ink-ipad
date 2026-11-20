@@ -13,6 +13,30 @@ struct BookSyncSnapshot: Codable {
     var blanks: [String: BlankPage] = [:]
     var bookmarks: [String: PageMark] = [:]
     var removed: [String: PageMark] = [:]
+    var texts: [String: [InkTextBox]] = [:]
+
+    enum CodingKeys: String, CodingKey { case strokes, blanks, bookmarks, removed, texts }
+    init(
+        strokes: [String: String] = [:],
+        blanks: [String: BlankPage] = [:],
+        bookmarks: [String: PageMark] = [:],
+        removed: [String: PageMark] = [:],
+        texts: [String: [InkTextBox]] = [:]
+    ) {
+        self.strokes = strokes
+        self.blanks = blanks
+        self.bookmarks = bookmarks
+        self.removed = removed
+        self.texts = texts
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        strokes = (try? c.decode([String: String].self, forKey: .strokes)) ?? [:]
+        blanks = (try? c.decode([String: BlankPage].self, forKey: .blanks)) ?? [:]
+        bookmarks = (try? c.decode([String: PageMark].self, forKey: .bookmarks)) ?? [:]
+        removed = (try? c.decode([String: PageMark].self, forKey: .removed)) ?? [:]
+        texts = (try? c.decode([String: [InkTextBox]].self, forKey: .texts)) ?? [:]
+    }
 }
 
 struct RemoteLogEntry: Codable, Sendable {
@@ -22,6 +46,7 @@ struct RemoteLogEntry: Codable, Sendable {
     var erased: [String: Int64]?
     var bookmarks: [String: PageMark]?
     var removed: [String: PageMark]?
+    var texts: [String: [InkTextBox]]?
 }
 
 struct BookLogState: Codable {
@@ -31,11 +56,36 @@ struct BookLogState: Codable {
     var ownBlanks: [String: BlankPage] = [:]
     var ownBookmarks: [String: PageMark] = [:]
     var ownRemoved: [String: PageMark] = [:]
+    var ownTexts: [String: [InkTextBox]] = [:]
     var erased: [String: Int64] = [:]
     var dirty: [String] = []
     var ids: [String: String] = [:]
     var seenMd5: [String: String] = [:]
     var base: BookSyncSnapshot? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case label, folderId, own, ownBlanks, ownBookmarks, ownRemoved, ownTexts, erased, dirty, ids, seenMd5, base
+    }
+
+    init(label: String) {
+        self.label = label
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        label = (try? c.decode(String.self, forKey: .label)) ?? "ios"
+        folderId = (try? c.decode(String.self, forKey: .folderId)) ?? ""
+        own = (try? c.decode([String: [InkStroke]].self, forKey: .own)) ?? [:]
+        ownBlanks = (try? c.decode([String: BlankPage].self, forKey: .ownBlanks)) ?? [:]
+        ownBookmarks = (try? c.decode([String: PageMark].self, forKey: .ownBookmarks)) ?? [:]
+        ownRemoved = (try? c.decode([String: PageMark].self, forKey: .ownRemoved)) ?? [:]
+        ownTexts = (try? c.decode([String: [InkTextBox]].self, forKey: .ownTexts)) ?? [:]
+        erased = (try? c.decode([String: Int64].self, forKey: .erased)) ?? [:]
+        dirty = (try? c.decode([String].self, forKey: .dirty)) ?? []
+        ids = (try? c.decode([String: String].self, forKey: .ids)) ?? [:]
+        seenMd5 = (try? c.decode([String: String].self, forKey: .seenMd5)) ?? [:]
+        base = try? c.decode(BookSyncSnapshot.self, forKey: .base)
+    }
 
     static func pageFile(label: String, key: String) -> String {
         "log_\(label)_p\(key.replacingOccurrences(of: ":", with: "~")).json"
@@ -43,6 +93,7 @@ struct BookLogState: Codable {
     static func blanksFile(label: String) -> String { "log_\(label)_blanks.json" }
     static func marksFile(label: String) -> String { "log_\(label)_marks.json" }
     static func eraseFile(label: String) -> String { "log_\(label)_erase.json" }
+    static func textsFile(label: String) -> String { "txt_\(label).json" }
     static func keyOfFile(_ name: String) -> String {
         guard let r = name.range(of: "_p") else { return "1" }
         var tail = String(name[r.upperBound...])
@@ -158,7 +209,12 @@ final class DriveSyncManager: ObservableObject {
 
     private static func generateDeviceLabel() -> String {
         let chars = Array("abcdefghijklmnopqrstuvwxyz0123456789")
-        return "ios" + String((0..<6).map { _ in chars.randomElement()! })
+        #if targetEnvironment(macCatalyst)
+        let prefix = "mac"
+        #else
+        let prefix = "ios"
+        #endif
+        return prefix + String((0..<6).map { _ in chars.randomElement()! })
     }
 
     func saveConfig() {
@@ -546,6 +602,7 @@ final class DriveSyncManager: ObservableObject {
                     if !st.erased.isEmpty { st.markDirty(BookLogState.eraseFile(label: st.label)) }
                     if !st.ownBlanks.isEmpty { st.markDirty(BookLogState.blanksFile(label: st.label)) }
                     if !st.ownBookmarks.isEmpty || !st.ownRemoved.isEmpty { st.markDirty(BookLogState.marksFile(label: st.label)) }
+                    if !st.ownTexts.isEmpty { st.markDirty(BookLogState.textsFile(label: st.label)) }
                 }
                 folderID = first.id
                 extraFolderIDs = chosenFolders.dropFirst().map { $0.id }
@@ -576,7 +633,8 @@ final class DriveSyncManager: ObservableObject {
 
         // Map our own existing log files inside canonical primary folder & flag duplicates
         var duplicateIDs: [String] = []
-        for f in listing where f.name.hasPrefix("log_\(st.label)_") {
+        let ownTextsFileName = BookLogState.textsFile(label: st.label)
+        for f in listing where f.name.hasPrefix("log_\(st.label)_") || f.name == ownTextsFileName {
             let inPrimary = (f.parents?.contains(folderID) ?? true)
             if inPrimary {
                 if st.ids[f.name] == nil {
@@ -590,7 +648,9 @@ final class DriveSyncManager: ObservableObject {
         // 2. Pull ALL other devices' changed `log_*` files across ALL matching folders in parallel!
         var remoteGroups: [String: [DriveFileMeta]] = [:]
         for f in listing {
-            if !f.name.hasPrefix("log_") || f.name.hasPrefix("log_\(st.label)_") { continue }
+            let isRemoteLog = f.name.hasPrefix("log_") && !f.name.hasPrefix("log_\(st.label)_")
+            let isRemoteTxt = f.name.hasPrefix("txt_") && f.name.hasSuffix(".json") && f.name != ownTextsFileName
+            if !isRemoteLog && !isRemoteTxt { continue }
             remoteGroups[f.name, default: []].append(f)
         }
 
@@ -699,6 +759,8 @@ final class DriveSyncManager: ObservableObject {
                     payload = try JSONEncoder().encode(WireCodec.BlanksLogPayload(v: 1, blanks: Array(st.ownBlanks.values)))
                 } else if name.hasSuffix("_marks.json") {
                     payload = try JSONEncoder().encode(WireCodec.MarksLogPayload(v: 1, bookmarks: st.ownBookmarks, removed: st.ownRemoved))
+                } else if name.hasPrefix("txt_") && name.hasSuffix(".json") {
+                    payload = try JSONEncoder().encode(WireCodec.TextBoxesLogPayload(v: 1, texts: st.ownTexts))
                 } else {
                     let pageKey = BookLogState.keyOfFile(name)
                     payload = try WireCodec.encodePageShard(key: pageKey, strokes: st.own[pageKey] ?? [])
@@ -776,7 +838,8 @@ final class DriveSyncManager: ObservableObject {
             strokes: strokesMap,
             blanks: doc.blanks,
             bookmarks: doc.bookmarks,
-            removed: doc.removed
+            removed: doc.removed,
+            texts: doc.texts
         )
     }
 
@@ -821,6 +884,18 @@ final class DriveSyncManager: ObservableObject {
             if let have = view.removed[k], m.t <= have.t { continue }
             st.ownRemoved[k] = m
             st.markDirty(BookLogState.marksFile(label: st.label))
+        }
+        for (pageKey, list) in local.texts {
+            let remoteById = Dictionary(uniqueKeysWithValues: (view.texts[pageKey] ?? []).map { ($0.id, $0) })
+            for tb in list {
+                if view.deleted[tb.id] != nil || st.erased[tb.id] != nil { continue }
+                if let rtb = remoteById[tb.id], rtb.t >= tb.t { continue }
+                var cur = st.ownTexts[pageKey] ?? []
+                cur.removeAll { $0.id == tb.id }
+                cur.append(tb)
+                st.ownTexts[pageKey] = cur
+                st.markDirty(BookLogState.textsFile(label: st.label))
+            }
         }
     }
 
@@ -893,6 +968,46 @@ final class DriveSyncManager: ObservableObject {
                 st.markDirty(BookLogState.marksFile(label: st.label))
             }
         }
+        // Diff text boxes (supports additions, inline edits/moves via higher `t`, and deletions via tombstone)
+        var localTextById: [String: (pageKey: String, box: InkTextBox)] = [:]
+        for (pk, list) in local.texts {
+            for tb in list { localTextById[tb.id] = (pk, tb) }
+        }
+        var baseTextById: [String: (pageKey: String, box: InkTextBox)] = [:]
+        for (pk, list) in base.texts {
+            for tb in list { baseTextById[tb.id] = (pk, tb) }
+        }
+        var remoteTextById: [String: InkTextBox] = [:]
+        if let rv = remoteView {
+            for list in rv.texts.values {
+                for tb in list { remoteTextById[tb.id] = tb }
+            }
+        }
+        for (id, item) in localTextById {
+            let was = baseTextById[id]?.box
+            if was == nil || was != item.box {
+                if let rtb = remoteTextById[id], rtb.t >= item.box.t && rtb == item.box {
+                    continue
+                }
+                if remoteView?.deleted[id] != nil { continue }
+                var cur = st.ownTexts[item.pageKey] ?? []
+                cur.removeAll { $0.id == id }
+                cur.append(item.box)
+                st.ownTexts[item.pageKey] = cur
+                st.markDirty(BookLogState.textsFile(label: st.label))
+            }
+        }
+        for (id, _) in baseTextById where localTextById[id] == nil {
+            st.eraseOwn(id: id, nowMs: nowMs)
+            for pk in Array(st.ownTexts.keys) {
+                if var list = st.ownTexts[pk], list.contains(where: { $0.id == id }) {
+                    list.removeAll { $0.id == id }
+                    st.ownTexts[pk] = list
+                    st.markDirty(BookLogState.textsFile(label: st.label))
+                }
+            }
+        }
+        base.texts = local.texts
         st.base = base
     }
 
@@ -955,12 +1070,39 @@ final class DriveSyncManager: ObservableObject {
             else { pages[key] = filtered }
         }
 
+        // Merge text boxes LWW by timestamp `t` across ownTexts + remote entries, filtering tombstones
+        var textsById: [String: (pageKey: String, box: InkTextBox)] = [:]
+        func mergeText(_ pageKey: String, _ tb: InkTextBox) {
+            guard erased[tb.id] == nil else { return }
+            if let cur = textsById[tb.id], cur.box.t >= tb.t { return }
+            textsById[tb.id] = (pageKey, tb)
+        }
+        for (pk, list) in st.ownTexts {
+            for tb in list { mergeText(pk, tb) }
+        }
+        for entry in seen.values {
+            if let tMap = entry.texts {
+                for (pk, list) in tMap {
+                    for tb in list { mergeText(pk, tb) }
+                }
+            }
+        }
+        var mergedTexts: [String: [InkTextBox]] = [:]
+        for (_, item) in textsById {
+            if item.pageKey.hasPrefix("b:") && blanks[String(item.pageKey.dropFirst(2))] == nil { continue }
+            mergedTexts[item.pageKey, default: []].append(item.box)
+        }
+        for pk in mergedTexts.keys {
+            mergedTexts[pk]?.sort { $0.t != $1.t ? $0.t < $1.t : $0.id < $1.id }
+        }
+
         var doc = InkDocument.empty(name: name)
         doc.pages = pages
         doc.blanks = blanks
         doc.bookmarks = bookmarks
         doc.removed = removed
         doc.deleted = erased
+        doc.texts = mergedTexts
         doc.layoutBlanks()
         return doc
     }
@@ -980,6 +1122,11 @@ final class DriveSyncManager: ObservableObject {
             let raw = WireCodec.isGzip(bytes) ? ((try? WireCodec.gzipDecompress(bytes)) ?? bytes) : bytes
             guard let p = try? JSONDecoder().decode(WireCodec.MarksLogPayload.self, from: raw) else { return nil }
             return RemoteLogEntry(bookmarks: p.bookmarks, removed: p.removed)
+        }
+        if name.hasPrefix("txt_") && name.hasSuffix(".json") {
+            let raw = WireCodec.isGzip(bytes) ? ((try? WireCodec.gzipDecompress(bytes)) ?? bytes) : bytes
+            guard let p = try? JSONDecoder().decode(WireCodec.TextBoxesLogPayload.self, from: raw) else { return nil }
+            return RemoteLogEntry(texts: p.texts)
         }
         guard let shard = WireCodec.decodePageShard(bytes) else { return nil }
         return RemoteLogEntry(key: shard.key, strokes: shard.strokes)
@@ -1011,11 +1158,26 @@ final class DriveSyncManager: ObservableObject {
             for (k, m) in brm where rm[k] == nil || m.t > rm[k]!.t { rm[k] = m }
             out.removed = rm
         }
+        if let bt = b.texts {
+            var merged = out.texts ?? [:]
+            for (pk, list) in bt {
+                var cur = merged[pk] ?? []
+                for tb in list {
+                    if let idx = cur.firstIndex(where: { $0.id == tb.id }) {
+                        if tb.t > cur[idx].t { cur[idx] = tb }
+                    } else {
+                        cur.append(tb)
+                    }
+                }
+                merged[pk] = cur
+            }
+            out.texts = merged
+        }
         return out
     }
 
     private func sameContent(_ a: InkDocument, _ b: InkDocument) -> Bool {
-        if a.blanks != b.blanks || a.bookmarks != b.bookmarks || a.removed != b.removed { return false }
+        if a.blanks != b.blanks || a.bookmarks != b.bookmarks || a.removed != b.removed || a.texts != b.texts { return false }
         if Set(a.pages.keys) != Set(b.pages.keys) { return false }
         for (k, listA) in a.pages {
             let listB = b.pages[k] ?? []

@@ -274,6 +274,98 @@ struct InkStroke: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+
+struct InkTextBox: Codable, Identifiable, Equatable, Sendable {
+    var id: String
+    var t: Int64
+    var x: Double
+    var y: Double
+    var w: Double
+    var text: String
+    var fontSize: Double
+    var color: String
+    var fontName: String?   // "sans" | "serif" | "mono"
+    var bold: Bool?
+    var bgColor: String?    // nil = clear, or hex tint
+
+    init(
+        id: String = InkStroke.newID(),
+        t: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
+        x: Double,
+        y: Double,
+        w: Double = 220,
+        text: String = "",
+        fontSize: Double = 16,
+        color: String = "#1c1c1e",
+        fontName: String? = "sans",
+        bold: Bool? = false,
+        bgColor: String? = nil
+    ) {
+        self.id = id
+        self.t = t
+        self.x = x
+        self.y = y
+        self.w = max(60, w)
+        self.text = text
+        self.fontSize = max(8, min(96, fontSize))
+        self.color = color
+        self.fontName = fontName
+        self.bold = bold
+        self.bgColor = bgColor
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, t, x, y, w, text, fontSize, color, fontName, bold, bgColor
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        if let ti = try? c.decode(Int64.self, forKey: .t) { t = ti }
+        else if let td = try? c.decode(Double.self, forKey: .t) { t = Int64(td.rounded()) }
+        else { t = 0 }
+        x = (try? c.decode(Double.self, forKey: .x)) ?? 40
+        y = (try? c.decode(Double.self, forKey: .y)) ?? 40
+        w = max(60, (try? c.decode(Double.self, forKey: .w)) ?? 220)
+        text = (try? c.decode(String.self, forKey: .text)) ?? ""
+        fontSize = max(8, min(96, (try? c.decode(Double.self, forKey: .fontSize)) ?? 16))
+        color = (try? c.decode(String.self, forKey: .color)) ?? "#1c1c1e"
+        fontName = try? c.decode(String.self, forKey: .fontName)
+        bold = try? c.decode(Bool.self, forKey: .bold)
+        bgColor = try? c.decode(String.self, forKey: .bgColor)
+    }
+
+    func resolvedUIFont() -> UIFont {
+        let sz = CGFloat(fontSize)
+        let isBold = (bold == true)
+        switch fontName ?? "sans" {
+        case "serif":
+            let base = UIFont(name: isBold ? "Georgia-Bold" : "Georgia", size: sz)
+            return base ?? UIFont.systemFont(ofSize: sz, weight: isBold ? .bold : .regular)
+        case "mono":
+            return UIFont.monospacedSystemFont(ofSize: sz, weight: isBold ? .bold : .regular)
+        default:
+            return UIFont.systemFont(ofSize: sz, weight: isBold ? .bold : .regular)
+        }
+    }
+
+    func measuredRect() -> CGRect {
+        let padX: CGFloat = 6
+        let padY: CGFloat = 4
+        let font = resolvedUIFont()
+        let str = (text.isEmpty ? " " : text) as NSString
+        let constraint = CGSize(width: max(48, CGFloat(w) - padX * 2), height: 4000)
+        let bounds = str.boundingRect(
+            with: constraint,
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font],
+            context: nil
+        )
+        let h = max(font.lineHeight + padY * 2 + 2, ceil(bounds.height) + padY * 2 + 4)
+        return CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(w), height: h)
+    }
+}
+
 struct InkDocument: Codable {
     var version: Int
     var name: String
@@ -283,9 +375,10 @@ struct InkDocument: Codable {
     var blanks: [String: BlankPage]
     var bookmarks: [String: PageMark]
     var removed: [String: PageMark]
+    var texts: [String: [InkTextBox]]
 
     enum CodingKeys: String, CodingKey {
-        case version, name, pages, deleted, updated, blanks, bookmarks, removed
+        case version, name, pages, deleted, updated, blanks, bookmarks, removed, texts
     }
 
     init(
@@ -296,7 +389,8 @@ struct InkDocument: Codable {
         updated: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
         blanks: [String: BlankPage] = [:],
         bookmarks: [String: PageMark] = [:],
-        removed: [String: PageMark] = [:]
+        removed: [String: PageMark] = [:],
+        texts: [String: [InkTextBox]] = [:]
     ) {
         self.version = version
         self.name = name
@@ -306,6 +400,7 @@ struct InkDocument: Codable {
         self.blanks = blanks
         self.bookmarks = bookmarks
         self.removed = removed
+        self.texts = texts
     }
 
     init(from decoder: Decoder) throws {
@@ -318,6 +413,7 @@ struct InkDocument: Codable {
         blanks = (try? c.decode([String: BlankPage].self, forKey: .blanks)) ?? [:]
         bookmarks = (try? c.decode([String: PageMark].self, forKey: .bookmarks)) ?? [:]
         removed = (try? c.decode([String: PageMark].self, forKey: .removed)) ?? [:]
+        texts = (try? c.decode([String: [InkTextBox]].self, forKey: .texts)) ?? [:]
     }
 
     static func blankKey(_ id: String) -> String { "b:" + id }

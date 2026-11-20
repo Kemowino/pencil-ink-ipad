@@ -1,7 +1,7 @@
 import SwiftUI
 
 private enum ToolPopoverKind: Int, Identifiable {
-    case pen, highlighter, eraser, laser, jumpPage, sync
+    case pen, highlighter, eraser, text, laser, jumpPage, sync
     var id: Int { rawValue }
 }
 
@@ -94,6 +94,12 @@ struct NotebookScreen: View {
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
 
+                    if toolState.hasActiveTextBox {
+                        textBoxActionBar
+                            .padding(.top, toolState.hasLassoSelection ? 0 : 10)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
                     if !toolState.toastMessage.isEmpty {
                         Text(toolState.toastMessage)
                             .font(.system(size: 12.5, weight: .semibold, design: .rounded))
@@ -157,8 +163,21 @@ struct NotebookScreen: View {
                 }
                 .animation(.easeOut(duration: 0.18), value: toolState.toastMessage)
                 .animation(.easeOut(duration: 0.18), value: toolState.hasLassoSelection)
+                .animation(.easeOut(duration: 0.18), value: toolState.hasActiveTextBox)
             }
         }
+        .background(
+            Button("") {
+                if isActive {
+                    controllerBox.vc?.commitActiveTextBox()
+                    openOverviewInSearch = true
+                    showPageOverview = true
+                }
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .opacity(0)
+            .allowsHitTesting(false)
+        )
         .sheet(isPresented: $showPageOverview) {
             PageOverviewSheet(
                 toolState: toolState,
@@ -387,82 +406,95 @@ struct NotebookScreen: View {
     // MARK: - Row 2: Goodnotes Signature Centered Drawing Tool Bar
 
     private var goodnotesToolBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 14) {
-                // Core Goodnotes Tool Icons
-                HStack(spacing: 8) {
-                    toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
-                        GoodnotesPenIcon(
-                            inkColor: Color(UIColor(hex: toolState.activePenColorHex)),
-                            isActive: toolState.tool == .pen,
-                            isDark: colorScheme == .dark
-                        )
-                    } action: {
-                        if toolState.tool == .pen { activePopover = .pen }
-                        else { selectTool(.pen) }
-                    }
-                    .popover(isPresented: Binding(
-                        get: { activePopover == .pen },
-                        set: { if !$0 { activePopover = nil } }
-                    )) { penSettingsPopover }
+        GeometryReader { geo in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    // Core Goodnotes Tool Icons (Pen, Eraser, Highlighter, Lasso, Text Box, Laser)
+                    HStack(spacing: 7) {
+                        toolSlotButton(active: toolState.tool == .pen, accent: .blue) {
+                            GoodnotesPenIcon(
+                                inkColor: Color(UIColor(hex: toolState.activePenColorHex)),
+                                isActive: toolState.tool == .pen,
+                                isDark: colorScheme == .dark
+                            )
+                        } action: {
+                            if toolState.tool == .pen { activePopover = .pen }
+                            else { selectTool(.pen) }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { activePopover == .pen },
+                            set: { if !$0 { activePopover = nil } }
+                        )) { penSettingsPopover }
 
-                    toolSlotButton(active: toolState.tool == .eraser, accent: .blue) {
-                        GoodnotesEraserIcon(isActive: toolState.tool == .eraser, isDark: colorScheme == .dark)
-                    } action: {
-                        if toolState.tool == .eraser { activePopover = .eraser }
-                        else { selectTool(.eraser) }
-                    }
-                    .popover(isPresented: Binding(
-                        get: { activePopover == .eraser },
-                        set: { if !$0 { activePopover = nil } }
-                    )) { eraserSettingsPopover }
+                        toolSlotButton(active: toolState.tool == .eraser, accent: .blue) {
+                            GoodnotesEraserIcon(isActive: toolState.tool == .eraser, isDark: colorScheme == .dark)
+                        } action: {
+                            if toolState.tool == .eraser { activePopover = .eraser }
+                            else { selectTool(.eraser) }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { activePopover == .eraser },
+                            set: { if !$0 { activePopover = nil } }
+                        )) { eraserSettingsPopover }
 
-                    toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
-                        GoodnotesHighlighterIcon(
-                            accentColor: Color(UIColor(hex: toolState.activeHlColorHex)),
-                            isActive: toolState.tool == .highlighter,
-                            isDark: colorScheme == .dark
-                        )
-                    } action: {
-                        if toolState.tool == .highlighter { activePopover = .highlighter }
-                        else { selectTool(.highlighter) }
-                    }
-                    .popover(isPresented: Binding(
-                        get: { activePopover == .highlighter },
-                        set: { if !$0 { activePopover = nil } }
-                    )) { highlighterSettingsPopover }
+                        toolSlotButton(active: toolState.tool == .highlighter, accent: .blue) {
+                            GoodnotesHighlighterIcon(
+                                accentColor: Color(UIColor(hex: toolState.activeHlColorHex)),
+                                isActive: toolState.tool == .highlighter,
+                                isDark: colorScheme == .dark
+                            )
+                        } action: {
+                            if toolState.tool == .highlighter { activePopover = .highlighter }
+                            else { selectTool(.highlighter) }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { activePopover == .highlighter },
+                            set: { if !$0 { activePopover = nil } }
+                        )) { highlighterSettingsPopover }
 
-                    toolSlotButton(active: toolState.tool == .lasso, accent: .blue) {
-                        GoodnotesLassoIcon(isActive: toolState.tool == .lasso, isDark: colorScheme == .dark)
-                    } action: {
-                        selectTool(.lasso)
+                        toolSlotButton(active: toolState.tool == .lasso, accent: .blue) {
+                            GoodnotesLassoIcon(isActive: toolState.tool == .lasso, isDark: colorScheme == .dark)
+                        } action: {
+                            selectTool(.lasso)
+                        }
+
+                        toolSlotButton(active: toolState.tool == .text, accent: .blue) {
+                            GoodnotesTextIcon(isActive: toolState.tool == .text, isDark: colorScheme == .dark)
+                        } action: {
+                            if toolState.tool == .text { activePopover = .text }
+                            else { selectTool(.text) }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { activePopover == .text },
+                            set: { if !$0 { activePopover = nil } }
+                        )) { textSettingsPopover }
+
+                        toolSlotButton(active: toolState.tool == .laser, accent: .red) {
+                            GoodnotesLaserIcon(
+                                laserColor: Color(UIColor(hex: toolState.laserColorHex)),
+                                isActive: toolState.tool == .laser,
+                                isDark: colorScheme == .dark
+                            )
+                        } action: {
+                            if toolState.tool == .laser { activePopover = .laser }
+                            else { selectTool(.laser) }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { activePopover == .laser },
+                            set: { if !$0 { activePopover = nil } }
+                        )) { laserSettingsPopover }
                     }
 
-                    toolSlotButton(active: toolState.tool == .laser, accent: .red) {
-                        GoodnotesLaserIcon(
-                            laserColor: Color(UIColor(hex: toolState.laserColorHex)),
-                            isActive: toolState.tool == .laser,
-                            isDark: colorScheme == .dark
-                        )
-                    } action: {
-                        if toolState.tool == .laser { activePopover = .laser }
-                        else { selectTool(.laser) }
-                    }
-                    .popover(isPresented: Binding(
-                        get: { activePopover == .laser },
-                        set: { if !$0 { activePopover = nil } }
-                    )) { laserSettingsPopover }
+                    Rectangle()
+                        .fill(hairlineColor)
+                        .frame(width: 1, height: 22)
+
+                    // Contextual Quick Swatches & Goodnotes Diagonal Stroke-Width / Font Controls
+                    contextualSlots
                 }
-
-                Rectangle()
-                    .fill(hairlineColor)
-                    .frame(width: 1, height: 22)
-
-                // Contextual Quick Swatches & Goodnotes Diagonal Stroke-Width Icons
-                contextualSlots
+                .padding(.horizontal, 16)
+                .frame(minWidth: geo.size.width, minHeight: geo.size.height)
             }
-            .padding(.horizontal, 16)
-            .frame(minWidth: UIScreen.main.bounds.width)
         }
         .frame(height: settings.compactToolbar ? 42 : 48)
         .background(secondaryBarBg)
@@ -575,6 +607,86 @@ struct NotebookScreen: View {
                  : (toolState.hasLassoClipboard ? "Circle strokes or tap page to paste" : "Circle handwriting to select"))
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundColor(.secondary)
+
+        case .text:
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    ForEach(0..<toolState.textColors.count, id: \.self) { idx in
+                        colorSwatch(hex: toolState.textColors[idx], selected: toolState.textColorIndex == idx) {
+                            if toolState.textColorIndex == idx {
+                                activePopover = .text
+                            } else {
+                                toolState.textColorIndex = idx
+                                controllerBox.vc?.updateActiveTextBoxStyle()
+                                Haptics.selection()
+                            }
+                        }
+                    }
+                }
+
+                Rectangle()
+                    .fill(hairlineColor)
+                    .frame(width: 1, height: 20)
+
+                HStack(spacing: 5) {
+                    Button {
+                        toolState.textSize = max(8, toolState.textSize - 2)
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                        Haptics.selection()
+                    } label: {
+                        Image(systemName: "minus")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary.opacity(0.8))
+                            .frame(width: 24, height: 26)
+                            .background(Color.primary.opacity(0.06))
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        activePopover = .text
+                    } label: {
+                        Text("\(Int(toolState.textSize))pt")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundColor(.primary)
+                            .frame(minWidth: 38)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        toolState.textSize = min(72, toolState.textSize + 2)
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                        Haptics.selection()
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary.opacity(0.8))
+                            .frame(width: 24, height: 26)
+                            .background(Color.primary.opacity(0.06))
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Rectangle()
+                    .fill(hairlineColor)
+                    .frame(width: 1, height: 20)
+
+                Button {
+                    toolState.textBold.toggle()
+                    controllerBox.vc?.updateActiveTextBoxStyle()
+                    Haptics.selection()
+                } label: {
+                    Text("B")
+                        .font(.system(size: 14, weight: .bold, design: .serif))
+                        .foregroundColor(toolState.textBold ? .white : .primary.opacity(0.8))
+                        .frame(width: 28, height: 28)
+                        .background(toolState.textBold ? Color.accentColor : Color.primary.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
 
         case .laser:
             HStack(spacing: 10) {
@@ -705,6 +817,120 @@ struct NotebookScreen: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+
+    // Floating Action Pill while typing/editing a Text Box
+    private var textBoxActionBar: some View {
+        HStack(spacing: 8) {
+            Text("Drag top bar to move · Drag edge dot to resize")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.secondary)
+                .padding(.leading, 4)
+            Divider().frame(height: 16)
+            lassoPillButton("Style") { activePopover = .text }
+            lassoPillButton("Duplicate") { controllerBox.vc?.duplicateActiveTextBox(); Haptics.light() }
+            lassoPillButton("Delete", danger: true) { controllerBox.vc?.deleteActiveTextBox(); Haptics.light() }
+            Button {
+                controllerBox.vc?.commitActiveTextBox()
+                Haptics.light()
+            } label: {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 24, height: 24)
+                    .background(Color.accentColor)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.regularMaterial)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(hairlineColor, lineWidth: 0.9))
+        .shadow(color: .black.opacity(0.20), radius: 10, y: 4)
+    }
+
+    private var textSettingsPopover: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Text Box Style").font(.headline)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Font").font(.caption.bold()).foregroundColor(.secondary)
+                Picker("Font", selection: $toolState.textFont) {
+                    ForEach(TextFontOption.allCases) { f in
+                        Text(f.title).tag(f)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: toolState.textFont) { _ in
+                    controllerBox.vc?.updateActiveTextBoxStyle()
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Font Size").font(.caption.bold()).foregroundColor(.secondary)
+                    Spacer()
+                    Text("\(Int(toolState.textSize)) pt")
+                        .font(.caption.bold())
+                        .foregroundColor(.accentColor)
+                }
+                Slider(value: $toolState.textSize, in: 8...72, step: 1)
+                    .onChange(of: toolState.textSize) { _ in
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                    }
+            }
+
+            Toggle("Bold Text", isOn: $toolState.textBold)
+                .font(.subheadline.weight(.medium))
+                .onChange(of: toolState.textBold) { _ in
+                    controllerBox.vc?.updateActiveTextBoxStyle()
+                }
+
+            ColorPicker(
+                "Text Color",
+                selection: Binding(
+                    get: { Color(UIColor(hex: toolState.activeTextColorHex)) },
+                    set: {
+                        toolState.textColors[toolState.textColorIndex] = UIColor($0).toHexString()
+                        controllerBox.vc?.updateActiveTextBoxStyle()
+                    }
+                ),
+                supportsOpacity: false
+            )
+            .font(.subheadline.weight(.medium))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Box Background").font(.caption.bold()).foregroundColor(.secondary)
+                HStack(spacing: 8) {
+                    ForEach(toolState.textBgPresets, id: \.hex) { preset in
+                        let selected = (toolState.textBgHex == preset.hex)
+                        Button {
+                            toolState.textBgHex = preset.hex
+                            controllerBox.vc?.updateActiveTextBoxStyle()
+                            Haptics.selection()
+                        } label: {
+                            Text(preset.name)
+                                .font(.system(size: 11.5, weight: selected ? .bold : .medium))
+                                .foregroundColor(selected ? .white : .primary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    selected
+                                        ? Color.accentColor
+                                        : (preset.hex.isEmpty ? Color.primary.opacity(0.08) : Color(UIColor(hex: preset.hex)).opacity(0.65))
+                                )
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .frame(width: 300)
     }
 
     // MARK: - Tool Settings Popovers (Goodnotes Style)
@@ -1140,6 +1366,41 @@ private struct GoodnotesLaserIcon: View {
             let coreR: CGFloat = 2.8
             let core = Path(ellipseIn: CGRect(x: cx - coreR, y: cy - coreR, width: coreR * 2, height: coreR * 2))
             ctx.fill(core, with: .color(dot))
+        }
+        .frame(width: 22, height: 22)
+    }
+}
+
+
+private struct GoodnotesTextIcon: View {
+    let isActive: Bool
+    let isDark: Bool
+
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width, h = size.height
+            let stroke: Color = isActive ? (isDark ? .white : .blue) : (isDark ? .white.opacity(0.86) : Color(white: 0.22))
+
+            // Dashed square text-box outline (classic Goodnotes Text Tool icon!)
+            let boxRect = CGRect(x: w * 0.12, y: h * 0.14, width: w * 0.76, height: h * 0.72)
+            let boxPath = Path(roundedRect: boxRect, cornerRadius: 3.5)
+            ctx.stroke(boxPath, with: .color(stroke.opacity(0.82)), style: StrokeStyle(lineWidth: 1.35, lineCap: .round, dash: [3.0, 2.2]))
+
+            // Crisp serif-like T in the center
+            var tTop = Path()
+            tTop.move(to: CGPoint(x: w * 0.32, y: h * 0.34))
+            tTop.addLine(to: CGPoint(x: w * 0.68, y: h * 0.34))
+            ctx.stroke(tTop, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
+
+            var tStem = Path()
+            tStem.move(to: CGPoint(x: w * 0.50, y: h * 0.34))
+            tStem.addLine(to: CGPoint(x: w * 0.50, y: h * 0.70))
+            ctx.stroke(tStem, with: .color(stroke), style: StrokeStyle(lineWidth: 1.85, lineCap: .round))
+
+            var tBase = Path()
+            tBase.move(to: CGPoint(x: w * 0.42, y: h * 0.70))
+            tBase.addLine(to: CGPoint(x: w * 0.58, y: h * 0.70))
+            ctx.stroke(tBase, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
         }
         .frame(width: 22, height: 22)
     }

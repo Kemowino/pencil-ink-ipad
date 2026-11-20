@@ -1,11 +1,8 @@
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 
-/// Hardware-level Apple Pencil / 3rd-party stylus recognizer.
-/// Follows Apple's "Leveraging Touch Input for Drawing Apps" pattern:
-/// - `allowedTouchTypes = [.pencil]` so fingers NEVER trigger drawing.
-/// - `requiresExclusiveTouchType = false` so a resting palm NEVER blocks the stylus.
-/// - `cancelsTouchesInView = false` so it NEVER interferes with UIScrollView's finger pan/pinch.
+/// Hardware-level Apple Pencil / 3rd-party stylus recognizer on iPadOS,
+/// and seamless Mouse / Trackpad pointer click-and-drag recognizer on Mac Catalyst.
 final class PencilDrawingGestureRecognizer: UIGestureRecognizer {
     var onPencilBegan: ((UITouch, UIEvent?) -> Void)?
     var onPencilMoved: ((UITouch, UIEvent?) -> Void)?
@@ -13,32 +10,58 @@ final class PencilDrawingGestureRecognizer: UIGestureRecognizer {
     var onPencilCancelled: ((UITouch, UIEvent?) -> Void)?
     var onPencilReset: (() -> Void)?
 
+    /// Optional gate so tapping inside an active live UITextView or handle doesn't steal input.
+    var shouldAcceptTouch: ((UITouch) -> Bool)?
+
     private var activeTouch: UITouch?
 
     var pencilOnly: Bool = true {
         didSet {
-            if pencilOnly {
-                allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
-            } else {
-                allowedTouchTypes = [
-                    NSNumber(value: UITouch.TouchType.pencil.rawValue),
-                    NSNumber(value: UITouch.TouchType.direct.rawValue)
-                ]
-            }
+            configureAllowedTouchTypes()
         }
+    }
+
+    private func configureAllowedTouchTypes() {
+        #if targetEnvironment(macCatalyst)
+        allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.pencil.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
+            NSNumber(value: UITouch.TouchType.direct.rawValue)
+        ]
+        #else
+        if pencilOnly {
+            allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        } else {
+            allowedTouchTypes = [
+                NSNumber(value: UITouch.TouchType.pencil.rawValue),
+                NSNumber(value: UITouch.TouchType.direct.rawValue)
+            ]
+        }
+        #endif
     }
 
     override init(target: Any?, action: Selector?) {
         super.init(target: target, action: action)
-        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        configureAllowedTouchTypes()
         requiresExclusiveTouchType = false
         cancelsTouchesInView = false
         delaysTouchesBegan = false
         delaysTouchesEnded = false
     }
 
+    private func isValidInputTouch(_ touch: UITouch) -> Bool {
+        if let gate = shouldAcceptTouch, !gate(touch) {
+            return false
+        }
+        #if targetEnvironment(macCatalyst)
+        return touch.type == .indirectPointer || touch.type == .pencil || touch.type == .direct
+        #else
+        return !pencilOnly || touch.type == .pencil
+        #endif
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        let valid = touches.filter { !pencilOnly || $0.type == .pencil }
+        let valid = touches.filter { isValidInputTouch($0) }
         if activeTouch == nil {
             guard let touch = valid.first else {
                 state = .failed

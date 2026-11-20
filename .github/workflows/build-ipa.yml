@@ -1,4 +1,4 @@
-name: Build Pencil Ink iPad IPA
+name: Build Pencil Ink (iPad IPA + macOS App)
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build-ipa:
+  build-release:
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -21,7 +21,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build unsigned Release .app
+      - name: Build iPadOS Release .app
         run: |
           xcodebuild \
             -project PencilInkNative.xcodeproj \
@@ -29,38 +29,66 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
+            -derivedDataPath build-ios \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package unsigned .ipa
+      - name: Package iPadOS .ipa
         run: |
+          rm -rf Payload PencilInkNative.ipa
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/PencilInkNative.app Payload/
+          cp -r build-ios/Build/Products/Release-iphoneos/PencilInkNative.app Payload/
           zip -r -9 PencilInkNative.ipa Payload
           ls -lh PencilInkNative.ipa
 
-      - name: Upload workflow artifact
+      - name: Build Universal macOS Catalyst .app (Intel x86_64 + Apple Silicon)
+        run: |
+          xcodebuild \
+            -project PencilInkNative.xcodeproj \
+            -scheme PencilInkNative \
+            -configuration Release \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath build-mac \
+            ARCHS="x86_64 arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Ad-hoc Sign & Package macOS .app
+        run: |
+          APP_PATH="build-mac/Build/Products/Release-maccatalyst/PencilInkNative.app"
+          codesign --force --deep --sign - "$APP_PATH"
+          lipo -info "$APP_PATH/Contents/MacOS/PencilInkNative"
+          rm -f PencilInkNative-macOS.zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" PencilInkNative-macOS.zip
+          ls -lh PencilInkNative-macOS.zip
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PencilInkNative-IPA
-          path: PencilInkNative.ipa
+          name: PencilInkNative-Builds
+          path: |
+            PencilInkNative.ipa
+            PencilInkNative-macOS.zip
           retention-days: 30
 
-      - name: Publish IPA to GitHub Releases
+      - name: Publish iPad IPA & macOS App to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-1.1.0}"
+          TAG="v${VER:-1.2.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" PencilInkNative.ipa --clobber
+            gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
-            gh release create "$TAG" PencilInkNative.ipa \
+            gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Complete Goodnotes-style UI Redesign (Library Grid with + New Tile & Fixed Landscape PDFs, House Icon Flat Tabs, Edge-to-Edge Split Toolbar, Goodnotes Page Overview, and Adaptive Light/Dark Themes)." \
+              --notes "Pencil Ink Native $TAG — Universal Intel & Apple Silicon macOS App + iPadOS IPA, Text Box Tool with live Drive sync, and Authentic Goodnotes 6 Rounded Folder Tabs." \
               --latest
           fi
