@@ -1,6 +1,6 @@
 import AppKit
 
-/// Pure AppKit circular color swatch button (zero SwiftUI, crisp native highlight ring).
+/// Pure AppKit circular color swatch button with crisp macOS selection ring.
 private final class MacColorSwatchButton: NSButton {
     let hexColor: String
     var isSwatchSelected: Bool = false {
@@ -32,7 +32,7 @@ private final class MacColorSwatchButton: NSButton {
         let inner = bounds.insetBy(dx: 4, dy: 4)
         ctx.setFillColor(NSColor.cached(hex: hexColor).cgColor)
         ctx.fillEllipse(in: inner)
-        ctx.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.20).cgColor)
+        ctx.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.22).cgColor)
         ctx.setLineWidth(0.8)
         ctx.strokeEllipse(in: inner)
 
@@ -45,6 +45,49 @@ private final class MacColorSwatchButton: NSButton {
     }
 }
 
+/// Proportional dot thickness button (Goodnotes/Preview aesthetic).
+private final class MacThicknessDotButton: NSButton {
+    let dotDiameter: CGFloat
+    var isDotSelected: Bool = false {
+        didSet { if isDotSelected != oldValue { needsDisplay = true } }
+    }
+
+    init(diameter: CGFloat, target: AnyObject?, action: Selector?) {
+        self.dotDiameter = diameter
+        super.init(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+        self.isBordered = false
+        self.title = ""
+        self.target = target
+        self.action = action
+        self.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 26),
+            heightAnchor.constraint(equalToConstant: 26)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        if isDotSelected {
+            let bg = bounds.insetBy(dx: 1.5, dy: 1.5)
+            ctx.setFillColor(NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor)
+            ctx.fillEllipse(in: bg)
+            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor)
+            ctx.setLineWidth(1.3)
+            ctx.strokeEllipse(in: bg)
+        }
+        let r = dotDiameter * 0.5
+        let dotRect = CGRect(x: bounds.midX - r, y: bounds.midY - r, width: dotDiameter, height: dotDiameter)
+        let col = isDotSelected ? NSColor.controlAccentColor : NSColor.labelColor.withAlphaComponent(0.75)
+        ctx.setFillColor(col.cgColor)
+        ctx.fillEllipse(in: dotRect)
+    }
+}
+
 /// Slim contextual AppKit accessory bar shown ONLY when Highlighter or Text Box mode is active.
 /// Completely hidden (0 px height, 0 CPU) in Read mode!
 @MainActor
@@ -54,15 +97,15 @@ final class MacToolOptionsBar: NSView {
     var onDeleteTextBox: (() -> Void)?
     var onCommitTextBox: (() -> Void)?
 
-    private let divider = NSBox()
+    private let bottomDivider = NSBox()
     private let hlStack = NSStackView()
     private let textStack = NSStackView()
 
     // Highlighter controls
     private var hlSwatchButtons: [MacColorSwatchButton] = []
-    private let hlSizeSegment = NSSegmentedControl(labels: ["Fine", "Med", "Thick"], trackingMode: .selectOne, target: nil, action: nil)
-    private let hlStraightCheck = NSButton(checkboxWithTitle: "Straight Line", target: nil, action: nil)
-    private let hlHintLabel = NSTextField(labelWithString: "Drag to highlight · Shift = straight · Option-Click = erase")
+    private var hlDotButtons: [MacThicknessDotButton] = []
+    private let hlStraightBtn = NSButton()
+    private let hlHintLabel = NSTextField(labelWithString: "Drag to highlight  ·  Shift = straight  ·  Option-Click = erase")
 
     // Text Box controls
     private var textSwatchButtons: [MacColorSwatchButton] = []
@@ -87,7 +130,7 @@ final class MacToolOptionsBar: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         setupUI()
         syncFromPreferences()
     }
@@ -98,24 +141,27 @@ final class MacToolOptionsBar: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+    }
+
+    private func makeVDivider() -> NSBox {
+        let b = NSBox()
+        b.boxType = .separator
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        return b
     }
 
     private func setupUI() {
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(divider)
+        bottomDivider.boxType = .separator
+        bottomDivider.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(bottomDivider)
 
         // Highlighter Stack
         hlStack.orientation = .horizontal
         hlStack.alignment = .centerY
         hlStack.spacing = 8
         hlStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let hlLbl = NSTextField(labelWithString: "Highlighter:")
-        hlLbl.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        hlLbl.textColor = .secondaryLabelColor
-        hlStack.addArrangedSubview(hlLbl)
 
         for (idx, hex) in MacPreferences.shared.hlColors.enumerated() {
             let sw = MacColorSwatchButton(hex: hex, target: self, action: #selector(hlSwatchClicked(_:)))
@@ -124,15 +170,27 @@ final class MacToolOptionsBar: NSView {
             hlStack.addArrangedSubview(sw)
         }
 
-        hlSizeSegment.controlSize = .small
-        hlSizeSegment.target = self
-        hlSizeSegment.action = #selector(hlSizeChanged)
-        hlStack.addArrangedSubview(hlSizeSegment)
+        hlStack.addArrangedSubview(makeVDivider())
 
-        hlStraightCheck.controlSize = .small
-        hlStraightCheck.target = self
-        hlStraightCheck.action = #selector(hlStraightChanged)
-        hlStack.addArrangedSubview(hlStraightCheck)
+        let diameters: [CGFloat] = [6.5, 10.5, 14.5]
+        for (idx, d) in diameters.enumerated() {
+            let btn = MacThicknessDotButton(diameter: d, target: self, action: #selector(hlDotClicked(_:)))
+            btn.tag = idx
+            hlDotButtons.append(btn)
+            hlStack.addArrangedSubview(btn)
+        }
+
+        hlStack.addArrangedSubview(makeVDivider())
+
+        hlStraightBtn.title = "Straight"
+        hlStraightBtn.image = NSImage(systemSymbolName: "ruler", accessibilityDescription: "Straight")
+        hlStraightBtn.imagePosition = .imageLeading
+        hlStraightBtn.bezelStyle = .rounded
+        hlStraightBtn.setButtonType(.pushOnPushOff)
+        hlStraightBtn.controlSize = .small
+        hlStraightBtn.target = self
+        hlStraightBtn.action = #selector(hlStraightChanged)
+        hlStack.addArrangedSubview(hlStraightBtn)
 
         let hlSpacer = NSView()
         hlSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -149,17 +207,14 @@ final class MacToolOptionsBar: NSView {
         textStack.spacing = 7
         textStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let txtLbl = NSTextField(labelWithString: "Text:")
-        txtLbl.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        txtLbl.textColor = .secondaryLabelColor
-        textStack.addArrangedSubview(txtLbl)
-
         for (idx, hex) in MacPreferences.shared.textColors.enumerated() {
             let sw = MacColorSwatchButton(hex: hex, target: self, action: #selector(textSwatchClicked(_:)))
             sw.tag = idx
             textSwatchButtons.append(sw)
             textStack.addArrangedSubview(sw)
         }
+
+        textStack.addArrangedSubview(makeVDivider())
 
         fontPopup.controlSize = .small
         fontPopup.addItems(withTitles: ["Sans", "Serif", "Mono"])
@@ -221,7 +276,6 @@ final class MacToolOptionsBar: NSView {
 
         doneBoxBtn.bezelStyle = .rounded
         doneBoxBtn.controlSize = .small
-        doneBoxBtn.keyEquivalent = ""
         doneBoxBtn.target = self
         doneBoxBtn.action = #selector(doneClicked)
         textStack.addArrangedSubview(doneBoxBtn)
@@ -229,9 +283,9 @@ final class MacToolOptionsBar: NSView {
         addSubview(textStack)
 
         NSLayoutConstraint.activate([
-            divider.leadingAnchor.constraint(equalTo: leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: trailingAnchor),
-            divider.bottomAnchor.constraint(equalTo: bottomAnchor),
+            bottomDivider.leadingAnchor.constraint(equalTo: leadingAnchor),
+            bottomDivider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bottomDivider.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             hlStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             hlStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
@@ -264,8 +318,10 @@ final class MacToolOptionsBar: NSView {
         for (i, btn) in hlSwatchButtons.enumerated() {
             btn.isSwatchSelected = (i == p.hlColorIndex)
         }
-        hlSizeSegment.selectedSegment = max(0, min(2, p.hlSizeIndex))
-        hlStraightCheck.state = p.hlStraight ? .on : .off
+        for (i, btn) in hlDotButtons.enumerated() {
+            btn.isDotSelected = (i == p.hlSizeIndex)
+        }
+        hlStraightBtn.state = p.hlStraight ? .on : .off
 
         for (i, btn) in textSwatchButtons.enumerated() {
             btn.isSwatchSelected = (i == p.textColorIndex)
@@ -288,12 +344,13 @@ final class MacToolOptionsBar: NSView {
         syncFromPreferences()
     }
 
-    @objc private func hlSizeChanged() {
-        MacPreferences.shared.hlSizeIndex = hlSizeSegment.selectedSegment
+    @objc private func hlDotClicked(_ sender: MacThicknessDotButton) {
+        MacPreferences.shared.hlSizeIndex = sender.tag
+        syncFromPreferences()
     }
 
     @objc private func hlStraightChanged() {
-        MacPreferences.shared.hlStraight = (hlStraightCheck.state == .on)
+        MacPreferences.shared.hlStraight = (hlStraightBtn.state == .on)
     }
 
     @objc private func textSwatchClicked(_ sender: MacColorSwatchButton) {

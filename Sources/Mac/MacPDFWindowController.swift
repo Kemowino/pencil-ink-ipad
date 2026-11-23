@@ -11,6 +11,7 @@ private extension NSToolbarItem.Identifier {
     static let zoomControls = NSToolbarItem.Identifier("pencilink.zoomControls")
     static let pageIndicator = NSToolbarItem.Identifier("pencilink.pageIndicator")
     static let syncStatus = NSToolbarItem.Identifier("pencilink.syncStatus")
+    static let diagnostics = NSToolbarItem.Identifier("pencilink.diagnostics")
 }
 
 private enum MacUndoAction {
@@ -18,9 +19,11 @@ private enum MacUndoAction {
     case texts(pageKey: String, added: [InkTextBox], removed: [InkTextBox])
 }
 
-/// Pure AppKit tabbed PDF Reader & Annotation window running directly on Apple Preview's `PDFView`
-/// + `PDFPageOverlayViewProvider` with zero Catalyst/SwiftUI overhead, inline `NSTextView` text boxes,
-/// drag & selection highlighting, Undo/Redo, Export Annotated PDF, and full Google Drive CRDT sync.
+/// Pure AppKit tabbed PDF Reader & Annotation window running directly on Apple Preview's `PDFView`:
+/// - **True Zero-Overlay Read Mode:** `pageOverlayViewProvider` is `nil` when a PDF has no ink/text in Read mode,
+///   and `overlayViewFor` returns `nil` on unannotated pages even in annotated PDFs (100% Preview fast-path!).
+/// - **Zero Double PDFDocument Load:** Small `.ink.json` sidecars (< 2 MB) load before `MacVirtualPDFBuilder` runs.
+/// - Clean native macOS `.unified` toolbar with SF Symbol icon-menus, contextual tool bar, & Self-Test hooks.
 @MainActor
 final class MacPDFWindowController: NSWindowController,
     NSWindowDelegate, NSToolbarDelegate,
@@ -31,6 +34,7 @@ final class MacPDFWindowController: NSWindowController,
     let syncManager: DriveSyncManager
     var onRequestNewTab: ((MacPDFWindowController) -> Void)?
     var onRequestOpenSyncSettings: (() -> Void)?
+    var onRequestOpenDiagnostics: (() -> Void)?
     var onWindowClosed: ((MacPDFWindowController) -> Void)?
 
     private let splitVC = NSSplitViewController()
@@ -43,6 +47,7 @@ final class MacPDFWindowController: NSWindowController,
     private var virtualResult: MacVirtualPDFResult?
     private var overlayByPageID: [ObjectIdentifier: MacPageOverlayView] = [:]
     private var overlayByKey: [String: MacPageOverlayView] = [:]
+    private var overlayProviderAttached = false
 
     // Static cached SF Symbol images (ZERO per-page/per-tick NSImage lookups!)
     private static let iconBookmark = NSImage(systemSymbolName: "bookmark", accessibilityDescription: "Bookmark")
@@ -51,13 +56,16 @@ final class MacPDFWindowController: NSWindowController,
     private static let iconSyncing = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.icloud", accessibilityDescription: "Syncing")
     private static let iconSyncError = NSImage(systemSymbolName: "exclamationmark.icloud", accessibilityDescription: "Sync Error")
     private static let iconSyncOff = NSImage(systemSymbolName: "icloud.slash", accessibilityDescription: "Disconnected")
+    private static let iconPaperOrig = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Original Paper")
+    private static let iconPaperSepia = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Warm Sepia")
+    private static let iconPaperDark = NSImage(systemSymbolName: "moon.fill", accessibilityDescription: "Dark Paper")
 
     // Toolbar controls
-    private let modeSegment = NSSegmentedControl(labels: ["Read", "Highlight", "Text Box"], trackingMode: .selectOne, target: nil, action: nil)
+    private let modeSegment = NSSegmentedControl()
     private let bookmarkButton = NSButton()
-    private let paperPopup = NSPopUpButton()
+    private let paperButton = NSButton()
     private let pageField = NSTextField()
-    private let syncButton = NSButton(title: "Sync", target: nil, action: nil)
+    private let syncButton = NSButton(title: "", target: nil, action: nil)
 
     // State, Undo/Redo & Coalesced Leeway Timers
     private var undoStack: [MacUndoAction] = []
@@ -104,13 +112,13 @@ final class MacPDFWindowController: NSWindowController,
         self.inkDoc = InkDocument.empty(name: relativePath)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 780),
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 800),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         win.title = pdfURL.deletingPathExtension().lastPathComponent
-        win.minSize = NSSize(width: 640, height: 480)
+        win.minSize = NSSize(width: 660, height: 480)
         win.tabbingMode = .preferred
         win.tabbingIdentifier = "PencilInkDocumentTab"
         win.titlebarAppearsTransparent = false
@@ -137,24 +145,24 @@ final class MacPDFWindowController: NSWindowController,
     // MARK: - Native AppKit Toolbar & Split View
 
     private func setupToolbar() {
-        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("PencilInkMacToolbar"))
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("PencilInkMacToolbarV31"))
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
         window?.toolbar = toolbar
-        window?.toolbarStyle = .unifiedCompact
+        window?.toolbarStyle = .unified
     }
 
     private func setupSplitView() {
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
-        sidebarItem.minimumThickness = 210
+        sidebarItem.minimumThickness = 220
         sidebarItem.maximumThickness = 360
         sidebarItem.canCollapse = true
-        sidebarItem.isCollapsed = true // Collapsed by default for zero sidebar CPU!
+        sidebarItem.isCollapsed = true
         sidebarVC.delegate = self
 
         let contentVC = NSViewController()
-        let hostView = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 700))
+        let hostView = NSView(frame: NSRect(x: 0, y: 0, width: 840, height: 720))
 
         optionsBar.translatesAutoresizingMaskIntoConstraints = false
         optionsBar.isHidden = true
@@ -174,7 +182,9 @@ final class MacPDFWindowController: NSWindowController,
 
         pdfView.translatesAutoresizingMaskIntoConstraints = false
         pdfView.canvasDelegate = self
-        pdfView.pageOverlayViewProvider = self
+        // Overlay provider attaches lazily ONLY if the book has annotations or user enters Highlight/Text Box mode!
+        pdfView.pageOverlayViewProvider = nil
+        overlayProviderAttached = false
         hostView.addSubview(pdfView)
 
         let barH = optionsBar.heightAnchor.constraint(equalToConstant: 0)
@@ -204,7 +214,7 @@ final class MacPDFWindowController: NSWindowController,
         let hasActiveBox = (activeTextEditor != nil)
         let shouldShow = (pdfView.toolMode != .read) || hasActiveBox
         optionsBar.isHidden = !shouldShow
-        optionsBarHeightConstraint?.constant = shouldShow ? 36 : 0
+        optionsBarHeightConstraint?.constant = shouldShow ? 38 : 0
         if shouldShow {
             optionsBar.update(for: pdfView.toolMode, hasActiveTextBox: hasActiveBox)
         }
@@ -252,9 +262,66 @@ final class MacPDFWindowController: NSWindowController,
         optionsBar.syncFromPreferences()
     }
 
-    // MARK: - Document Loading (Instant PDF Open + Async `.ink.json` Merge)
+    // MARK: - Zero-Overlay Fast-Path Management
+
+    private var documentHasAnyOverlayContent: Bool {
+        !inkDoc.pages.isEmpty || !inkDoc.texts.isEmpty
+    }
+
+    private func syncOverlayProviderAttachment(forceRefresh: Bool = false) {
+        let shouldAttach = (pdfView.toolMode != .read) || documentHasAnyOverlayContent || (activeTextEditor != nil)
+        if !shouldAttach {
+            if overlayProviderAttached {
+                pdfView.pageOverlayViewProvider = nil
+                overlayProviderAttached = false
+                overlayByPageID.removeAll()
+                overlayByKey.removeAll()
+            }
+            return
+        }
+
+        if !overlayProviderAttached || forceRefresh {
+            let savedOrigin = pdfView.documentView?.enclosingScrollView?.contentView.bounds.origin
+            if overlayProviderAttached {
+                pdfView.pageOverlayViewProvider = nil
+                overlayByPageID.removeAll()
+                overlayByKey.removeAll()
+            }
+            pdfView.pageOverlayViewProvider = self
+            overlayProviderAttached = true
+            if let origin = savedOrigin, let scroll = pdfView.documentView?.enclosingScrollView {
+                scroll.contentView.scroll(to: origin)
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+        }
+    }
+
+    // MARK: - Document Loading (Single-Pass PDFDocument Build — Zero Double Open!)
 
     private func loadDocumentAndInk() {
+        let sidecar = InkDocument.sidecarURL(for: pdfURL)
+        let sidecarSize: Int64 = {
+            guard FileManager.default.fileExists(atPath: sidecar.path),
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: sidecar.path),
+                  let sz = attrs[.size] as? NSNumber else { return 0 }
+            return sz.int64Value
+        }()
+
+        // Fast-path: for no sidecar or normal sidecars (< 2 MB, parses in < 2 ms), load synchronously BEFORE building PDFDocument so we never build PDFDocument twice!
+        if sidecarSize < 2 * 1024 * 1024 {
+            var loaded = InkDocument.load(for: pdfURL)
+            if loaded.name.isEmpty { loaded.name = relativePath }
+            isInitialInkLoaded = true
+            if let built = MacVirtualPDFBuilder.build(from: pdfURL, inkDoc: &loaded) {
+                self.inkDoc = loaded
+                applyVirtualResult(built, preservePageIndex: nil)
+                restoreSavedPageIfPossible()
+            }
+            startSmartDriveSync()
+            return
+        }
+
+        // Giant (> 2 MB) sidecar fallback: show PDF immediately and merge asynchronously
         var emptyDoc = inkDoc
         if let built = MacVirtualPDFBuilder.build(from: pdfURL, inkDoc: &emptyDoc) {
             self.inkDoc = emptyDoc
@@ -301,6 +368,12 @@ final class MacPDFWindowController: NSWindowController,
         overlayByPageID.removeAll()
         overlayByKey.removeAll()
         virtualResult = res
+
+        // Attach or detach overlay provider BEFORE assigning `pdfView.document` so PDFKit initializes cleanly in 1 pass!
+        let shouldAttach = (pdfView.toolMode != .read) || documentHasAnyOverlayContent
+        pdfView.pageOverlayViewProvider = shouldAttach ? self : nil
+        overlayProviderAttached = shouldAttach
+
         pdfView.document = res.document
         pdfView.autoScales = true
         pdfView.applyPaperMode(MacPreferences.shared.paperMode)
@@ -322,13 +395,11 @@ final class MacPDFWindowController: NSWindowController,
             updatePageIndicatorAndBookmarkUI()
             pendingSavedPageRestore = nil
         } else if !isInitialInkLoaded {
-            // Hobonichi journals or PDFs with inserted blank pages: defer jump until async inkDoc finishes loading!
             pendingSavedPageRestore = saved
         }
     }
 
     private func applyLoadedOrRemoteInkDoc(_ remoteMerged: InkDocument) {
-        // Preserve any brand-new local highlights or text boxes created while Drive sync was in flight!
         var combined = remoteMerged
         for (pageKey, localList) in inkDoc.pages {
             var cur = combined.pages[pageKey] ?? []
@@ -370,6 +441,13 @@ final class MacPDFWindowController: NSWindowController,
                 applyVirtualResult(rebuilt, preservePageIndex: min(curIdx, max(0, rebuilt.slots.count - 1)))
             }
         } else {
+            // Check if any currently visible page gained annotations while having no mounted overlay yet
+            let visibleNeedsMount = pdfView.visiblePages.contains { page in
+                let pid = ObjectIdentifier(page)
+                guard overlayByPageID[pid] == nil, let slot = virtualResult?.slotByPageID[pid] else { return false }
+                return !(inkDoc.pages[slot.key]?.isEmpty ?? true) || !(inkDoc.texts[slot.key]?.isEmpty ?? true)
+            }
+            syncOverlayProviderAttachment(forceRefresh: visibleNeedsMount)
             refreshAllMountedOverlays()
             sidebarVC.updateBookmarks(currentBookmarkItems())
             updatePageIndicatorAndBookmarkUI()
@@ -415,7 +493,7 @@ final class MacPDFWindowController: NSWindowController,
         return out
     }
 
-    // MARK: - PDFPageOverlayViewProvider (Zero-Cost Overlay Management, macOS 13.0+ Safe)
+    // MARK: - PDFPageOverlayViewProvider (Zero-Overlay Unannotated Read Fast-Path!)
 
     func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> NSView? {
         let pid = ObjectIdentifier(page)
@@ -423,11 +501,16 @@ final class MacPDFWindowController: NSWindowController,
             return existing
         }
         guard let slot = virtualResult?.slotByPageID[pid] else { return nil }
+        let strokes = inkDoc.pages[slot.key] ?? []
+        let texts = inkDoc.texts[slot.key] ?? []
+
+        // CRITICAL ENERGY FIX: Return `nil` on unannotated pages in Read Mode so PDFKit stays on Apple Preview's pure-tile fast-path!
+        if pdfView.toolMode == .read && strokes.isEmpty && texts.isEmpty {
+            return nil
+        }
+
         let overlay = MacPageOverlayView(slot: slot)
-        overlay.setContent(
-            strokes: inkDoc.pages[slot.key] ?? [],
-            textBoxes: inkDoc.texts[slot.key] ?? []
-        )
+        overlay.setContent(strokes: strokes, textBoxes: texts)
         overlayByPageID[pid] = overlay
         overlayByKey[slot.key] = overlay
         return overlay
@@ -435,7 +518,6 @@ final class MacPDFWindowController: NSWindowController,
 
     func pdfView(_ pdfView: PDFView, willDisplayOverlayView overlayView: NSView, for page: PDFPage) {
         if let ov = overlayView as? MacPageOverlayView {
-            // Re-register in case PDFKit reused a cached overlay without re-calling overlayViewFor!
             overlayByPageID[ObjectIdentifier(page)] = ov
             overlayByKey[ov.slot.key] = ov
             let k = ov.slot.key
@@ -475,6 +557,7 @@ final class MacPDFWindowController: NSWindowController,
         let colorHex = MacPreferences.shared.activeHlColorHex
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         var addedByKey: [String: [InkStroke]] = [:]
+        var neededFreshOverlay = false
 
         for lineSel in lines {
             guard let page = lineSel.pages.first,
@@ -519,10 +602,17 @@ final class MacPDFWindowController: NSWindowController,
             var list = inkDoc.pages[slot.key] ?? []
             list.append(stroke)
             inkDoc.pages[slot.key] = list
-            overlayByPageID[ObjectIdentifier(page)]?.appendStroke(stroke)
+            if let ov = overlayByPageID[ObjectIdentifier(page)] {
+                ov.appendStroke(stroke)
+            } else {
+                neededFreshOverlay = true
+            }
             addedByKey[slot.key, default: []].append(stroke)
         }
 
+        if neededFreshOverlay {
+            syncOverlayProviderAttachment(forceRefresh: true)
+        }
         if !addedByKey.isEmpty {
             let entries = addedByKey.map { (pageKey: $0.key, added: $0.value, removed: [InkStroke]()) }
             pushUndo(.strokes(entries: entries))
@@ -531,6 +621,9 @@ final class MacPDFWindowController: NSWindowController,
     }
 
     func canvasView(_ view: MacPDFCanvasView, didBeginHighlightAt pagePoint: CGPoint, on page: PDFPage) {
+        if overlayByPageID[ObjectIdentifier(page)] == nil {
+            syncOverlayProviderAttachment(forceRefresh: true)
+        }
         guard let slot = virtualResult?.slotByPageID[ObjectIdentifier(page)],
               let overlay = overlayByPageID[ObjectIdentifier(page)] else { return }
         cancelIdleCheckTimer()
@@ -660,10 +753,12 @@ final class MacPDFWindowController: NSWindowController,
     }
 
     func canvasView(_ view: MacPDFCanvasView, didClickTextBoxAt pagePoint: CGPoint, on page: PDFPage) {
+        if overlayByPageID[ObjectIdentifier(page)] == nil {
+            syncOverlayProviderAttachment(forceRefresh: true)
+        }
         guard let slot = virtualResult?.slotByPageID[ObjectIdentifier(page)],
               let overlay = overlayByPageID[ObjectIdentifier(page)] else { return }
 
-        // Check if clicking an existing text box first (topmost wins)
         let existing = inkDoc.texts[slot.key] ?? []
         for tb in existing.reversed() {
             if tb.measuredRect().insetBy(dx: -6, dy: -6).contains(pagePoint) {
@@ -672,7 +767,6 @@ final class MacPDFWindowController: NSWindowController,
             }
         }
 
-        // Create a brand new text box right where the user clicked!
         let prefs = MacPreferences.shared
         let boxW = min(240.0, max(120.0, Double(slot.size.width) - 24.0))
         let clampedX = max(10.0, min(Double(slot.size.width) - boxW - 10.0, Double(pagePoint.x) - 10.0))
@@ -884,10 +978,11 @@ final class MacPDFWindowController: NSWindowController,
                 list.sort { $0.t < $1.t }
                 if list.isEmpty { inkDoc.pages.removeValue(forKey: entry.pageKey) }
                 else { inkDoc.pages[entry.pageKey] = list }
-                overlayForPageKey(entry.pageKey)?.setContent(
-                    strokes: list,
-                    textBoxes: inkDoc.texts[entry.pageKey] ?? []
-                )
+                if let ov = overlayForPageKey(entry.pageKey) {
+                    ov.setContent(strokes: list, textBoxes: inkDoc.texts[entry.pageKey] ?? [])
+                } else if !list.isEmpty {
+                    syncOverlayProviderAttachment(forceRefresh: true)
+                }
             }
 
         case let .texts(pageKey, added, removed):
@@ -907,10 +1002,11 @@ final class MacPDFWindowController: NSWindowController,
             list.sort { $0.t < $1.t }
             if list.isEmpty { inkDoc.texts.removeValue(forKey: pageKey) }
             else { inkDoc.texts[pageKey] = list }
-            overlayForPageKey(pageKey)?.setContent(
-                strokes: inkDoc.pages[pageKey] ?? [],
-                textBoxes: list
-            )
+            if let ov = overlayForPageKey(pageKey) {
+                ov.setContent(strokes: inkDoc.pages[pageKey] ?? [], textBoxes: list)
+            } else if !list.isEmpty {
+                syncOverlayProviderAttachment(forceRefresh: true)
+            }
         }
     }
 
@@ -971,6 +1067,50 @@ final class MacPDFWindowController: NSWindowController,
         }
     }
 
+    // MARK: - Automated Self-Test Diagnostics Hooks
+
+    func diagnosticsEnvironmentSummary() -> String {
+        let count = pdfView.document?.pageCount ?? 0
+        let strokeTotal = inkDoc.pages.values.reduce(0) { $0 + $1.count }
+        let textTotal = inkDoc.texts.values.reduce(0) { $0 + $1.count }
+        return "\(pdfURL.lastPathComponent) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, overlayProvider=\(overlayProviderAttached ? "attached" : "nil"))"
+    }
+
+    func diagnosticsPageCount() -> Int { pdfView.document?.pageCount ?? 0 }
+    func diagnosticsCurrentPageIndex() -> Int { currentPageIndex() }
+    func diagnosticsToolMode() -> MacToolMode { pdfView.toolMode }
+    func diagnosticsScaleFactor() -> CGFloat { pdfView.scaleFactor }
+
+    func diagnosticsGoToPage(_ idx: Int) {
+        guard let doc = pdfView.document, idx >= 0, idx < doc.pageCount, let p = doc.page(at: idx) else { return }
+        pdfView.go(to: p)
+    }
+
+    func diagnosticsSetScaleFactor(_ factor: CGFloat) {
+        pdfView.autoScales = false
+        pdfView.scaleFactor = max(0.35, min(4.0, factor))
+    }
+
+    func diagnosticsScrollBy(deltaY: CGFloat) -> Bool {
+        guard let scroll = pdfView.documentView?.enclosingScrollView,
+              let docView = scroll.documentView else { return false }
+        let clip = scroll.contentView
+        let cur = clip.bounds.origin
+        let maxY = max(0, docView.bounds.height - clip.bounds.height)
+        guard maxY > 10 else { return false }
+        let nextY = max(0, min(maxY, cur.y + deltaY))
+        if abs(nextY - cur.y) < 0.5 { return false }
+        clip.scroll(to: NSPoint(x: cur.x, y: nextY))
+        scroll.reflectScrolledClipView(clip)
+        return true
+    }
+
+    func diagnosticsRestore(pageIndex: Int) {
+        pdfView.autoScales = true
+        diagnosticsGoToPage(pageIndex)
+        updatePageIndicatorAndBookmarkUI()
+    }
+
     // MARK: - MacSidebarDelegate
 
     func sidebarDidSelectPage(at index: Int) {
@@ -1010,12 +1150,19 @@ final class MacPDFWindowController: NSWindowController,
     }
 
     func setToolMode(_ mode: MacToolMode) {
+        let wasRead = (pdfView.toolMode == .read)
         if mode != .textBox {
             commitActiveTextBox()
         }
         pdfView.toolMode = mode
         modeSegment.selectedSegment = mode.rawValue
         updateOptionsBarVisibility()
+
+        // Dynamically attach/detach overlay provider when transitioning in or out of Read Mode!
+        let nowRead = (mode == .read)
+        if wasRead != nowRead {
+            syncOverlayProviderAttachment(forceRefresh: !nowRead || documentHasAnyOverlayContent)
+        }
     }
 
     @objc private func modeSegmentChanged() {
@@ -1037,18 +1184,42 @@ final class MacPDFWindowController: NSWindowController,
         scheduleSave()
     }
 
-    @objc private func paperPopupChanged() {
-        let idx = paperPopup.indexOfSelectedItem
-        guard idx >= 0 && idx < MacPaperMode.allCases.count else { return }
-        MacPreferences.shared.paperMode = MacPaperMode.allCases[idx]
+    @objc private func showPaperMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let cur = MacPreferences.shared.paperMode
+        for (idx, m) in MacPaperMode.allCases.enumerated() {
+            let item = NSMenuItem(title: m.title, action: #selector(selectPaperModeFromMenu(_:)), keyEquivalent: "")
+            item.tag = idx
+            item.target = self
+            item.state = (m == cur) ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func selectPaperModeFromMenu(_ sender: NSMenuItem) {
+        guard sender.tag >= 0 && sender.tag < MacPaperMode.allCases.count else { return }
+        MacPreferences.shared.paperMode = MacPaperMode.allCases[sender.tag]
+    }
+
+    private func updatePaperButtonIcon() {
+        switch MacPreferences.shared.paperMode {
+        case .original:
+            paperButton.image = Self.iconPaperOrig
+            paperButton.toolTip = "Paper Mode: Original"
+        case .sepia:
+            paperButton.image = Self.iconPaperSepia
+            paperButton.toolTip = "Paper Mode: Warm Sepia"
+        case .dark:
+            paperButton.image = Self.iconPaperDark
+            paperButton.toolTip = "Paper Mode: Dark Paper"
+        }
     }
 
     @objc private func handlePaperModePrefChanged() {
         let mode = MacPreferences.shared.paperMode
         pdfView.applyPaperMode(mode)
-        if let idx = MacPaperMode.allCases.firstIndex(of: mode) {
-            paperPopup.selectItem(at: idx)
-        }
+        updatePaperButtonIcon()
     }
 
     @objc private func zoomSegmentClicked(_ sender: NSSegmentedControl) {
@@ -1095,11 +1266,16 @@ final class MacPDFWindowController: NSWindowController,
         triggerDriveSync(forceFolderScan: true)
     }
 
+    @objc private func openDiagnosticsAction() {
+        onRequestOpenDiagnostics?()
+    }
+
     @objc override func newWindowForTab(_ sender: Any?) {
         onRequestNewTab?(self)
     }
 
     @objc private func handlePageChanged() {
+        MacOverlayMetrics.shared.totalPageChangeNotifications &+= 1
         updatePageIndicatorAndBookmarkUI()
         let pageNum = currentPageIndex() + 1
         pagePersistTimer?.cancel()
@@ -1230,7 +1406,6 @@ final class MacPDFWindowController: NSWindowController,
         guard syncManager.config.isConnected,
               syncManager.config.autoSync,
               MacPreferences.shared.syncMode == .smart else { return }
-        // Never arm idle timers while window is hidden or occluded behind other apps!
         if let win = window, !win.occlusionState.contains(.visible) { return }
         let delaysSec: [Int] = [180, 600]
         guard stage >= 0 && stage < delaysSec.count else { return }
@@ -1300,11 +1475,11 @@ final class MacPDFWindowController: NSWindowController,
     // MARK: - NSToolbarDelegate
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .flexibleSpace, .toolMode, .flexibleSpace, .bookmark, .paperMode, .zoomControls, .pageIndicator, .syncStatus]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -1314,10 +1489,19 @@ final class MacPDFWindowController: NSWindowController,
             let img = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Sidebar") ?? NSImage()
             let btn = NSButton(image: img, target: self, action: #selector(toggleSidebarAction))
             btn.bezelStyle = .texturedRounded
+            btn.toolTip = "Toggle Outline / Search Sidebar (⌘⌥S)"
             item.view = btn
             item.label = "Sidebar"
 
         case .toolMode:
+            modeSegment.segmentCount = 3
+            modeSegment.trackingMode = .selectOne
+            modeSegment.setLabel("Read", forSegment: 0)
+            modeSegment.setLabel("Highlight", forSegment: 1)
+            modeSegment.setLabel("Text", forSegment: 2)
+            modeSegment.setImage(NSImage(systemSymbolName: "book", accessibilityDescription: "Read"), forSegment: 0)
+            modeSegment.setImage(NSImage(systemSymbolName: "highlighter", accessibilityDescription: "Highlight"), forSegment: 1)
+            modeSegment.setImage(NSImage(systemSymbolName: "textbox", accessibilityDescription: "Text"), forSegment: 2)
             modeSegment.selectedSegment = pdfView.toolMode.rawValue
             modeSegment.target = self
             modeSegment.action = #selector(modeSegmentChanged)
@@ -1326,21 +1510,20 @@ final class MacPDFWindowController: NSWindowController,
 
         case .bookmark:
             bookmarkButton.bezelStyle = .texturedRounded
-            bookmarkButton.image = NSImage(systemSymbolName: "bookmark", accessibilityDescription: "Bookmark")
+            bookmarkButton.image = Self.iconBookmark
+            bookmarkButton.toolTip = "Toggle Bookmark (⌘D)"
             bookmarkButton.target = self
             bookmarkButton.action = #selector(toggleBookmarkAction)
             item.view = bookmarkButton
             item.label = "Bookmark"
 
         case .paperMode:
-            paperPopup.removeAllItems()
-            for m in MacPaperMode.allCases { paperPopup.addItem(withTitle: m.title) }
-            if let idx = MacPaperMode.allCases.firstIndex(of: MacPreferences.shared.paperMode) {
-                paperPopup.selectItem(at: idx)
-            }
-            paperPopup.target = self
-            paperPopup.action = #selector(paperPopupChanged)
-            item.view = paperPopup
+            paperButton.bezelStyle = .texturedRounded
+            paperButton.imagePosition = .imageOnly
+            paperButton.target = self
+            paperButton.action = #selector(showPaperMenu(_:))
+            updatePaperButtonIcon()
+            item.view = paperButton
             item.label = "Paper Mode"
 
         case .zoomControls:
@@ -1361,7 +1544,7 @@ final class MacPDFWindowController: NSWindowController,
             pageField.alignment = .center
             pageField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             pageField.bezelStyle = .roundedBezel
-            pageField.frame = NSRect(x: 0, y: 0, width: 88, height: 24)
+            pageField.frame = NSRect(x: 0, y: 0, width: 84, height: 24)
             pageField.target = self
             pageField.action = #selector(pageFieldSubmitted)
             item.view = pageField
@@ -1369,12 +1552,20 @@ final class MacPDFWindowController: NSWindowController,
 
         case .syncStatus:
             syncButton.bezelStyle = .texturedRounded
-            syncButton.image = NSImage(systemSymbolName: "icloud", accessibilityDescription: "Sync")
+            syncButton.image = Self.iconSyncOff
             syncButton.imagePosition = .imageOnly
             syncButton.target = self
             syncButton.action = #selector(syncNowAction)
             item.view = syncButton
             item.label = "Sync"
+
+        case .diagnostics:
+            let img = NSImage(systemSymbolName: "gauge.with.dots.needle.bottom.50percent", accessibilityDescription: "Self-Test") ?? NSImage()
+            let btn = NSButton(image: img, target: self, action: #selector(openDiagnosticsAction))
+            btn.bezelStyle = .texturedRounded
+            btn.toolTip = "Performance & Battery Self-Test (⌘⌥B)"
+            item.view = btn
+            item.label = "Self-Test"
 
         default:
             return nil

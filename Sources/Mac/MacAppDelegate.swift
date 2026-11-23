@@ -9,6 +9,8 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
 
     private var libraryController: MacLibraryWindowController?
     private var syncWindowController: MacDriveSyncWindowController?
+    private var diagnosticsController: MacDiagnosticsWindowController?
+    private var startupSyncTimer: DispatchSourceTimer?
     private var openDocControllers: [String: MacPDFWindowController] = [:]
 
     static func main() {
@@ -25,10 +27,19 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         buildMainMenu()
         showLibraryWindow()
 
-        if syncManager.config.isConnected && vault.vaultURL != nil {
-            Task {
-                _ = await syncManager.syncVault(vault: vault, force: false)
+        // Delay initial background vault sync by 6 seconds so launch stays cool & instant!
+        if syncManager.config.isConnected && vault.vaultURL != nil && MacPreferences.shared.syncMode == .smart {
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.schedule(deadline: .now() + .seconds(6), leeway: .seconds(2))
+            t.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.startupSyncTimer?.cancel()
+                self.startupSyncTimer = nil
+                guard self.syncManager.config.isConnected, self.vault.vaultURL != nil else { return }
+                Task { _ = await self.syncManager.syncVault(vault: self.vault, force: false) }
             }
+            startupSyncTimer = t
+            t.resume()
         }
     }
 
@@ -69,6 +80,9 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         lib.onOpenSyncSettings = { [weak self] in
             self?.showDriveSyncSettings()
         }
+        lib.onOpenDiagnostics = { [weak self] in
+            self?.showDiagnosticsWindow()
+        }
         libraryController = lib
         lib.showWindow(nil)
         lib.window?.makeKeyAndOrderFront(nil)
@@ -88,6 +102,9 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         }
         wc.onRequestOpenSyncSettings = { [weak self] in
             self?.showDriveSyncSettings()
+        }
+        wc.onRequestOpenDiagnostics = { [weak self] in
+            self?.showDiagnosticsWindow()
         }
         wc.onWindowClosed = { [weak self] closed in
             self?.openDocControllers.removeValue(forKey: closed.pdfURL.standardizedFileURL.path)
@@ -145,6 +162,26 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         syncWindowController = wc
         wc.showWindow(nil)
         wc.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showDiagnosticsWindow() {
+        if let existing = diagnosticsController {
+            existing.showWindow(nil)
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let dc = MacDiagnosticsWindowController()
+        dc.activeReaderProvider = { [weak self] in
+            self?.activeReaderController()
+        }
+        dc.onWindowClosed = { [weak self] in
+            self?.diagnosticsController = nil
+        }
+        diagnosticsController = dc
+        dc.showWindow(nil)
+        dc.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -277,6 +314,10 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         hlSel.keyEquivalentModifierMask = [.command, .shift]
         toolsMenu.addItem(hlSel)
         toolsMenu.addItem(withTitle: "Toggle Page Bookmark", action: #selector(menuToggleBookmark), keyEquivalent: "d")
+        toolsMenu.addItem(.separator())
+        let diagItem = NSMenuItem(title: "Performance & Battery Self-Test…", action: #selector(showDiagnosticsWindow), keyEquivalent: "b")
+        diagItem.keyEquivalentModifierMask = [.command, .option]
+        toolsMenu.addItem(diagItem)
         toolsItem.submenu = toolsMenu
         mainMenu.addItem(toolsItem)
 

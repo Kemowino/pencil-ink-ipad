@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-3.0.0}"
+          TAG="v${VER:-3.1.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Dedicated Native Intel (x86_64) macOS AppKit App + iPadOS v3.0.0: Pure AppKit PDFView (Apple Preview Engine) + Zero-VRAM Flipped PDFPageOverlayViewProvider, Zero Mac Catalyst / Zero SwiftUI / Zero Discrete GPU Wakeups, Native Window Tabbing, Full iPad Ink & Hobonichi Display, Selection & Drag Highlighter, Native Inline NSTextView Text Boxes, Undo/Redo, Export Annotated PDF, Full Bidirectional Google Drive CRDT Sync, and 50-Pass Intel Mac Optimization Audit." \
+              --notes "Pencil Ink Native $TAG — Intel macOS Energy Fix, Native macOS UI Overhaul & Built-In Objective Performance/Battery Self-Test: True Zero-Overlay Read Mode (nil PDFPageOverlayViewProvider on unannotated pages), Disabled PDFKit Data Detectors & Background Vision Scanning, 160ms Throttled Zoom Vector Redraws, Single-Pass Dark Paper CIColorMatrix, Native 2-Pane SplitView Library with Cover Thumbnails & Unified Search Toolbar, Polished Reader Toolbar & Proportional Swatch Bar, plus Built-In 5-Phase Performance & Battery Self-Test + Live 1 Hz Monitor (Cmd+Option+B)." \
               --latest
           fi

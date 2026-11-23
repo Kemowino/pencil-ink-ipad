@@ -36,6 +36,8 @@ private final class MacCommittedInkView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         guard pageSize.width > 1, pageSize.height > 1, bounds.width > 1, bounds.height > 1 else { return }
 
+        MacOverlayMetrics.shared.totalOverlayDrawCalls &+= 1
+
         let sx = bounds.width / pageSize.width
         let sy = bounds.height / pageSize.height
         let pageClip = CGRect(
@@ -59,10 +61,10 @@ private final class MacCommittedInkView: NSView {
     }
 }
 
-/// Pure AppKit flipped container `NSView` mounted per visible PDF page by `PDFPageOverlayViewProvider`.
-/// - Container does NOT override `draw(_:)` -> **0 bytes** of CoreAnimation backing store on unannotated pages!
-/// - Lazily allocates `MacCommittedInkView` and GPU `CAShapeLayer` ONLY on pages that actually have ink/text/live highlight!
-/// - `isFlipped = true` maps `(0, 0)` to top-left of the page, matching `.ink.json` 1:1.
+/// Pure AppKit flipped container `NSView` mounted per visible annotated PDF page by `PDFPageOverlayViewProvider`.
+/// - Container does NOT override `draw(_:)` -> **0 bytes** of CoreAnimation backing store when unannotated!
+/// - **Throttled Zoom Vector Redraw:** During trackpad pinch-to-zoom, CoreAnimation scales the existing
+///   ink texture smoothly on the GPU at 0% CPU and redraws sharp vectors ONCE 160 ms after zoom settles!
 final class MacPageOverlayView: NSView {
     let slot: PageSlot
 
@@ -70,6 +72,8 @@ final class MacPageOverlayView: NSView {
     private var liveShapeLayer: CAShapeLayer?
     weak var activeTextEditor: MacInlineTextBoxView? = nil
     private var lastLayoutSize: CGSize = .zero
+    private var zoomRedrawTimer: DispatchSourceTimer?
+    private var countedVisibleInk = false
 
     private static let noLayerActions: [String: CAAction] = [
         "path": NSNull(),
@@ -98,22 +102,51 @@ final class MacPageOverlayView: NSView {
         layer?.isOpaque = false
         layer?.allowsEdgeAntialiasing = false
         layer?.allowsGroupOpacity = false
+        MacOverlayMetrics.shared.overlaysMounted += 1
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        zoomRedrawTimer?.cancel()
+        let hadVis = countedVisibleInk
+        Task { @MainActor in
+            MacOverlayMetrics.shared.overlaysMounted = max(0, MacOverlayMetrics.shared.overlaysMounted - 1)
+            if hadVis {
+                MacOverlayMetrics.shared.committedViewsVisible = max(0, MacOverlayMetrics.shared.committedViewsVisible - 1)
+            }
+        }
+    }
+
+    private func setVisibleInkCounted(_ visible: Bool) {
+        guard visible != countedVisibleInk else { return }
+        countedVisibleInk = visible
+        if visible {
+            MacOverlayMetrics.shared.committedViewsVisible += 1
+        } else {
+            MacOverlayMetrics.shared.committedViewsVisible = max(0, MacOverlayMetrics.shared.committedViewsVisible - 1)
+        }
+    }
+
     override func layout() {
         super.layout()
         let curSize = bounds.size
         guard curSize != lastLayoutSize else { return }
+        let hadPrevious = (lastLayoutSize != .zero)
         lastLayoutSize = curSize
+        MacOverlayMetrics.shared.totalOverlayLayoutCalls &+= 1
 
         if let cv = committedView {
             cv.frame = bounds
             if !cv.isHidden {
-                cv.needsDisplay = true
+                if !hadPrevious {
+                    cv.needsDisplay = true
+                } else {
+                    // Coalesce 60Hz pinch-to-zoom vector redraws into ONE sharp redraw 160ms after zoom settles!
+                    scheduleDeferredZoomRedraw()
+                }
             }
         }
         if let lsl = liveShapeLayer {
@@ -123,6 +156,23 @@ final class MacPageOverlayView: NSView {
             CATransaction.commit()
         }
         activeTextEditor?.applyStylingAndLayout()
+    }
+
+    private func scheduleDeferredZoomRedraw() {
+        zoomRedrawTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + .milliseconds(160), leeway: .milliseconds(35))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.zoomRedrawTimer?.cancel()
+            self.zoomRedrawTimer = nil
+            if let cv = self.committedView, !cv.isHidden {
+                MacOverlayMetrics.shared.totalDeferredZoomRedraws &+= 1
+                cv.needsDisplay = true
+            }
+        }
+        zoomRedrawTimer = t
+        t.resume()
     }
 
     /// O(1) pass-through hit testing: zero cost unless an inline `MacInlineTextBoxView` is open on this page!
@@ -178,6 +228,7 @@ final class MacPageOverlayView: NSView {
                 cv.hiddenTextBoxID = nil
                 cv.isHidden = true
             }
+            setVisibleInkCounted(false)
             return
         }
 
@@ -192,6 +243,7 @@ final class MacPageOverlayView: NSView {
         cv.strokes = strokes
         cv.textBoxes = textBoxes
         cv.hiddenTextBoxID = hiddenTextBoxID
+        setVisibleInkCounted(true)
         if wasHidden {
             cv.frame = bounds
             cv.isHidden = false
@@ -212,6 +264,7 @@ final class MacPageOverlayView: NSView {
         let cv = ensureCommittedView()
         let wasHidden = cv.isHidden
         cv.strokes.append(stroke)
+        setVisibleInkCounted(true)
         if wasHidden {
             cv.frame = bounds
             cv.isHidden = false
@@ -300,7 +353,6 @@ final class MacPageOverlayView: NSView {
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 
-        // Pass 1: Highlighters (multiply blend so black PDF text stays razor-sharp underneath!)
         var hasHighlight = false
         for s in strokes where s.tool == "highlighter" {
             hasHighlight = true
@@ -320,7 +372,6 @@ final class MacPageOverlayView: NSView {
             ctx.restoreGState()
         }
 
-        // Pass 2: Pen / Shape strokes drawn on iPad (fountain, brush, ballpoint, smart shapes)
         ctx.setBlendMode(.normal)
         ctx.setAlpha(1.0)
         for s in strokes where s.tool != "highlighter" {
