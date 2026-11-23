@@ -1,6 +1,10 @@
 import Foundation
 import CoreGraphics
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// Stabilization levels 0..5 matching Obsidian Pencil Ink's exact 1-Euro parameters.
 final class OneEuroSmoother {
@@ -173,7 +177,7 @@ enum StrokeGeometry {
     static func drawStroke(
         in ctx: CGContext,
         points pts: [InkPoint],
-        color: UIColor,
+        color: PlatformColor,
         baseSize: CGFloat,
         tool: String,
         style: String,
@@ -331,12 +335,12 @@ enum StrokeGeometry {
 
     /// Zero-allocation committed stroke renderer: reads flat `[Double]` directly (no `[InkPoint]` temp array!)
     /// and accepts `overrideColor` so Dark Paper mode performs ZERO struct copies or hex round-trips.
-    static func drawCommittedStroke(_ s: InkStroke, in ctx: CGContext, overrideColor: UIColor? = nil) {
+    static func drawCommittedStroke(_ s: InkStroke, in ctx: CGContext, overrideColor: PlatformColor? = nil) {
         let n = s.pointCount
         guard n > 0 else { return }
         let isLinear = (s.straight == true)
         let style = s.tool == "highlighter" ? "ball" : (s.style ?? "ball")
-        let color = overrideColor ?? UIColor.cached(hex: s.color)
+        let color = overrideColor ?? PlatformColor.cached(hex: s.color)
         let baseSize = CGFloat(s.size)
 
         ctx.setStrokeColor(color.cgColor)

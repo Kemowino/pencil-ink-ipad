@@ -1,6 +1,10 @@
 import Foundation
 import CoreGraphics
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 enum PaperTemplate: String, CaseIterable, Identifiable, Codable {
     case blank = "blank"
@@ -409,33 +413,22 @@ struct InkTextBox: Codable, Identifiable, Equatable, Sendable {
         bgColor = try? c.decode(String.self, forKey: .bgColor)
     }
 
-    func resolvedUIFont() -> UIFont {
-        let sz = CGFloat(fontSize)
-        let isBold = (bold == true)
-        switch fontName ?? "sans" {
-        case "serif":
-            let base = UIFont(name: isBold ? "Georgia-Bold" : "Georgia", size: sz)
-            return base ?? UIFont.systemFont(ofSize: sz, weight: isBold ? .bold : .regular)
-        case "mono":
-            return UIFont.monospacedSystemFont(ofSize: sz, weight: isBold ? .bold : .regular)
-        default:
-            return UIFont.systemFont(ofSize: sz, weight: isBold ? .bold : .regular)
-        }
+    func resolvedFont() -> PlatformFont {
+        TextBoxRenderCache.shared.font(name: fontName ?? "sans", size: fontSize, bold: bold == true)
     }
 
+    #if canImport(UIKit)
+    func resolvedUIFont() -> UIFont { resolvedFont() }
+    #endif
+
     func measuredRect() -> CGRect {
-        let padX: CGFloat = 6
-        let padY: CGFloat = 4
-        let font = resolvedUIFont()
-        let str = (text.isEmpty ? " " : text) as NSString
-        let constraint = CGSize(width: max(48, CGFloat(w) - padX * 2), height: 4000)
-        let bounds = str.boundingRect(
-            with: constraint,
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font],
-            context: nil
+        let h = TextBoxRenderCache.shared.measuredHeight(
+            text: text,
+            width: w,
+            fontName: fontName ?? "sans",
+            fontSize: fontSize,
+            bold: bold == true
         )
-        let h = max(font.lineHeight + padY * 2 + 2, ceil(bounds.height) + padY * 2 + 4)
         return CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(w), height: h)
     }
 }
@@ -703,20 +696,87 @@ struct InkDocument: Codable {
     }
 }
 
+/// Thread-safe O(1) cache for `InkTextBox` fonts & measured heights (eliminates per-draw NSLayoutManager churn!).
+private final class TextBoxRenderCache {
+    static let shared = TextBoxRenderCache()
+    private let lock = NSLock()
+    private var fonts: [String: PlatformFont] = [:]
+    private var heights: [String: CGFloat] = [:]
+
+    func font(name: String, size: Double, bold: Bool) -> PlatformFont {
+        let key = "\(name)|\(Int((size * 10).rounded()))|\(bold ? 1 : 0)"
+        lock.lock()
+        if let hit = fonts[key] {
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+
+        let sz = CGFloat(size)
+        let resolved: PlatformFont
+        switch name {
+        case "serif":
+            resolved = PlatformFont(name: bold ? "Georgia-Bold" : "Georgia", size: sz)
+                ?? PlatformFont.systemFont(ofSize: sz, weight: bold ? .bold : .regular)
+        case "mono":
+            resolved = PlatformFont.monospacedSystemFont(ofSize: sz, weight: bold ? .bold : .regular)
+        default:
+            resolved = PlatformFont.systemFont(ofSize: sz, weight: bold ? .bold : .regular)
+        }
+
+        lock.lock()
+        if fonts.count > 128 { fonts.removeAll(keepingCapacity: true) }
+        fonts[key] = resolved
+        lock.unlock()
+        return resolved
+    }
+
+    func measuredHeight(text: String, width: Double, fontName: String, fontSize: Double, bold: Bool) -> CGFloat {
+        let wBucket = Int((width * 10).rounded())
+        let sBucket = Int((fontSize * 10).rounded())
+        let cacheKey = "\(fontName)|\(sBucket)|\(bold ? 1 : 0)|\(wBucket)|\(text)"
+        lock.lock()
+        if let hit = heights[cacheKey] {
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+
+        let padX: CGFloat = 6
+        let padY: CGFloat = 4
+        let f = font(name: fontName, size: fontSize, bold: bold)
+        let str = (text.isEmpty ? " " : text) as NSString
+        let constraint = CGSize(width: max(48, CGFloat(width) - padX * 2), height: 4000)
+        let bounds = str.boundingRect(
+            with: constraint,
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: f],
+            context: nil
+        )
+        let h = max(f.lineHeight + padY * 2 + 2, ceil(bounds.height) + padY * 2 + 4)
+
+        lock.lock()
+        if heights.count > 512 { heights.removeAll(keepingCapacity: true) }
+        heights[cacheKey] = h
+        lock.unlock()
+        return h
+    }
+}
+
 private final class HexColorCache {
     static let shared = HexColorCache()
     private let lock = NSLock()
-    private var normal: [String: UIColor] = [:]
-    private var darkLifted: [String: UIColor] = [:]
+    private var normal: [String: PlatformColor] = [:]
+    private var darkLifted: [String: PlatformColor] = [:]
 
-    func color(for hex: String) -> UIColor {
+    func color(for hex: String) -> PlatformColor {
         lock.lock()
         if let hit = normal[hex] {
             lock.unlock()
             return hit
         }
         lock.unlock()
-        let parsed = UIColor(hex: hex)
+        let parsed = PlatformColor(hex: hex)
         lock.lock()
         if normal.count > 256 { normal.removeAll(keepingCapacity: true) }
         normal[hex] = parsed
@@ -724,7 +784,7 @@ private final class HexColorCache {
         return parsed
     }
 
-    func darkColor(for hex: String) -> UIColor {
+    func darkColor(for hex: String) -> PlatformColor {
         lock.lock()
         if let hit = darkLifted[hex] {
             lock.unlock()
@@ -732,10 +792,9 @@ private final class HexColorCache {
         }
         lock.unlock()
         let base = color(for: hex)
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
-        let lifted: UIColor
-        if base.getRed(&r, green: &g, blue: &b, alpha: &a), (0.299 * r + 0.587 * g + 0.114 * b) < 0.28 {
-            lifted = UIColor(red: 0.93, green: 0.94, blue: 0.97, alpha: a)
+        let lifted: PlatformColor
+        if let rgba = base.safeRGBAComponents(), (0.299 * rgba.r + 0.587 * rgba.g + 0.114 * rgba.b) < 0.28 {
+            lifted = PlatformColor(red: 0.93, green: 0.94, blue: 0.97, alpha: rgba.a)
         } else {
             lifted = base
         }
@@ -747,13 +806,27 @@ private final class HexColorCache {
     }
 }
 
-extension UIColor {
-    static func cached(hex: String) -> UIColor {
+extension PlatformColor {
+    static func cached(hex: String) -> PlatformColor {
         HexColorCache.shared.color(for: hex)
     }
 
-    static func cachedDarkLifted(hex: String) -> UIColor {
+    static func cachedDarkLifted(hex: String) -> PlatformColor {
         HexColorCache.shared.darkColor(for: hex)
+    }
+
+    /// Safe sRGB component extraction (avoids NSColor Objective-C exceptions on grayscale/catalog colors on macOS!).
+    func safeRGBAComponents() -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)? {
+        #if canImport(UIKit)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        guard getRed(&r, green: &g, blue: &b, alpha: &a) else { return nil }
+        return (r, g, b, a)
+        #elseif canImport(AppKit)
+        guard let srgb = usingColorSpace(.sRGB) else { return nil }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return (r, g, b, a)
+        #endif
     }
 
     convenience init(hex: String) {
@@ -774,16 +847,12 @@ extension UIColor {
     }
 
     func toHexString() -> String {
-        var r: CGFloat = 0
-        var g: CGFloat = 0
-        var b: CGFloat = 0
-        var a: CGFloat = 0
-        if getRed(&r, green: &g, blue: &b, alpha: &a) {
+        if let rgba = safeRGBAComponents() {
             return String(
                 format: "#%02x%02x%02x",
-                Int(round(max(0, min(1, r)) * 255)),
-                Int(round(max(0, min(1, g)) * 255)),
-                Int(round(max(0, min(1, b)) * 255))
+                Int(round(max(0, min(1, rgba.r)) * 255)),
+                Int(round(max(0, min(1, rgba.g)) * 255)),
+                Int(round(max(0, min(1, rgba.b)) * 255))
             )
         }
         return "#1c1c1e"

@@ -1,6 +1,10 @@
 import Foundation
 import CoreGraphics
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 struct CoverPalette: Identifiable, Equatable {
     let id: Int
@@ -9,8 +13,8 @@ struct CoverPalette: Identifiable, Equatable {
     let spineHex: String
     let isHobonichi: Bool
 
-    var bgColor: UIColor { UIColor(hex: bgHex) }
-    var spineColor: UIColor { UIColor(hex: spineHex) }
+    var bgColor: PlatformColor { PlatformColor(hex: bgHex) }
+    var spineColor: PlatformColor { PlatformColor(hex: spineHex) }
 }
 
 enum HobonichiEngine {
@@ -18,14 +22,14 @@ enum HobonichiEngine {
     static let pageHeight: CGFloat = 842
     static let pageSize = CGSize(width: 1190, height: 842)
 
-    static let creamColor = UIColor(red: 0.984, green: 0.973, blue: 0.937, alpha: 1.0)
-    static let creamDark = UIColor(red: 0.953, green: 0.937, blue: 0.886, alpha: 1.0)
-    static let gridColor = UIColor(red: 0.541, green: 0.510, blue: 0.447, alpha: 0.24)
-    static let gridStrong = UIColor(red: 0.471, green: 0.439, blue: 0.384, alpha: 0.44)
-    static let inkColor = UIColor(red: 0.173, green: 0.165, blue: 0.157, alpha: 1.0)
-    static let mutedColor = UIColor(red: 0.471, green: 0.447, blue: 0.408, alpha: 1.0)
-    static let redColor = UIColor(red: 0.784, green: 0.294, blue: 0.192, alpha: 1.0)
-    static let blueColor = UIColor(red: 0.290, green: 0.420, blue: 0.510, alpha: 1.0)
+    static let creamColor = PlatformColor(red: 0.984, green: 0.973, blue: 0.937, alpha: 1.0)
+    static let creamDark = PlatformColor(red: 0.953, green: 0.937, blue: 0.886, alpha: 1.0)
+    static let gridColor = PlatformColor(red: 0.541, green: 0.510, blue: 0.447, alpha: 0.24)
+    static let gridStrong = PlatformColor(red: 0.471, green: 0.439, blue: 0.384, alpha: 0.44)
+    static let inkColor = PlatformColor(red: 0.173, green: 0.165, blue: 0.157, alpha: 1.0)
+    static let mutedColor = PlatformColor(red: 0.471, green: 0.447, blue: 0.408, alpha: 1.0)
+    static let redColor = PlatformColor(red: 0.784, green: 0.294, blue: 0.192, alpha: 1.0)
+    static let blueColor = PlatformColor(red: 0.290, green: 0.420, blue: 0.510, alpha: 1.0)
 
     static let monthsFull = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
     static let monthsShort = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -79,11 +83,11 @@ enum HobonichiEngine {
 
     private static let spineGradient: CGGradient? = {
         let colors = [
-            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor,
-            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
-            UIColor(red: 0.29, green: 0.27, blue: 0.22, alpha: 0.18).cgColor,
-            UIColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
-            UIColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor
+            PlatformColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor,
+            PlatformColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
+            PlatformColor(red: 0.29, green: 0.27, blue: 0.22, alpha: 0.18).cgColor,
+            PlatformColor(red: 0.43, green: 0.39, blue: 0.33, alpha: 0.07).cgColor,
+            PlatformColor(red: 0.47, green: 0.43, blue: 0.37, alpha: 0.0).cgColor
         ] as CFArray
         let locs: [CGFloat] = [0.0, 0.42, 0.5, 0.58, 1.0]
         let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -263,22 +267,15 @@ enum HobonichiEngine {
     // MARK: - Obsidian-Compatible PDF Generators (New Notebook + New Hobonichi Journal)
 
     static func createNotebookPDF(template: PaperTemplate, size: CGSize = CGSize(width: 595, height: 842)) -> Data {
-        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: size))
-        return renderer.pdfData { ctx in
-            ctx.beginPage()
-            template.draw(in: ctx.cgContext, size: size)
+        PlatformGraphics.makePDFData(pageSizes: [size]) { _, cgCtx, _ in
+            template.draw(in: cgCtx, size: size)
         }
     }
 
     static func createHobonichiBasePDF() -> Data {
-        let rect = CGRect(origin: .zero, size: pageSize)
-        let renderer = UIGraphicsPDFRenderer(bounds: rect)
-        return renderer.pdfData { ctx in
-            for _ in 0..<2 {
-                ctx.beginPage()
-                creamColor.setFill()
-                ctx.cgContext.fill(rect)
-            }
+        PlatformGraphics.makePDFData(pageSizes: [pageSize, pageSize]) { _, cgCtx, rect in
+            cgCtx.setFillColor(creamColor.cgColor)
+            cgCtx.fill(rect)
         }
     }
 
@@ -297,9 +294,9 @@ enum HobonichiEngine {
         let mid = W * 0.5
 
         ctx.saveGState()
-        UIGraphicsPushContext(ctx)
+        PlatformGraphics.pushFlippedContext(ctx)
         defer {
-            UIGraphicsPopContext()
+            PlatformGraphics.popFlippedContext()
             ctx.restoreGState()
         }
         drawBasePaper(in: ctx, W: W, H: H)
@@ -317,7 +314,7 @@ enum HobonichiEngine {
     }
 
     private static func drawBasePaper(in ctx: CGContext, W: CGFloat, H: CGFloat) {
-        creamColor.setFill()
+        ctx.setFillColor(creamColor.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
 
         let mid = W * 0.5
@@ -327,7 +324,7 @@ enum HobonichiEngine {
             ctx.drawLinearGradient(grad, start: CGPoint(x: mid - 22, y: 0), end: CGPoint(x: mid + 22, y: 0), options: [])
             ctx.restoreGState()
         }
-        ctx.setStrokeColor(UIColor(red: 0.35, green: 0.32, blue: 0.27, alpha: 0.28).cgColor)
+        ctx.setStrokeColor(PlatformColor(red: 0.35, green: 0.32, blue: 0.27, alpha: 0.28).cgColor)
         ctx.setLineWidth(0.8)
         ctx.move(to: CGPoint(x: mid, y: 0))
         ctx.addLine(to: CGPoint(x: mid, y: H))
@@ -354,7 +351,7 @@ enum HobonichiEngine {
         ctx.restoreGState()
     }
 
-    private static func drawText(_ text: String, at pt: CGPoint, font: UIFont, color: UIColor, align: NSTextAlignment = .left, maxWidth: CGFloat = 500) {
+    private static func drawText(_ text: String, at pt: CGPoint, font: PlatformFont, color: PlatformColor, align: NSTextAlignment = .left, maxWidth: CGFloat = 500) {
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let ns = text as NSString
         let sz = ns.size(withAttributes: attrs)
@@ -366,7 +363,7 @@ enum HobonichiEngine {
 
     private static func drawMiniMonth(in ctx: CGContext, rect: CGRect, year: Int, monthZeroBased: Int, highlightMonday: String = "") {
         ctx.saveGState()
-        creamColor.setFill()
+        ctx.setFillColor(creamColor.cgColor)
         ctx.fill(rect.insetBy(dx: -3, dy: -3))
         ctx.setStrokeColor(gridStrong.cgColor)
         ctx.setLineWidth(0.7)
@@ -381,7 +378,7 @@ enum HobonichiEngine {
         let startX = rect.minX + 4
         let startY = rect.minY + 18
 
-        let hdrFont = UIFont.systemFont(ofSize: 6.8, weight: .semibold)
+        let hdrFont = PlatformFont.systemFont(ofSize: 6.8, weight: .semibold)
         for c in 0..<7 {
             let col = (c == 6) ? redColor : (c == 5 ? blueColor : mutedColor)
             drawText(daysMini[c], at: CGPoint(x: startX + (CGFloat(c) + 0.5) * colW, y: startY), font: hdrFont, color: col, align: .center)
@@ -400,9 +397,9 @@ enum HobonichiEngine {
                 if let dt = cal.date(from: dc), dateStr(mondayOf(dt)) == highlightMonday {
                     let row = (firstDow + d - 1) / 7
                     let hlRect = CGRect(x: rect.minX + 2, y: startY + 9 + CGFloat(row) * rowH, width: rect.width - 4, height: rowH + 1)
-                    redColor.withAlphaComponent(0.11).setFill()
+                    ctx.setFillColor(redColor.withAlphaComponent(0.11).cgColor)
                     ctx.fill(hlRect)
-                    redColor.withAlphaComponent(0.45).setStroke()
+                    ctx.setStrokeColor(redColor.withAlphaComponent(0.45).cgColor)
                     ctx.setLineWidth(0.6)
                     ctx.stroke(hlRect)
                     break
@@ -410,7 +407,7 @@ enum HobonichiEngine {
             }
         }
 
-        let dayFont = UIFont.systemFont(ofSize: 7.2, weight: .medium)
+        let dayFont = PlatformFont.systemFont(ofSize: 7.2, weight: .medium)
         for d in 1...daysInMonth {
             let cell = firstDow + d - 1
             let r = cell / 7
@@ -482,7 +479,7 @@ enum HobonichiEngine {
                 drawText(monthsShort[cMonth].uppercased(), at: CGPoint(x: padL + 6, y: dy + 42), font: .systemFont(ofSize: 7.5, weight: .semibold), color: mutedColor)
             }
 
-            mutedColor.setFill()
+            ctx.setFillColor(mutedColor.cgColor)
             for frac: CGFloat in [0.25, 0.5, 0.75] {
                 ctx.fillEllipse(in: CGRect(x: splitX - 1.1, y: dy + dayH * frac - 1.1, width: 2.2, height: 2.2))
             }
@@ -535,7 +532,7 @@ enum HobonichiEngine {
         let numRows = Int(ceil(Double(firstDow + daysInMonth) / 7.0))
         let rowH = (botY - (topY + 20)) / CGFloat(max(1, numRows))
 
-        creamDark.setFill()
+        ctx.setFillColor(creamDark.cgColor)
         ctx.fill(CGRect(x: gridLeft, y: topY, width: gridW, height: 20))
         ctx.setStrokeColor(inkColor.cgColor)
         ctx.setLineWidth(0.9)
@@ -561,7 +558,7 @@ enum HobonichiEngine {
             ctx.strokePath()
         }
 
-        let dayFont = UIFont.systemFont(ofSize: 11, weight: .bold)
+        let dayFont = PlatformFont.systemFont(ofSize: 11, weight: .bold)
         for d in 1...daysInMonth {
             let cell = firstDow + d - 1
             let r = cell / 7

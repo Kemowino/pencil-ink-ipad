@@ -1,4 +1,4 @@
-name: Build Pencil Ink (iPad/iPhone IPA + macOS App)
+name: Build Pencil Ink (iPadOS IPA + Native Intel macOS App)
 
 on:
   push:
@@ -44,15 +44,15 @@ jobs:
           zip -r -9 PencilInkNative.ipa Payload
           ls -lh PencilInkNative.ipa
 
-      - name: Build Universal macOS Catalyst .app (Intel x86_64 + Apple Silicon)
+      - name: Build Native Intel (x86_64) macOS AppKit .app
         run: |
           xcodebuild \
             -project PencilInkNative.xcodeproj \
-            -scheme PencilInkNative \
+            -scheme PencilInkMac \
             -configuration Release \
-            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -destination 'generic/platform=macOS' \
             -derivedDataPath build-mac \
-            ARCHS="x86_64 arm64" \
+            ARCHS="x86_64" \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
@@ -60,9 +60,9 @@ jobs:
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Ad-hoc Sign & Package macOS .app
+      - name: Ad-hoc Sign & Package Native Intel macOS .app
         run: |
-          APP_PATH="build-mac/Build/Products/Release-maccatalyst/PencilInkNative.app"
+          APP_PATH="build-mac/Build/Products/Release/PencilInkNative.app"
           codesign --force --deep --sign - "$APP_PATH"
           lipo -info "$APP_PATH/Contents/MacOS/PencilInkNative"
           rm -f PencilInkNative-macOS.zip
@@ -78,17 +78,17 @@ jobs:
             PencilInkNative-macOS.zip
           retention-days: 30
 
-      - name: Publish iOS/iPadOS IPA & macOS App to GitHub Releases
+      - name: Publish iOS/iPadOS IPA & Native Intel macOS App to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-2.0.0}"
+          TAG="v${VER:-3.0.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Complete Efficiency & Performance Overhaul (macOS Catalyst + iPadOS): Zero-Copy IOSurface PDF Backing (Tagged sRGB, 64-Byte Aligned), Two-Tier COMPRESSION_LZ4 Page Raster Cache (RAM + Persistent LRU SSD Cache for 0% Re-Scroll PDF CPU), Automatic 50-Page CGPDFDocument Recycler (Flat Textbook RAM), Viewport-Clipped Zoom Detail Layer (<=1.4MP Crop), GPU CAShapeLayer Live Ink Fast-Path + Apple Pencil predictedTouches (-16–24ms Latency) + Dirty-Rect Ink Invalidation, O(1) Cached Stroke Bounds & HexColorCache, Dedicated Cancellable Overview Thumbnail Queue (80-Item LRU), Persistent SSD Cover Thumbnails, Async Initial Ink Load, Background DriveSyncManager I/O, and 50-Pass Deep Optimization Audit." \
+              --notes "Pencil Ink Native $TAG — Dedicated Native Intel (x86_64) macOS AppKit App + iPadOS v3.0.0: Pure AppKit PDFView (Apple Preview Engine) + Zero-VRAM Flipped PDFPageOverlayViewProvider, Zero Mac Catalyst / Zero SwiftUI / Zero Discrete GPU Wakeups, Native Window Tabbing, Full iPad Ink & Hobonichi Display, Selection & Drag Highlighter, Native Inline NSTextView Text Boxes, Undo/Redo, Export Annotated PDF, Full Bidirectional Google Drive CRDT Sync, and 50-Pass Intel Mac Optimization Audit." \
               --latest
           fi

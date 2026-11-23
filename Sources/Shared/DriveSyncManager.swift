@@ -1,5 +1,5 @@
 import Foundation
-import SwiftUI
+import Combine
 
 enum SyncVisualState: String {
     case disconnected
@@ -164,6 +164,15 @@ final class DriveSyncManager: ObservableObject {
     }()
     private static let sharedISOBasic = ISO8601DateFormatter()
 
+    /// Platform hook controlling whether smart auto-sync is enabled (defaults to iOS AppSettings on iOS, true on macOS).
+    var isSmartSyncEnabled: () -> Bool = {
+        #if os(iOS)
+        return AppSettings.shared.syncMode == .smart
+        #else
+        return true
+        #endif
+    }
+
     private let configKey = "pencilink.native.drive.config.v1"
     private var lastVaultSyncAt: Date? = nil
     private var activeVaultSyncTask: Task<(downloadedPDFs: Int, uploadedPDFs: Int, syncedBooks: Int), Never>? = nil
@@ -220,7 +229,7 @@ final class DriveSyncManager: ObservableObject {
 
     private static func generateDeviceLabel() -> String {
         let chars = Array("abcdefghijklmnopqrstuvwxyz0123456789")
-        #if targetEnvironment(macCatalyst)
+        #if os(macOS) || targetEnvironment(macCatalyst)
         let prefix = "mac"
         #else
         let prefix = "ios"
@@ -397,7 +406,7 @@ final class DriveSyncManager: ObservableObject {
         localDocProvider: @escaping () -> InkDocument,
         onMerged: @escaping (InkDocument) -> Void
     ) {
-        guard config.isConnected, config.autoSync, AppSettings.shared.syncMode == .smart else { return }
+        guard config.isConnected, config.autoSync, isSmartSyncEnabled() else { return }
         let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
         debounceTimers[inkRelPath]?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -694,7 +703,7 @@ final class DriveSyncManager: ObservableObject {
             return (0, 0, 0)
         }
         if !force {
-            guard config.autoSync, AppSettings.shared.syncMode == .smart else {
+            guard config.autoSync, isSmartSyncEnabled() else {
                 return (0, 0, 0)
             }
             if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < 90.0 {

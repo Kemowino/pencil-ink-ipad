@@ -1,7 +1,11 @@
 import Foundation
-import SwiftUI
+import Combine
 import PDFKit
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 struct PDFItem: Identifiable, Hashable {
     let id: String
@@ -42,7 +46,7 @@ final class VaultManager: ObservableObject {
 
     /// True when executing as a guest app inside LiveContainer on iOS/iPadOS.
     static var isRunningInLiveContainer: Bool {
-        #if targetEnvironment(macCatalyst)
+        #if os(macOS) || targetEnvironment(macCatalyst)
         return false
         #else
         let env = ProcessInfo.processInfo.environment
@@ -63,7 +67,7 @@ final class VaultManager: ObservableObject {
     }
 
     static var localFolderDisplayName: String {
-        #if targetEnvironment(macCatalyst)
+        #if os(macOS) || targetEnvironment(macCatalyst)
         return "Local App Folder"
         #else
         if isRunningInLiveContainer {
@@ -78,7 +82,7 @@ final class VaultManager: ObservableObject {
     private let recentPathsKey = "pencilink.native.recentPaths.v1"
     private var scopedRootURL: URL?
     private var accessingRoot = false
-    private let thumbCache = NSCache<NSString, UIImage>()
+    private let thumbCache = NSCache<NSString, PlatformImage>()
     private let thumbQueue = DispatchQueue(label: "com.pencilink.coverthumbs", qos: .utility)
     private var coverWritesSincePrune: Int = 0
     private let coverDiskDirURL: URL = {
@@ -153,14 +157,24 @@ final class VaultManager: ObservableObject {
             if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
                 for u in files { try? FileManager.default.removeItem(at: u) }
             }
+            #if os(iOS)
             PageRasterCache.shared.clearAllCaches(completion: completion)
+            #else
+            if let completion {
+                DispatchQueue.main.async { completion() }
+            }
+            #endif
         }
     }
 
     func computeTotalCacheSizeBytes(completion: @escaping (Int64) -> Void) {
         let dir = coverDiskDirURL
         thumbQueue.async {
+            #if os(iOS)
             var total = PageRasterCache.shared.diskCacheBytesSync()
+            #else
+            var total: Int64 = 0
+            #endif
             if let files = try? FileManager.default.contentsOfDirectory(
                 at: dir,
                 includingPropertiesForKeys: [.fileSizeKey],
@@ -290,8 +304,13 @@ final class VaultManager: ObservableObject {
         }
 
         do {
+            #if os(macOS)
+            let bmOptions: URL.BookmarkCreationOptions = [.withSecurityScope]
+            #else
+            let bmOptions: URL.BookmarkCreationOptions = []
+            #endif
             let bookmark = try url.bookmarkData(
-                options: [],
+                options: bmOptions,
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
@@ -319,9 +338,16 @@ final class VaultManager: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: bookmarkKey) {
             var stale = false
             do {
+                #if os(macOS)
+                let resOpts: URL.BookmarkResolutionOptions = [.withSecurityScope]
+                let bmOpts: URL.BookmarkCreationOptions = [.withSecurityScope]
+                #else
+                let resOpts: URL.BookmarkResolutionOptions = []
+                let bmOpts: URL.BookmarkCreationOptions = []
+                #endif
                 let url = try URL(
                     resolvingBookmarkData: data,
-                    options: [],
+                    options: resOpts,
                     relativeTo: nil,
                     bookmarkDataIsStale: &stale
                 )
@@ -334,7 +360,7 @@ final class VaultManager: ObservableObject {
                     vaultURL = effective
                     lastSavedVaultName = effective.lastPathComponent
                     if stale {
-                        if let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                        if let fresh = try? url.bookmarkData(options: bmOpts, includingResourceValuesForKeys: nil, relativeTo: nil) {
                             UserDefaults.standard.set(fresh, forKey: bookmarkKey)
                         }
                     }
@@ -484,12 +510,12 @@ final class VaultManager: ObservableObject {
 
     // MARK: - Cover Preview Thumbnails (Cached Page 1 PDF Preview)
 
-    func cachedCoverThumb(for item: PDFItem) -> UIImage? {
+    func cachedCoverThumb(for item: PDFItem) -> PlatformImage? {
         let key = "\(item.id)|\(Int(item.modifiedAt.timeIntervalSince1970))" as NSString
         return thumbCache.object(forKey: key)
     }
 
-    func loadCoverThumb(for item: PDFItem, completion: @escaping (UIImage?) -> Void) {
+    func loadCoverThumb(for item: PDFItem, completion: @escaping (PlatformImage?) -> Void) {
         let keyStr = "\(item.id)|\(Int(item.modifiedAt.timeIntervalSince1970))"
         let key = keyStr as NSString
         if let hit = thumbCache.object(forKey: key) {
@@ -506,7 +532,7 @@ final class VaultManager: ObservableObject {
         thumbQueue.async { [weak self] in
             // Persistent SSD cover cache hit -> ZERO cold PDF parsing on app launch!
             if let data = try? Data(contentsOf: diskURL),
-               let diskImg = UIImage(data: data) {
+               let diskImg = PlatformImage(data: data) {
                 self?.thumbCache.setObject(diskImg, forKey: key)
                 DispatchQueue.main.async { completion(diskImg) }
                 return
@@ -515,21 +541,12 @@ final class VaultManager: ObservableObject {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let sz = PageCanvasView.normalizedPageSize(for: cgPage)
-            guard sz.width > 0, sz.height > 0 else {
+            let sz = PlatformGraphics.normalizedPageSize(for: cgPage)
+            guard sz.width > 0, sz.height > 0,
+                  let img = PlatformGraphics.renderPDFCoverImage(cgPage: cgPage, pageSize: sz) else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let scale = min(1.0, 240.0 / sz.width)
-            let slot = PageSlot(index: 0, key: "1", pdfN: 1, srcN: nil, blank: nil, size: sz)
-            let img = PageCanvasView.renderSlotBackground(
-                slot: slot,
-                cgPDFDoc: cgDoc,
-                zoomScale: scale,
-                maxPixels: 240_000,
-                displayScale: 1.5,
-                fastQuality: true
-            )
             if let jpg = img.jpegData(compressionQuality: 0.78) {
                 try? jpg.write(to: diskURL, options: .atomic)
                 if let self {
