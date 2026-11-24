@@ -44,6 +44,7 @@ enum MacToolMode: Int, CaseIterable {
 extension Notification.Name {
     static let macPaperModeDidChange = Notification.Name("pencilink.mac.paperModeDidChange")
     static let macToolPrefsDidChange = Notification.Name("pencilink.mac.toolPrefsDidChange")
+    static let macRenderQualityDidChange = Notification.Name("pencilink.mac.renderQualityDidChange")
 }
 
 /// Ultra-lean UserDefaults preferences for Intel macOS (zero SwiftUI / Combine overhead on scroll!).
@@ -66,6 +67,16 @@ final class MacPreferences {
 
     var syncMode: MacSyncMode = .smart {
         didSet { if syncMode != oldValue { schedulePersist() } }
+    }
+
+    /// `false` = fast bilinear embedded image resampling (vector PDF text stays 100% crisp CoreText, much cooler CPU).
+    var highQualityImages: Bool = false {
+        didSet {
+            if highQualityImages != oldValue {
+                schedulePersist()
+                NotificationCenter.default.post(name: .macRenderQualityDidChange, object: nil)
+            }
+        }
     }
 
     // Highlighter defaults (exact same palette harmony as iPadOS)
@@ -123,6 +134,7 @@ final class MacPreferences {
     private struct Snapshot: Codable {
         var paperMode: String?
         var syncMode: String?
+        var highQualityImages: Bool?
         var hlColors: [String]?
         var hlColorIndex: Int?
         var hlSizes: [Double]?
@@ -152,6 +164,7 @@ final class MacPreferences {
         defer { loading = false }
         if let v = s.paperMode, let m = MacPaperMode(rawValue: v) { paperMode = m }
         if let v = s.syncMode, let m = MacSyncMode(rawValue: v) { syncMode = m }
+        if let hq = s.highQualityImages { highQualityImages = hq }
         if let c = s.hlColors, !c.isEmpty { hlColors = c }
         if let i = s.hlColorIndex { hlColorIndex = max(0, min(hlColors.count - 1, i)) }
         if let sz = s.hlSizes, sz.count == 3 { hlSizes = sz }
@@ -183,6 +196,7 @@ final class MacPreferences {
         let snap = Snapshot(
             paperMode: paperMode.rawValue,
             syncMode: syncMode.rawValue,
+            highQualityImages: highQualityImages,
             hlColors: hlColors,
             hlColorIndex: hlColorIndex,
             hlSizes: hlSizes,

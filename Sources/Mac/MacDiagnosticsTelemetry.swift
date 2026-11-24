@@ -61,6 +61,8 @@ struct MacProcessSnapshot {
     let timestamp: CFTimeInterval
     let userCPUSec: Double
     let sysCPUSec: Double
+    let billedSysSec: Double
+    let processGPUSec: Double
     let qosInteractiveSec: Double
     let qosInitiatedSec: Double
     let qosDefaultSec: Double
@@ -87,6 +89,8 @@ struct MacIntervalMetrics {
     let cpuPercentTotal: Double
     let cpuPercentUser: Double
     let cpuPercentSys: Double
+    let billedSysPercent: Double
+    let processGPUPercent: Double
     let estimatedEnergyImpact: Double
     let pkgIdleWakeupsPerSec: Double
     let interruptWakeupsPerSec: Double
@@ -138,22 +142,24 @@ enum MacDiagnosticsCollector {
 
         let userSec = rc == 0 ? ticksToSeconds(rusage.ri_user_time) : 0
         let sysSec = rc == 0 ? ticksToSeconds(rusage.ri_system_time) : 0
+        let billedSec = rc == 0 ? ticksToSeconds(rusage.ri_billed_system_time) : 0
         let qosUI = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_user_interactive) : 0
         let qosInit = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_user_initiated) : 0
         let qosDef = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_default) : 0
         let qosUtil = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_utility) : 0
         let qosBg = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_background) : 0
 
-        // 2. task_info(TASK_POWER_INFO): <5ms and >5ms timer wakeup bins
-        var pwr = task_power_info_data_t()
-        var pwrCount = mach_msg_type_number_t(MemoryLayout<task_power_info_data_t>.size / MemoryLayout<integer_t>.size)
-        let pwrKR: kern_return_t = withUnsafeMutablePointer(to: &pwr) { ptr in
-            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(pwrCount)) { rebound in
-                task_info(mach_task_self_, task_flavor_t(TASK_POWER_INFO), rebound, &pwrCount)
+        // 2. task_info(TASK_POWER_INFO_V2): <5ms / >5ms timer bins + THIS process's exact GPU utilization nanoseconds!
+        var pwr2 = task_power_info_v2_data_t()
+        var pwr2Count = mach_msg_type_number_t(MemoryLayout<task_power_info_v2_data_t>.size / MemoryLayout<integer_t>.size)
+        let pwr2KR: kern_return_t = withUnsafeMutablePointer(to: &pwr2) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(pwr2Count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_POWER_INFO_V2), rebound, &pwr2Count)
             }
         }
-        let bin1 = pwrKR == KERN_SUCCESS ? pwr.task_timer_wakeups_bin_1 : 0
-        let bin2 = pwrKR == KERN_SUCCESS ? pwr.task_timer_wakeups_bin_2 : 0
+        let bin1 = pwr2KR == KERN_SUCCESS ? pwr2.cpu_energy.task_timer_wakeups_bin_1 : 0
+        let bin2 = pwr2KR == KERN_SUCCESS ? pwr2.cpu_energy.task_timer_wakeups_bin_2 : 0
+        let procGPUSec = pwr2KR == KERN_SUCCESS ? Double(pwr2.gpu_energy.task_gpu_utilisation) / 1_000_000_000.0 : 0
 
         // 3. Per-thread CPU & names (pinpoints PDFKit / Vision / CoreImage / Main / DriveSync!)
         let threads = sampleThreads()
@@ -168,6 +174,8 @@ enum MacDiagnosticsCollector {
             timestamp: ts,
             userCPUSec: userSec,
             sysCPUSec: sysSec,
+            billedSysSec: billedSec,
+            processGPUSec: procGPUSec,
             qosInteractiveSec: qosUI,
             qosInitiatedSec: qosInit,
             qosDefaultSec: qosDef,
@@ -197,8 +205,12 @@ enum MacDiagnosticsCollector {
 
         let dUser = max(0, end.userCPUSec - start.userCPUSec)
         let dSys = max(0, end.sysCPUSec - start.sysCPUSec)
+        let dBilled = max(0, end.billedSysSec - start.billedSysSec)
+        let dProcGPU = max(0, end.processGPUSec - start.processGPUSec)
         let userPct = (dUser / dt) * 100.0
         let sysPct = (dSys / dt) * 100.0
+        let billedPct = (dBilled / dt) * 100.0
+        let procGPUPct = (dProcGPU / dt) * 100.0
         let totalPct = userPct + sysPct
 
         let dPkg = end.pkgIdleWakeups >= start.pkgIdleWakeups ? (end.pkgIdleWakeups - start.pkgIdleWakeups) : 0
@@ -214,8 +226,8 @@ enum MacDiagnosticsCollector {
         let dRead = end.diskReadBytes >= start.diskReadBytes ? (end.diskReadBytes - start.diskReadBytes) : 0
         let dWrite = end.diskWriteBytes >= start.diskWriteBytes ? (end.diskWriteBytes - start.diskWriteBytes) : 0
 
-        // Apple Activity Monitor Energy Impact approximation (CPU% + Idle Wakeups * 0.05 + Disk/Timer penalty)
-        let energyApprox = totalPct + pkgPerSec * 0.05 + bin1PerSec * 0.02
+        // Apple Activity Monitor Energy Impact approximation (CPU% + Process GPU% + Idle Wakeups)
+        let energyApprox = totalPct + procGPUPct + pkgPerSec * 0.05 + bin1PerSec * 0.02
 
         // QoS breakdown
         let qUI = max(0, end.qosInteractiveSec - start.qosInteractiveSec) / dt * 100.0
@@ -272,6 +284,8 @@ enum MacDiagnosticsCollector {
             cpuPercentTotal: totalPct,
             cpuPercentUser: userPct,
             cpuPercentSys: sysPct,
+            billedSysPercent: billedPct,
+            processGPUPercent: procGPUPct,
             estimatedEnergyImpact: energyApprox,
             pkgIdleWakeupsPerSec: pkgPerSec,
             interruptWakeupsPerSec: intPerSec,

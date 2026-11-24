@@ -47,13 +47,16 @@ enum MacPaperThemeRenderer {
         ctx.restoreGState()
     }
 
-    /// Applies Zero-CIFilter pure CoreGraphics Dark Paper or Warm Sepia inside PDFKit's tile cache.
+    /// Ultra-low-energy 1-pass CoreGraphics paper theming baked ONCE into PDFKit's `CATiledLayer` cache:
+    /// - Original: 100% passthrough (ZERO overhead)
+    /// - Sepia: 1× draw + 1× `.multiply` fill (ZERO offscreen buffers)
+    /// - Dark Paper: 1× draw + 1× `.exclusion` (0.89) fill (ZERO transparency layer, ZERO 2nd PDF draw!)
+    ///   Strictly monotonic: White #FFFFFF -> #1C1C1C charcoal, Light Gray #EAEAEA -> #2C2C2C, Black #000000 -> #E3E3E3!
     static func drawThemed(rect: CGRect, in ctx: CGContext, drawContent: () -> Void) {
         let mode = currentMode
         switch mode {
         case .original:
             drawContent()
-            drawSubtlePageBorder(in: ctx, rect: rect, mode: .original)
 
         case .sepia:
             let clip = ctx.boundingBoxOfClipPath.intersection(rect)
@@ -65,45 +68,19 @@ enum MacPaperThemeRenderer {
             ctx.setFillColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0)
             ctx.fill(clip)
             ctx.restoreGState()
-            drawSubtlePageBorder(in: ctx, rect: rect, mode: .sepia)
 
         case .dark:
-            // Strictly monotonic hue-preserving dark paper using pure CoreGraphics blend modes:
-            //   White (#FFFFFF) -> #1A1A1A charcoal | Light gray table (#EAEAEA) -> #2A2A2A
-            //   Black (#000000) -> #E8E8E8 soft text | Red/Blue/Green diagrams retain true hues!
             let clip = ctx.boundingBoxOfClipPath.intersection(rect)
             guard !clip.isNull, !clip.isEmpty else { return }
             ctx.saveGState()
             ctx.clip(to: clip)
-            ctx.beginTransparencyLayer(in: clip, auxiliaryInfo: nil)
-
-            // 1. White paper + original PDF page
             ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
             ctx.fill(clip)
             drawContent()
-
-            // 2. Monotonic inversion (1 - c)
-            ctx.setBlendMode(.difference)
-            ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+            ctx.setBlendMode(.exclusion)
+            ctx.setFillColor(red: 0.89, green: 0.89, blue: 0.89, alpha: 1.0)
             ctx.fill(clip)
-
-            // 3. Restore original figure/diagram hues & saturation onto inverted luminosity
-            ctx.setBlendMode(.color)
-            drawContent()
-
-            // 4. Lift pure black background to comfortable #1A1A1A charcoal
-            ctx.setBlendMode(.screen)
-            ctx.setFillColor(red: 0.11, green: 0.11, blue: 0.11, alpha: 1.0)
-            ctx.fill(clip)
-
-            // 5. Soften pure white text to zero-halation #E8E8E8
-            ctx.setBlendMode(.multiply)
-            ctx.setFillColor(red: 0.91, green: 0.91, blue: 0.91, alpha: 1.0)
-            ctx.fill(clip)
-
-            ctx.endTransparencyLayer()
             ctx.restoreGState()
-            drawSubtlePageBorder(in: ctx, rect: rect, mode: .dark)
         }
     }
 }
@@ -111,6 +88,10 @@ enum MacPaperThemeRenderer {
 /// Zero-overhead `PDFPage` subclass instantiated automatically for every page by `MacThemedPDFDocument`.
 final class MacThemedPDFPage: PDFPage {
     override func draw(with box: PDFDisplayBox, to context: CGContext) {
+        if MacPaperThemeRenderer.currentMode == .original {
+            super.draw(with: box, to: context)
+            return
+        }
         let rect = bounds(for: box)
         MacPaperThemeRenderer.drawThemed(rect: rect, in: context) {
             super.draw(with: box, to: context)

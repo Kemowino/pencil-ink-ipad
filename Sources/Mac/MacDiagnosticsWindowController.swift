@@ -267,9 +267,15 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             progressBar.doubleValue = 1
         }
 
+        // Pick a consistent mid-book start page so Phase 2 (Original) & Phase 5 (Dark Paper) scroll the EXACT SAME pages!
+        let totalP = max(1, reader.diagnosticsPageCount())
+        let scrollAnchorPage = min(max(0, totalP - 12), min(50, totalP / 4))
+
         // Phase 2: Smooth Scroll — Original Paper (4.5s)
         if !cancelTestRequested {
             statusLabel.stringValue = "Phase 2/5: Smooth Scroll — Original Paper (4.5s)…"
+            reader.diagnosticsGoToPage(scrollAnchorPage)
+            try? await Task.sleep(nanoseconds: 250_000_000)
             let m = await runSmoothScrollPhase(reader: reader, durationSec: 4.5, pointsPerStep: 28)
             phaseResults.append(("2. Smooth Scroll (Original)", m))
             appendReport(formatPhaseSection("Phase 2: Smooth Scroll (Original Paper)", m))
@@ -294,11 +300,12 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             progressBar.doubleValue = 4
         }
 
-        // Phase 5: Smooth Scroll — Dark Paper (4.5s)
+        // Phase 5: Smooth Scroll — Dark Paper (4.5s, EXACT SAME pages as Phase 2!)
         if !cancelTestRequested {
             statusLabel.stringValue = "Phase 5/5: Smooth Scroll — Dark Paper (4.5s)…"
+            reader.diagnosticsGoToPage(scrollAnchorPage)
             MacPreferences.shared.paperMode = .dark
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            try? await Task.sleep(nanoseconds: 450_000_000)
             let m = await runSmoothScrollPhase(reader: reader, durationSec: 4.5, pointsPerStep: 28)
             phaseResults.append(("5. Smooth Scroll (Dark Paper)", m))
             appendReport(formatPhaseSection("Phase 5: Smooth Scroll (Dark Paper)", m))
@@ -313,16 +320,16 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         // Summary Markdown Table
         if !phaseResults.isEmpty {
             var table = "\n## Summary Table\n"
-            table += "| Phase | CPU% (U/S) | Est EI | Wkup/s | <5ms/s | FPS (P95) | Mem | Watts | Overlays (Draws) |\n"
+            table += "| Phase | CPU% (U/S) | Proc GPU% | Est EI | Wkup/s | FPS (P95) | Mem | Watts | Pages |\n"
             table += "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n"
             for (name, m) in phaseResults {
                 let fpsCol = m.fps > 0 ? String(format: "%.0f (%.1fms)", m.fps, m.p95FrameMs) : "—"
                 let wCol = m.battery.available ? String(format: "%.1fW", m.battery.watts) : "N/A"
                 table += String(
-                    format: "| %@ | %.1f%% (%.1f/%.1f) | %.1f | %.0f | %.0f | %@ | %.0fMB | %@ | %d (%d) |\n",
+                    format: "| %@ | %.1f%% (%.1f/%.1f) | %.1f%% | %.1f | %.0f | %@ | %.0fMB | %@ | %d |\n",
                     name, m.cpuPercentTotal, m.cpuPercentUser, m.cpuPercentSys,
-                    m.estimatedEnergyImpact, m.pkgIdleWakeupsPerSec, m.timerUnder5msPerSec,
-                    fpsCol, m.memoryMB, wCol, m.overlaysMounted, m.overlayDraws
+                    m.processGPUPercent, m.estimatedEnergyImpact, m.pkgIdleWakeupsPerSec,
+                    fpsCol, m.memoryMB, wCol, m.pageChanges
                 )
             }
             appendReport(table)
@@ -414,7 +421,6 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             lastTick = now
         }
         reader.diagnosticsCommitZoom()
-        reader.zoomToFitAction()
         try? await Task.sleep(nanoseconds: 250_000_000)
 
         let end = MacDiagnosticsCollector.captureSnapshot()
@@ -437,7 +443,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
 
         return """
         ### \(title) (\(String(format: "%.2fs", m.durationSec)))
-        - CPU: \(String(format: "%.1f%%", m.cpuPercentTotal)) total (User \(String(format: "%.1f%%", m.cpuPercentUser)) / Sys \(String(format: "%.1f%%", m.cpuPercentSys))) | Est Energy Impact: \(String(format: "%.1f", m.estimatedEnergyImpact))
+        - CPU: \(String(format: "%.1f%%", m.cpuPercentTotal)) total (User \(String(format: "%.1f%%", m.cpuPercentUser)) / Sys \(String(format: "%.1f%%", m.cpuPercentSys)) / BilledSys \(String(format: "%.1f%%", m.billedSysPercent))) | Proc GPU: \(String(format: "%.1f%%", m.processGPUPercent)) | Est EI: \(String(format: "%.1f", m.estimatedEnergyImpact))
         - QoS: \(m.qosBreakdown)
         - Wakeups: Pkg Idle \(String(format: "%.1f/s", m.pkgIdleWakeupsPerSec)) | Interrupt \(String(format: "%.1f/s", m.interruptWakeupsPerSec)) | Timers <5ms: \(String(format: "%.1f/s", m.timerUnder5msPerSec)), >5ms: \(String(format: "%.1f/s", m.timerOver5msPerSec))
         - Top Threads: \(threadsLine)

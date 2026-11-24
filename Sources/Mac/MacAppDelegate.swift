@@ -22,6 +22,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prevent macOS VisionKit Live Text background OCR/GPU scans on every PDF page jump!
+        UserDefaults.standard.register(defaults: [
+            "AppleLiveTextEnabled": false
+        ])
+        UserDefaults.standard.set(false, forKey: "AppleLiveTextEnabled")
         NSWindow.allowsAutomaticWindowTabbing = true
         syncManager.isSmartSyncEnabled = { MacPreferences.shared.syncMode == .smart }
         buildMainMenu()
@@ -226,6 +231,9 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
              #selector(menuModeRead), #selector(menuModeHighlight), #selector(menuModeTextBox),
              #selector(menuToggleBookmark), #selector(menuZoomIn), #selector(menuZoomOut), #selector(menuZoomFit), #selector(menuToggleTwoUp):
             return reader != nil
+        case #selector(menuToggleHighQualityImages):
+            menuItem.state = MacPreferences.shared.highQualityImages ? .on : .off
+            return true
         default:
             return true
         }
@@ -242,6 +250,9 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     @objc private func menuZoomOut() { activeReaderController()?.zoomOutAction() }
     @objc private func menuZoomFit() { activeReaderController()?.zoomToFitAction() }
     @objc private func menuToggleTwoUp() { activeReaderController()?.toggleTwoUpAction() }
+    @objc private func menuToggleHighQualityImages() {
+        MacPreferences.shared.highQualityImages.toggle()
+    }
     @objc private func menuPaperOriginal() { MacPreferences.shared.paperMode = .original }
     @objc private func menuPaperSepia() { MacPreferences.shared.paperMode = .sepia }
     @objc private func menuPaperDark() { MacPreferences.shared.paperMode = .dark }
@@ -339,6 +350,8 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         viewMenu.addItem(withTitle: "Original Paper", action: #selector(menuPaperOriginal), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Warm Sepia Paper", action: #selector(menuPaperSepia), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Dark Paper", action: #selector(menuPaperDark), keyEquivalent: "")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "High-Quality Image Resampling", action: #selector(menuToggleHighQualityImages), keyEquivalent: "")
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 

@@ -240,6 +240,12 @@ final class MacPDFWindowController: NSWindowController,
             name: .macToolPrefsDidChange,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRenderQualityChanged),
+            name: .macRenderQualityDidChange,
+            object: nil
+        )
         syncManager.$statusText
             .receive(on: DispatchQueue.main)
             .sink { [weak self] text in
@@ -261,6 +267,10 @@ final class MacPDFWindowController: NSWindowController,
 
     @objc private func handleToolPrefsChanged() {
         optionsBar.syncFromPreferences()
+    }
+
+    @objc private func handleRenderQualityChanged() {
+        pdfView.applyRenderQuality(highQualityImages: MacPreferences.shared.highQualityImages)
     }
 
     // MARK: - Zero-Overlay Fast-Path Management
@@ -1111,7 +1121,9 @@ final class MacPDFWindowController: NSWindowController,
         let cur = clip.bounds.origin
         let maxY = max(0, docView.bounds.height - clip.bounds.height)
         guard maxY > 10 else { return false }
-        let nextY = max(0, min(maxY, cur.y + deltaY))
+        // Respect flipped vs bottom-up PDFDocumentView so positive deltaY ALWAYS scrolls forward (downward)!
+        let signedDelta = docView.isFlipped ? deltaY : -deltaY
+        let nextY = max(0, min(maxY, cur.y + signedDelta))
         if abs(nextY - cur.y) < 0.5 { return false }
         clip.scroll(to: NSPoint(x: cur.x, y: nextY))
         scroll.reflectScrolledClipView(clip)

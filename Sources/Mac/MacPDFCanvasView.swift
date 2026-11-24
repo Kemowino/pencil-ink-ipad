@@ -66,9 +66,16 @@ final class MacPDFCanvasView: PDFView {
         displayBox = .cropBox
         autoScales = true
         pageShadowsEnabled = false
-        interpolationQuality = .high
+        interpolationQuality = MacPreferences.shared.highQualityImages ? .high : .low
         enableDataDetectors = false
         backgroundColor = Self.originalBgColor
+    }
+
+    func applyRenderQuality(highQualityImages: Bool) {
+        let target: PDFInterpolationQuality = highQualityImages ? .high : .low
+        guard interpolationQuality != target else { return }
+        interpolationQuality = target
+        flushTileCachesPreservingScroll()
     }
 
     // MARK: - Zero-CIFilter Paper Mode Switching (Tile-Cached Pure CoreGraphics!)
@@ -103,18 +110,11 @@ final class MacPDFCanvasView: PDFView {
     }
 
     private func flushTileCachesPreservingScroll() {
-        let scroll = documentView?.enclosingScrollView
-        let savedOrigin = scroll?.contentView.bounds.origin
         if let rootLayer = documentView?.layer {
             Self.invalidateLayerTree(rootLayer)
         }
         documentView?.needsDisplay = true
         needsDisplay = true
-        layoutDocumentView()
-        if let origin = savedOrigin, let scroll {
-            scroll.contentView.scroll(to: origin)
-            scroll.reflectScrolledClipView(scroll.contentView)
-        }
     }
 
     private static func invalidateLayerTree(_ layer: CALayer) {
