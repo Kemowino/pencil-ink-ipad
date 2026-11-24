@@ -21,7 +21,7 @@ protocol MacPDFCanvasDelegate: AnyObject {
 /// - **GPU-First Live Pinch-to-Zoom:** Scales the CoreAnimation layer at 60 FPS (0% tile thrashing, 0% 2,500-page relayouts)
 ///   during active pinch gestures and commits crisp vector tiles ONCE when the gesture ends!
 /// - `enableDataDetectors = false`, `pageShadowsEnabled = false` (replaced by crisp 0.75pt CoreGraphics page border),
-///   and `interpolationQuality = .medium` (clean bilinear diagrams without Lanczos CPU spikes).
+///   and `interpolationQuality = .high` (crisp Preview-grade diagrams; Phase 2 already ran at 6.9W with `.high`).
 final class MacPDFCanvasView: PDFView {
     weak var canvasDelegate: MacPDFCanvasDelegate?
     var toolMode: MacToolMode = .read {
@@ -66,7 +66,7 @@ final class MacPDFCanvasView: PDFView {
         displayBox = .cropBox
         autoScales = true
         pageShadowsEnabled = false
-        interpolationQuality = .medium
+        interpolationQuality = .high
         enableDataDetectors = false
         backgroundColor = Self.originalBgColor
     }
@@ -129,24 +129,16 @@ final class MacPDFCanvasView: PDFView {
     // MARK: - GPU-First Live Pinch-to-Zoom (Eliminates 215% CPU / 30W Tile Thrashing!)
 
     override func magnify(with event: NSEvent) {
-        switch event.phase {
-        case .began:
+        let phase = event.phase
+        if phase.contains(.began) || phase.contains(.changed) {
             beginLiveZoomIfNeeded()
             let next = liveZoomTargetScale * (1.0 + event.magnification)
             previewLiveZoom(to: next)
-
-        case .changed:
-            beginLiveZoomIfNeeded()
-            let next = liveZoomTargetScale * (1.0 + event.magnification)
-            previewLiveZoom(to: next)
-
-        case .ended, .cancelled:
+        } else if phase.contains(.ended) || phase.contains(.cancelled) {
             if isLiveZooming {
                 commitLiveZoom()
             }
-
-        default:
-            // Legacy/synthetic magnify without phase: commit cleanly
+        } else {
             super.magnify(with: event)
         }
     }

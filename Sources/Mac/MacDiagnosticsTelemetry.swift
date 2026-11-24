@@ -300,7 +300,7 @@ enum MacDiagnosticsCollector {
 
     private static let mainThreadID: UInt64 = {
         var tid: UInt64 = 0
-        pthread_threadid_np(nil, &tid)
+        pthread_threadid_np(pthread_self(), &tid)
         return tid
     }()
 

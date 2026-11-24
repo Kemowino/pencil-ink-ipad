@@ -89,6 +89,6 @@ jobs:
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Telemetry-Driven Intel macOS Battery & GPU Breakthrough: Eliminates CoreImage/CIFilter completely with Zero-CIFilter tile-cached pure CoreGraphics Dark & Sepia Paper via MacThemedPDFDocument/MacThemedPDFPage (stops 30W / 54% AMD Radeon wakeups & 98% Dark Paper scroll CPU), GPU-First 60Hz Live Pinch-to-Zoom (eliminates 216% CPU zoom tile thrashing), removes unsafe ObjC perform() selector call, adds Two-Page Spread (Cmd+Shift+2), full-height macOS Library sidebar, wider 2,500+ page indicator, and readable Main/GCD thread labels in Self-Test." \
+              --notes "Pencil Ink Native $TAG — Telemetry-Driven Intel macOS Battery & GPU Breakthrough: Eliminates CoreImage/CIFilter completely with Zero-CIFilter tile-cached pure CoreGraphics Dark & Sepia Paper via MacThemedPDFDocument/MacThemedPDFPage (stops 30W / 54% AMD Radeon wakeups & 98% Dark Paper scroll CPU), GPU-First 60Hz Live Pinch-to-Zoom (eliminates 216% CPU zoom tile thrashing), Two-Page Spread (Cmd+Shift+2), full-height macOS Library sidebar, wider 2,500+ page indicator, and readable Main/GCD thread labels in Self-Test." \
               --latest
           fi
