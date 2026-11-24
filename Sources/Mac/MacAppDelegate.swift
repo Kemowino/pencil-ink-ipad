@@ -204,6 +204,21 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         case #selector(menuToggleHighQualityImages):
             menuItem.state = MacPreferences.shared.highQualityImages ? .on : .off
             return true
+        case #selector(menuPaperOriginal):
+            menuItem.state = (MacPreferences.shared.paperMode == .original) ? .on : .off
+            return true
+        case #selector(menuPaperSepia):
+            menuItem.state = (MacPreferences.shared.paperMode == .sepia) ? .on : .off
+            return true
+        case #selector(menuPaperDark):
+            menuItem.state = (MacPreferences.shared.paperMode == .dark) ? .on : .off
+            return true
+        case #selector(menuLibraryGrid):
+            menuItem.state = (MacPreferences.shared.libraryDisplayMode == .grid) ? .on : .off
+            return true
+        case #selector(menuLibraryList):
+            menuItem.state = (MacPreferences.shared.libraryDisplayMode == .list) ? .on : .off
+            return true
         case #selector(menuSwitchTab(_:)):
             return menuItem.tag < (workspaceController?.openTabCount ?? 0)
         case #selector(menuPrevTab), #selector(menuNextTab):
@@ -225,6 +240,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     @objc private func menuZoomFit() { workspaceController?.zoomToFitAction() }
     @objc private func menuToggleTwoUp() { workspaceController?.toggleTwoUpAction() }
     @objc private func menuToggleHighQualityImages() { MacPreferences.shared.highQualityImages.toggle() }
+    @objc private func menuPaperOriginal() { MacPreferences.shared.paperMode = .original }
+    @objc private func menuPaperSepia() { MacPreferences.shared.paperMode = .sepia }
+    @objc private func menuPaperDark() { MacPreferences.shared.paperMode = .dark }
+    @objc private func menuLibraryGrid() { workspaceController?.setLibraryDisplayMode(.grid) }
+    @objc private func menuLibraryList() { workspaceController?.setLibraryDisplayMode(.list) }
     @objc private func menuSwitchTab(_ sender: NSMenuItem) { workspaceController?.switchToTabAtIndex(sender.tag) }
     @objc private func menuPrevTab() { workspaceController?.cycleTab(delta: -1) }
     @objc private func menuNextTab() { workspaceController?.cycleTab(delta: 1) }
@@ -319,6 +339,19 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         let twoUpItem = NSMenuItem(title: "Toggle Two-Page Spread", action: #selector(menuToggleTwoUp), keyEquivalent: "2")
         twoUpItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(twoUpItem)
+        viewMenu.addItem(.separator())
+        let pOrig = NSMenuItem(title: "Original Paper", action: #selector(menuPaperOriginal), keyEquivalent: "1")
+        pOrig.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(pOrig)
+        let pSepia = NSMenuItem(title: "Warm Sepia Paper", action: #selector(menuPaperSepia), keyEquivalent: "2")
+        pSepia.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(pSepia)
+        let pDark = NSMenuItem(title: "Dark Paper", action: #selector(menuPaperDark), keyEquivalent: "3")
+        pDark.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(pDark)
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Library Cover Grid", action: #selector(menuLibraryGrid), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Library Compact List", action: #selector(menuLibraryList), keyEquivalent: "")
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "High-Quality Image Resampling", action: #selector(menuToggleHighQualityImages), keyEquivalent: "")
         viewItem.submenu = viewMenu

@@ -9,6 +9,7 @@ private extension NSToolbarItem.Identifier {
     static let toolMode = NSToolbarItem.Identifier("pencilink.v4.toolMode")
     static let pageIndicator = NSToolbarItem.Identifier("pencilink.v4.pageIndicator")
     static let zoomControls = NSToolbarItem.Identifier("pencilink.v4.zoomControls")
+    static let paperMode = NSToolbarItem.Identifier("pencilink.v5.paperMode")
     static let syncStatus = NSToolbarItem.Identifier("pencilink.v4.syncStatus")
     static let diagnostics = NSToolbarItem.Identifier("pencilink.v4.diagnostics")
 }
@@ -65,6 +66,101 @@ final class MacTabSession: Identifiable {
 /// - **Tabs 1…N (In-App):** PDF Reader tabs sharing one `MacZeroScrollCanvasView` + `MacIOSurfacePool`
 /// - **Zero-Cost Background Tab Hibernation:** Switching tabs detaches & recycles 100% of `IOSurface`s immediately
 ///   (0.0% CPU, 0 wakeups/s, 0 MB active `IOSurface` VRAM for every background tab).
+/// Appearance-aware opaque tab strip container (0% live blur overhead, updates immediately on Dark/Light toggle).
+private final class MacTabStripContainerView: NSView {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.backgroundColor = DesignTokens.nsChromeSecondary.cgColor
+    }
+}
+
+/// Tactile hover-aware Studio Craft tab pill (100% pure AppKit CALayer, zero idle timers).
+private final class MacTabPillView: NSView {
+    let isActiveTab: Bool
+    private let accentUnderline = NSView()
+    private var isHovered = false
+    private var tracking: NSTrackingArea?
+
+    init(isActive: Bool) {
+        self.isActiveTab = isActive
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.borderWidth = isActive ? 0.9 : 0.5
+
+        accentUnderline.translatesAutoresizingMaskIntoConstraints = false
+        accentUnderline.wantsLayer = true
+        accentUnderline.layer?.cornerRadius = 1.0
+        accentUnderline.layer?.backgroundColor = DesignTokens.nsAccent.cgColor
+        accentUnderline.isHidden = !isActive
+        addSubview(accentUnderline)
+        NSLayoutConstraint.activate([
+            accentUnderline.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            accentUnderline.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            accentUnderline.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+            accentUnderline.heightAnchor.constraint(equalToConstant: 2)
+        ])
+        refreshColors(animated: false)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = tracking { removeTrackingArea(t) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard !isActiveTab else { return }
+        isHovered = true
+        refreshColors(animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard !isActiveTab else { return }
+        isHovered = false
+        refreshColors(animated: true)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors(animated: false)
+    }
+
+    private func refreshColors(animated: Bool) {
+        let bg: CGColor
+        let border: CGColor
+        if isActiveTab {
+            bg = DesignTokens.nsChromePrimary.cgColor
+            border = DesignTokens.nsAccent.withAlphaComponent(0.38).cgColor
+        } else if isHovered {
+            bg = NSColor.labelColor.withAlphaComponent(0.08).cgColor
+            border = DesignTokens.nsHairline.cgColor
+        } else {
+            bg = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            border = NSColor.clear.cgColor
+        }
+        let apply = {
+            self.layer?.backgroundColor = bg
+            self.layer?.borderColor = border
+            self.accentUnderline.layer?.backgroundColor = DesignTokens.nsAccent.cgColor
+        }
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.12
+                apply()
+            }
+        } else {
+            apply()
+        }
+    }
+}
+
 @MainActor
 final class MacWorkspaceWindowController: NSWindowController,
     NSWindowDelegate, NSToolbarDelegate,
@@ -80,7 +176,7 @@ final class MacWorkspaceWindowController: NSWindowController,
 
     // Layout chrome
     private let rootView = NSView()
-    private let tabStripContainer = NSView()
+    private let tabStripContainer = MacTabStripContainerView()
     private let tabScroll = NSScrollView()
     private let tabStack = NSStackView()
     private let contentHost = NSView()
@@ -101,6 +197,7 @@ final class MacWorkspaceWindowController: NSWindowController,
     private let bookmarkButton = NSButton()
     private let pageField = NSTextField()
     private let zoomSegment = NSSegmentedControl()
+    private let paperModeButton = NSButton()
     private let syncButton = NSButton(title: "", target: nil, action: nil)
 
     // Static cached SF Symbols (ZERO per-scroll NSImage lookups!)
@@ -198,7 +295,7 @@ final class MacWorkspaceWindowController: NSWindowController,
         // In-app Tab Strip (Pinned Library + Open PDF Tabs)
         tabStripContainer.translatesAutoresizingMaskIntoConstraints = false
         tabStripContainer.wantsLayer = true
-        tabStripContainer.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        tabStripContainer.layer?.backgroundColor = DesignTokens.nsChromeSecondary.cgColor
 
         let tabBottomLine = NSBox()
         tabBottomLine.boxType = .separator
@@ -234,7 +331,7 @@ final class MacWorkspaceWindowController: NSWindowController,
             tabStripContainer.topAnchor.constraint(equalTo: rootView.topAnchor),
             tabStripContainer.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
             tabStripContainer.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
-            tabStripContainer.heightAnchor.constraint(equalToConstant: 36),
+            tabStripContainer.heightAnchor.constraint(equalToConstant: 38),
 
             tabScroll.topAnchor.constraint(equalTo: tabStripContainer.topAnchor),
             tabScroll.leadingAnchor.constraint(equalTo: tabStripContainer.leadingAnchor),
@@ -264,6 +361,7 @@ final class MacWorkspaceWindowController: NSWindowController,
 
         optionsBar.translatesAutoresizingMaskIntoConstraints = false
         optionsBar.isHidden = true
+        optionsBar.alphaValue = 0.0
         optionsBar.onStyleChanged = { [weak self] in self?.updateActiveTextBoxStyle() }
         optionsBar.onDuplicateTextBox = { [weak self] in self?.duplicateActiveTextBox() }
         optionsBar.onDeleteTextBox = { [weak self] in self?.deleteActiveTextBox() }
@@ -317,6 +415,12 @@ final class MacWorkspaceWindowController: NSWindowController,
             name: .macRenderQualityDidChange,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handlePaperModeChanged),
+            name: .macPaperModeDidChange,
+            object: nil
+        )
         syncManager.$statusText
             .receive(on: DispatchQueue.main)
             .sink { [weak self] text in
@@ -344,6 +448,26 @@ final class MacWorkspaceWindowController: NSWindowController,
         if activeReaderSession != nil {
             canvasView.applyRenderQuality(highQualityImages: MacPreferences.shared.highQualityImages)
         }
+    }
+
+    @objc private func handlePaperModeChanged() {
+        let mode = MacPreferences.shared.paperMode
+        updatePaperModeButtonIcon()
+        if activeReaderSession != nil {
+            canvasView.applyPaperMode(mode)
+        }
+    }
+
+    private func updatePaperModeButtonIcon() {
+        let mode = MacPreferences.shared.paperMode
+        paperModeButton.image = NSImage(systemSymbolName: mode.symbolName, accessibilityDescription: mode.title)
+        paperModeButton.contentTintColor = (mode == .original) ? nil : DesignTokens.nsWarmGold
+        paperModeButton.toolTip = "Paper Mode: \(mode.title)"
+    }
+
+    func setLibraryDisplayMode(_ mode: MacLibraryDisplayMode) {
+        showLibraryTab(focusSearch: false)
+        libraryVC.setDisplayMode(mode)
     }
 
     // MARK: - In-App Tab Lifecycle & Zero-VRAM Hibernation
@@ -538,35 +662,26 @@ final class MacWorkspaceWindowController: NSWindowController,
     }
 
     private func makeTabPill(for tab: MacTabSession, index: Int, isActive: Bool) -> NSView {
-        let container = NSView()
+        let container = MacTabPillView(isActive: isActive)
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.wantsLayer = true
-        container.layer?.cornerRadius = 6
-        container.layer?.backgroundColor = isActive
-            ? NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
-            : NSColor.labelColor.withAlphaComponent(0.04).cgColor
-        container.layer?.borderWidth = isActive ? 0.8 : 0.4
-        container.layer?.borderColor = isActive
-            ? NSColor.controlAccentColor.withAlphaComponent(0.45).cgColor
-            : NSColor.separatorColor.withAlphaComponent(0.5).cgColor
 
         let displayTitle = tab.isLibrary ? "Library" : String(tab.title.prefix(28))
         let selectBtn = NSButton(title: displayTitle, target: self, action: #selector(didClickTabPill(_:)))
         selectBtn.isBordered = false
         selectBtn.font = NSFont.systemFont(ofSize: 12, weight: isActive ? .semibold : .regular)
-        selectBtn.contentTintColor = isActive ? .controlAccentColor : .labelColor
+        selectBtn.contentTintColor = isActive ? DesignTokens.nsAccent : .labelColor
         selectBtn.tag = index
         selectBtn.toolTip = tab.isLibrary ? "Library (⌘1)" : "\(tab.title) (⌘\(min(9, index + 1)))"
         selectBtn.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(selectBtn)
 
         if tab.isLibrary {
-            selectBtn.image = NSImage(systemSymbolName: "books.vertical", accessibilityDescription: "Library")
+            selectBtn.image = NSImage(systemSymbolName: isActive ? "books.vertical.fill" : "books.vertical", accessibilityDescription: "Library")
             selectBtn.imagePosition = .imageLeading
             NSLayoutConstraint.activate([
-                container.heightAnchor.constraint(equalToConstant: 26),
-                selectBtn.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 9),
-                selectBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -9),
+                container.heightAnchor.constraint(equalToConstant: 28),
+                selectBtn.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+                selectBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
                 selectBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor)
             ])
         } else {
@@ -576,7 +691,7 @@ final class MacWorkspaceWindowController: NSWindowController,
                 action: #selector(didClickCloseTabPill(_:))
             )
             closeBtn.isBordered = false
-            closeBtn.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+            closeBtn.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 8.5, weight: .bold)
             closeBtn.contentTintColor = .secondaryLabelColor
             closeBtn.tag = index
             closeBtn.toolTip = "Close Tab (⌘W)"
@@ -584,15 +699,15 @@ final class MacWorkspaceWindowController: NSWindowController,
             container.addSubview(closeBtn)
 
             NSLayoutConstraint.activate([
-                container.heightAnchor.constraint(equalToConstant: 26),
-                selectBtn.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 9),
+                container.heightAnchor.constraint(equalToConstant: 28),
+                selectBtn.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
                 selectBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
 
-                closeBtn.leadingAnchor.constraint(equalTo: selectBtn.trailingAnchor, constant: 5),
-                closeBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+                closeBtn.leadingAnchor.constraint(equalTo: selectBtn.trailingAnchor, constant: 6),
+                closeBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -7),
                 closeBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-                closeBtn.widthAnchor.constraint(equalToConstant: 14),
-                closeBtn.heightAnchor.constraint(equalToConstant: 14)
+                closeBtn.widthAnchor.constraint(equalToConstant: 15),
+                closeBtn.heightAnchor.constraint(equalToConstant: 15)
             ])
         }
 
@@ -614,6 +729,7 @@ final class MacWorkspaceWindowController: NSWindowController,
         modeSegment.isEnabled = isReader
         pageField.isEnabled = isReader
         zoomSegment.isEnabled = isReader
+        paperModeButton.isEnabled = isReader
         if !isReader {
             pageField.stringValue = "—"
             bookmarkButton.image = Self.iconBookmark
@@ -624,11 +740,25 @@ final class MacWorkspaceWindowController: NSWindowController,
     private func updateOptionsBarVisibility() {
         let hasActiveBox = (activeTextEditor != nil)
         let shouldShow = (activeReaderSession != nil) && ((canvasView.toolMode != .read) || hasActiveBox)
-        optionsBar.isHidden = !shouldShow
-        optionsBarHeightConstraint?.constant = shouldShow ? 38 : 0
+        let targetH: CGFloat = shouldShow ? 40 : 0
         if shouldShow {
+            optionsBar.isHidden = false
             optionsBar.update(for: canvasView.toolMode, hasActiveTextBox: hasActiveBox)
         }
+        guard optionsBarHeightConstraint?.constant != targetH else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DesignTokens.motionQuick
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            optionsBarHeightConstraint?.animator().constant = targetH
+            optionsBar.animator().alphaValue = shouldShow ? 1.0 : 0.0
+        }, completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.optionsBarHeightConstraint?.constant == 0 {
+                    self.optionsBar.isHidden = true
+                }
+            }
+        })
     }
 
     // MARK: - Document Loading (Single-Pass PDFDocument + Memory-Mapped CGPDFDocument)
@@ -1355,7 +1485,7 @@ final class MacWorkspaceWindowController: NSWindowController,
         let textTotal = session.inkDoc.texts.values.reduce(0) { $0 + $1.count }
         let fileName = session.pdfURL?.lastPathComponent ?? session.title
         let cal = MacEnergyImpactCalibrator.shared.weights.sourceDescription
-        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-VSync-v4.2, Cal=\(cal))"
+        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-VSync-v5.0, Cal=\(cal))"
     }
 
     func diagnosticsPageCount() -> Int { activeReaderSession?.virtualResult?.slots.count ?? 0 }
@@ -1511,6 +1641,26 @@ final class MacWorkspaceWindowController: NSWindowController,
 
     @objc private func openDiagnosticsAction() {
         onRequestOpenDiagnostics?()
+    }
+
+    @objc private func showPaperModeMenu(_ sender: NSButton) {
+        let m = NSMenu()
+        let cur = MacPreferences.shared.paperMode
+        for (idx, mode) in MacPaperMode.allCases.enumerated() {
+            let item = NSMenuItem(title: mode.title, action: #selector(selectPaperModeFromMenu(_:)), keyEquivalent: "")
+            item.tag = idx
+            item.target = self
+            item.state = (mode == cur) ? .on : .off
+            item.image = NSImage(systemSymbolName: mode.symbolName, accessibilityDescription: mode.title)
+            m.addItem(item)
+        }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func selectPaperModeFromMenu(_ sender: NSMenuItem) {
+        let all = MacPaperMode.allCases
+        guard sender.tag >= 0 && sender.tag < all.count else { return }
+        MacPreferences.shared.paperMode = all[sender.tag]
     }
 
     private func updatePageIndicatorAndBookmarkUI() {
@@ -1716,11 +1866,11 @@ final class MacWorkspaceWindowController: NSWindowController,
     // MARK: - NSToolbarDelegate
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .syncStatus, .diagnostics]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .syncStatus, .diagnostics]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -1772,6 +1922,14 @@ final class MacWorkspaceWindowController: NSWindowController,
             zoomSegment.action = #selector(zoomSegmentClicked(_:))
             item.view = zoomSegment
             item.label = "Zoom"
+
+        case .paperMode:
+            paperModeButton.bezelStyle = .texturedRounded
+            paperModeButton.target = self
+            paperModeButton.action = #selector(showPaperModeMenu(_:))
+            updatePaperModeButtonIcon()
+            item.view = paperModeButton
+            item.label = "Paper"
 
         case .pageIndicator:
             pageField.alignment = .center

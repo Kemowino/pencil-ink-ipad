@@ -38,7 +38,7 @@ private final class MacColorSwatchButton: NSButton {
 
         if isSwatchSelected {
             let ring = bounds.insetBy(dx: 1.5, dy: 1.5)
-            ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
+            ctx.setStrokeColor(DesignTokens.nsAccent.cgColor)
             ctx.setLineWidth(2.0)
             ctx.strokeEllipse(in: ring)
         }
@@ -74,15 +74,15 @@ private final class MacThicknessDotButton: NSButton {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if isDotSelected {
             let bg = bounds.insetBy(dx: 1.5, dy: 1.5)
-            ctx.setFillColor(NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor)
+            ctx.setFillColor(DesignTokens.nsAccent.withAlphaComponent(0.16).cgColor)
             ctx.fillEllipse(in: bg)
-            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor)
+            ctx.setStrokeColor(DesignTokens.nsAccent.withAlphaComponent(0.8).cgColor)
             ctx.setLineWidth(1.3)
             ctx.strokeEllipse(in: bg)
         }
         let r = dotDiameter * 0.5
         let dotRect = CGRect(x: bounds.midX - r, y: bounds.midY - r, width: dotDiameter, height: dotDiameter)
-        let col = isDotSelected ? NSColor.controlAccentColor : NSColor.labelColor.withAlphaComponent(0.75)
+        let col = isDotSelected ? DesignTokens.nsAccent : NSColor.labelColor.withAlphaComponent(0.75)
         ctx.setFillColor(col.cgColor)
         ctx.fillEllipse(in: dotRect)
     }
@@ -130,7 +130,7 @@ final class MacToolOptionsBar: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = DesignTokens.nsChromeSecondary.cgColor
         setupUI()
         syncFromPreferences()
     }
@@ -141,7 +141,7 @@ final class MacToolOptionsBar: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = DesignTokens.nsChromeSecondary.cgColor
     }
 
     private func makeVDivider() -> NSBox {

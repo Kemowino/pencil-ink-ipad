@@ -39,6 +39,7 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
             defer: false
         )
         win.title = "Google Drive Sync & Device Key"
+        win.backgroundColor = DesignTokens.nsCanvasBackdrop
         win.center()
         super.init(window: win)
         win.delegate = self
@@ -248,7 +249,7 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
         statusLabel.stringValue = connected
             ? "Connected · \(syncManager.statusText) (Device: \(syncManager.config.deviceLabel))"
             : "Not Connected"
-        statusLabel.textColor = connected ? .systemGreen : .secondaryLabelColor
+        statusLabel.textColor = connected ? DesignTokens.nsEmerald : .secondaryLabelColor
 
         var parts: [String] = []
         if let vName = vault.vaultURL?.lastPathComponent { parts.append("Vault: \(vName)") }

@@ -71,27 +71,10 @@ struct NotebookScreen: View {
         tab.controllerBox
     }
 
-    private var primaryBarBg: Color {
-        colorScheme == .dark
-            ? Color(red: 0.135, green: 0.140, blue: 0.156)
-            : Color.white
-    }
-
-    private var secondaryBarBg: Color {
-        colorScheme == .dark
-            ? Color(red: 0.115, green: 0.120, blue: 0.135)
-            : Color(red: 0.975, green: 0.978, blue: 0.986)
-    }
-
-    private var hairlineColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.10)
-    }
-
-    private var floatingPillBg: Color {
-        colorScheme == .dark
-            ? Color(red: 0.145, green: 0.150, blue: 0.168).opacity(0.96)
-            : Color.white.opacity(0.96)
-    }
+    private var primaryBarBg: Color { DesignTokens.chromePrimary(colorScheme) }
+    private var secondaryBarBg: Color { DesignTokens.chromeSecondary(colorScheme) }
+    private var hairlineColor: Color { DesignTokens.hairline(colorScheme) }
+    private var floatingPillBg: Color { DesignTokens.elevatedPill(colorScheme).opacity(0.96) }
 
     #if targetEnvironment(macCatalyst)
     // Native 1.0x Mac Idiom ("Optimize for Mac" — crisp native macOS toolbar proportions!)
@@ -1629,6 +1612,8 @@ struct NotebookScreen: View {
                     Circle()
                         .stroke(active && colorScheme != .dark ? accent.opacity(0.35) : Color.clear, lineWidth: 1)
                 )
+                .scaleEffect(active ? 1.06 : 1.0)
+                .animation(.spring(response: 0.22, dampingFraction: 0.78), value: active)
         }
         .buttonStyle(.plain)
     }

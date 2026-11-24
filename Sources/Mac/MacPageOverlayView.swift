@@ -9,6 +9,7 @@ private final class MacCommittedInkView: NSView {
     var strokes: [InkStroke] = []
     var textBoxes: [InkTextBox] = []
     var hiddenTextBoxID: String? = nil
+    var smartDarkInk: Bool = false
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
@@ -51,10 +52,10 @@ private final class MacCommittedInkView: NSView {
         ctx.scaleBy(x: sx, y: sy)
 
         if !strokes.isEmpty {
-            MacPageOverlayView.drawStrokes(strokes, in: ctx, clipRect: pageClip)
+            MacPageOverlayView.drawStrokes(strokes, in: ctx, clipRect: pageClip, smartDarkInk: smartDarkInk)
         }
         if !textBoxes.isEmpty {
-            MacPageOverlayView.drawTextBoxes(textBoxes, in: ctx, clipRect: pageClip, hiddenID: hiddenTextBoxID)
+            MacPageOverlayView.drawTextBoxes(textBoxes, in: ctx, clipRect: pageClip, hiddenID: hiddenTextBoxID, smartDarkInk: smartDarkInk)
         }
 
         ctx.restoreGState()
@@ -210,6 +211,7 @@ final class MacPageOverlayView: NSView {
     private func ensureCommittedView() -> MacCommittedInkView {
         if let cv = committedView { return cv }
         let cv = MacCommittedInkView(pageSize: slot.size, frame: bounds)
+        cv.smartDarkInk = smartDarkInk
         if let editor = activeTextEditor {
             addSubview(cv, positioned: .below, relativeTo: editor)
         } else {
@@ -280,6 +282,16 @@ final class MacPageOverlayView: NSView {
         }
     }
 
+    var smartDarkInk: Bool = false {
+        didSet {
+            guard smartDarkInk != oldValue else { return }
+            if let cv = committedView {
+                cv.smartDarkInk = smartDarkInk
+                if !cv.isHidden { cv.needsDisplay = true }
+            }
+        }
+    }
+
     func setHiddenTextBoxID(_ id: String?) {
         guard let cv = committedView, cv.hiddenTextBoxID != id else { return }
         cv.hiddenTextBoxID = id
@@ -347,7 +359,7 @@ final class MacPageOverlayView: NSView {
 
     // MARK: - CoreGraphics Vector Rendering (Exact Match to iPadOS & Obsidian)
 
-    nonisolated static func drawStrokes(_ strokes: [InkStroke], in ctx: CGContext, clipRect: CGRect? = nil) {
+    nonisolated static func drawStrokes(_ strokes: [InkStroke], in ctx: CGContext, clipRect: CGRect? = nil, smartDarkInk: Bool = false) {
         guard !strokes.isEmpty else { return }
         ctx.saveGState()
         ctx.setLineCap(.round)
@@ -360,8 +372,8 @@ final class MacPageOverlayView: NSView {
         }
         if hasHighlight {
             ctx.saveGState()
-            ctx.setBlendMode(.multiply)
-            ctx.setAlpha(0.42)
+            ctx.setBlendMode(smartDarkInk ? .screen : .multiply)
+            ctx.setAlpha(smartDarkInk ? 0.34 : 0.42)
             for s in strokes where s.tool == "highlighter" {
                 if let rect = clipRect {
                     let pad = CGFloat(s.size) * 1.5 + 4
@@ -379,7 +391,8 @@ final class MacPageOverlayView: NSView {
                 let pad = CGFloat(s.size) * 1.8 + 4
                 guard s.boundingBox().insetBy(dx: -pad, dy: -pad).intersects(rect) else { continue }
             }
-            StrokeGeometry.drawCommittedStroke(s, in: ctx)
+            let overrideCol: NSColor? = smartDarkInk ? NSColor.cachedDarkLifted(hex: s.color) : nil
+            StrokeGeometry.drawCommittedStroke(s, in: ctx, overrideColor: overrideCol)
         }
         ctx.restoreGState()
     }
@@ -388,7 +401,8 @@ final class MacPageOverlayView: NSView {
         _ boxes: [InkTextBox],
         in ctx: CGContext,
         clipRect: CGRect? = nil,
-        hiddenID: String? = nil
+        hiddenID: String? = nil,
+        smartDarkInk: Bool = false
     ) {
         guard !boxes.isEmpty else { return }
         ctx.saveGState()
@@ -409,14 +423,14 @@ final class MacPageOverlayView: NSView {
             }
 
             if let bgHex = box.bgColor, !bgHex.isEmpty {
-                let bgCol = NSColor.cached(hex: bgHex).withAlphaComponent(0.85)
+                let bgCol = NSColor.cached(hex: bgHex).withAlphaComponent(smartDarkInk ? 0.24 : 0.85)
                 let path = CGPath(roundedRect: rect, cornerWidth: 5, cornerHeight: 5, transform: nil)
                 ctx.setFillColor(bgCol.cgColor)
                 ctx.addPath(path)
                 ctx.fillPath()
             }
 
-            let textColor = NSColor.cached(hex: box.color)
+            let textColor = smartDarkInk ? NSColor.cachedDarkLifted(hex: box.color) : NSColor.cached(hex: box.color)
             let font = box.resolvedFont()
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,

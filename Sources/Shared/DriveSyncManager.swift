@@ -1637,7 +1637,10 @@ final class DriveSyncManager: ObservableObject {
     }
 
     private func loadLogStateAsync(for inkRelPath: String) async -> BookLogState {
-        if let cached = logStates[inkRelPath] { return cached }
+        if let cached = logStates[inkRelPath] {
+            touchBookLogLRU(inkRelPath)
+            return cached
+        }
         let url = logStateURL(for: inkRelPath)
         let decoded: BookLogState? = await withCheckedContinuation { cont in
             logIOQueue.async {

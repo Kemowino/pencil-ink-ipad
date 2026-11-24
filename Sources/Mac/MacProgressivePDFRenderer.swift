@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CoreImage
 import Foundation
 import IOSurface
 import IOKit
@@ -40,13 +41,8 @@ final class MacRenderedPageSurface {
 }
 
 /// Two-tier progressive `CGPDFDocument` -> `IOSurface` rasterizer tuned for 5-10 EI on Intel Macs.
-///
-/// v4.1.0 Upgrades:
-/// 1. **1.05 MP Crisp Reading Draft (`interpolationQuality = .none`):** Vector CoreText stays 100% antialiased
-///    while skipping expensive `argb32_sample_argb32` resampling on embedded images -> crisp while scrolling, zero pop-in ghosting.
-/// 2. **Area-Capped Tier-2 Retina (`<= 1.85 MP` normal / `<= 2.40 MP` zoomed):** Cuts settled & zoom Worker CPU by ~60%.
-/// 3. **16-Page Draft + 6-Page Retina LRU Cache Preserved Across Zoom:** Zooming 1.0x <-> 2.1x and scrolling back hits cache at 0% CPU.
-/// 4. **Edge-to-edge `cropBox` + `rotationAngle` matrix:** Eliminates white borders on 16:9 lecture slides & zoomed pages.
+/// - Supports Original, Warm Sepia, and Dark Paper baked straight into the `IOSurface` (0% extra scroll shader cost).
+/// - Recycles `CGPDFDocument` handles every 60 cold decodes and releases handles + mmap on `hibernate()`.
 final class MacProgressivePDFRenderer {
     private let draftQueue = DispatchQueue(
         label: "com.pencilink.mac.progressive.draft",
@@ -66,6 +62,9 @@ final class MacProgressivePDFRenderer {
     /// Separate `CGPDFDocument` handles per serial queue (zero lock contention, shared kernel mmap pages).
     private var draftCGDoc: CGPDFDocument?
     private var retinaCGDoc: CGPDFDocument?
+    private var draftColdDecodes = 0
+    private var retinaColdDecodes = 0
+    private let cgDocRecycleInterval = 60
 
     private var generation: UInt64 = 0
     private var activeRange: ClosedRange<Int> = 0...0
@@ -76,6 +75,7 @@ final class MacProgressivePDFRenderer {
         let pixelW: Int
         let pixelH: Int
         let highQuality: Bool
+        let paperMode: MacPaperMode
     }
 
     private var draftCache: [CacheKey: MacRenderedPageSurface] = [:]
@@ -87,6 +87,22 @@ final class MacProgressivePDFRenderer {
     private let maxCachedRetina = 6
 
     private var inFlight: Set<CacheKey> = []
+
+    /// Lazily allocated ONLY if user activates Dark Paper mode -> 0 GPU/Metal cost in Original & Sepia!
+    private static let ciLock = NSLock()
+    private static var lazyCIContext: CIContext?
+    private static func darkPaperCIContext() -> CIContext {
+        ciLock.lock()
+        defer { ciLock.unlock() }
+        if let existing = lazyCIContext { return existing }
+        let ctx = CIContext(options: [
+            .useSoftwareRenderer: false,
+            .priorityRequestLow: true,
+            .cacheIntermediates: false
+        ])
+        lazyCIContext = ctx
+        return ctx
+    }
 
     /// Configures (or switches) the backing PDF file using a zero-syscall memory-mapped `CGDataProvider`.
     func configure(pdfURL: URL) {
@@ -100,10 +116,12 @@ final class MacProgressivePDFRenderer {
 
         draftQueue.async { [weak self] in
             guard let self else { return }
+            self.draftColdDecodes = 0
             self.draftCGDoc = Self.openCGPDFDocument(url: pdfURL, mappedData: mapped)
         }
         retinaQueue.async { [weak self] in
             guard let self else { return }
+            self.retinaColdDecodes = 0
             self.retinaCGDoc = Self.openCGPDFDocument(url: pdfURL, mappedData: mapped)
         }
     }
@@ -130,7 +148,7 @@ final class MacProgressivePDFRenderer {
         lock.unlock()
     }
 
-    /// Invalidates all cached surfaces (e.g. on quality preference change or hibernation) and recycles them to the pool.
+    /// Invalidates all cached surfaces (e.g. on quality/paper change or hibernation) and recycles them to the pool.
     func invalidateCacheForScaleOrQuality() {
         lock.lock()
         generation &+= 1
@@ -147,12 +165,27 @@ final class MacProgressivePDFRenderer {
         _ = oldRetinas
     }
 
-    /// Cancels all pending renders and releases every cached `IOSurface` back to `MacIOSurfacePool`.
-    func releaseAllSurfaces() {
+    /// Full hibernation release: recycles all cached surfaces AND closes background `CGPDFDocument` + mmap handles.
+    func hibernate() {
         invalidateCacheForScaleOrQuality()
+        lock.lock()
+        mappedPDFData = nil
+        lock.unlock()
+        draftQueue.async { [weak self] in
+            self?.draftCGDoc = nil
+            self?.draftColdDecodes = 0
+        }
+        retinaQueue.async { [weak self] in
+            self?.retinaCGDoc = nil
+            self?.retinaColdDecodes = 0
+        }
     }
 
-    /// Computes area-capped crisp Tier 1 Draft dimensions (<= 1.05 MP, ~4.2 MB, even pixels) preserving exact aspect ratio.
+    func releaseAllSurfaces() {
+        hibernate()
+    }
+
+    /// Computes area-capped crisp Tier 1 Draft dimensions (<= 0.64 MP, even pixels) preserving exact aspect ratio.
     static func draftPixelSize(forPageSize pageSize: CGSize) -> (Int, Int) {
         let w = max(1.0, pageSize.width)
         let h = max(1.0, pageSize.height)
@@ -165,7 +198,7 @@ final class MacProgressivePDFRenderer {
         return (pw, ph)
     }
 
-    /// Computes area-capped Tier 2 crisp Retina pixel dimensions (<= 1.85 MP normal, <= 2.40 MP when zoomed).
+    /// Computes area-capped Tier 2 crisp Retina pixel dimensions (<= 1.55 MP normal, <= 2.20 MP when zoomed).
     static func retinaPixelSize(forViewSize viewSize: CGSize, backingScale: CGFloat, isZoomedIn: Bool = false) -> (Int, Int) {
         let effectiveScale = min(backingScale, isZoomedIn ? 1.85 : 1.55)
         var pw = viewSize.width * effectiveScale
@@ -186,9 +219,16 @@ final class MacProgressivePDFRenderer {
         return (max(32, Int(pw.rounded()) & ~1), max(32, Int(ph.rounded()) & ~1))
     }
 
-    /// Synchronous cache lookup for a specific tier & pixel size.
-    func cachedSurface(slotKey: String, tier: MacRenderTier, pixelW: Int, pixelH: Int, highQuality: Bool) -> MacRenderedPageSurface? {
-        let key = CacheKey(slotKey: slotKey, tier: tier, pixelW: pixelW, pixelH: pixelH, highQuality: highQuality)
+    /// Synchronous cache lookup for a specific tier, pixel size, quality, & paper mode.
+    func cachedSurface(
+        slotKey: String,
+        tier: MacRenderTier,
+        pixelW: Int,
+        pixelH: Int,
+        highQuality: Bool,
+        paperMode: MacPaperMode = .original
+    ) -> MacRenderedPageSurface? {
+        let key = CacheKey(slotKey: slotKey, tier: tier, pixelW: pixelW, pixelH: pixelH, highQuality: highQuality, paperMode: paperMode)
         lock.lock()
         defer { lock.unlock() }
         switch tier {
@@ -219,10 +259,11 @@ final class MacProgressivePDFRenderer {
         pixelW: Int,
         pixelH: Int,
         highQuality: Bool,
+        paperMode: MacPaperMode = .original,
         colorSpace: CGColorSpace,
         completion: @escaping @MainActor (MacRenderedPageSurface?) -> Void
     ) {
-        let key = CacheKey(slotKey: slot.key, tier: tier, pixelW: pixelW, pixelH: pixelH, highQuality: highQuality)
+        let key = CacheKey(slotKey: slot.key, tier: tier, pixelW: pixelW, pixelH: pixelH, highQuality: highQuality, paperMode: paperMode)
 
         lock.lock()
         if let hit = (tier == .draft ? draftCache[key] : retinaCache[key]) {
@@ -270,6 +311,7 @@ final class MacProgressivePDFRenderer {
                     pixelW: pixelW,
                     pixelH: pixelH,
                     highQuality: highQuality,
+                    paperMode: paperMode,
                     colorSpace: colorSpace
                 )
             }
@@ -316,6 +358,7 @@ final class MacProgressivePDFRenderer {
         pixelW: Int,
         pixelH: Int,
         highQuality: Bool,
+        paperMode: MacPaperMode,
         colorSpace: CGColorSpace
     ) -> MacRenderedPageSurface? {
         guard pixelW >= 8, pixelH >= 8 else { return nil }
@@ -348,16 +391,14 @@ final class MacProgressivePDFRenderer {
             return nil
         }
 
-        // Opaque white page background (sets alpha = 0xFF across entire 32BGRA surface).
+        let fullRect = CGRect(x: 0, y: 0, width: pixelW, height: pixelH)
         ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
-        ctx.fill(CGRect(x: 0, y: 0, width: pixelW, height: pixelH))
+        ctx.fill(fullRect)
 
         ctx.setShouldAntialias(true)
         ctx.setAllowsAntialiasing(true)
         ctx.setAllowsFontSmoothing(false)
         ctx.setShouldSmoothFonts(false)
-        // Vector PDF text stays 100% antialiased CoreText regardless of interpolationQuality;
-        // `.none` on draft & `.low` on settled Retina cuts embedded-image CPU filtering drastically!
         if tier == .draft {
             ctx.interpolationQuality = .low
         } else {
@@ -366,21 +407,37 @@ final class MacProgressivePDFRenderer {
 
         let sx = CGFloat(pixelW) / max(1.0, slot.size.width)
         let sy = CGFloat(pixelH) / max(1.0, slot.size.height)
+        let isHoboSpread = isHobonichi && (HobonichiEngine.slotKind(for: slot, isHobo: true) != nil)
 
-        if isHobonichi, HobonichiEngine.slotKind(for: slot, isHobo: true) != nil, let doc = docSnapshot {
+        if isHoboSpread, let doc = docSnapshot {
             ctx.translateBy(x: 0, y: CGFloat(pixelH))
             ctx.scaleBy(x: sx, y: -sy)
             HobonichiEngine.drawSpread(in: ctx, slot: slot, doc: doc, allSlots: allSlots, isHobo: true)
         } else if let pdfN = slot.effectivePDFPageNumber {
+            lock.lock()
+            let curURL = pdfURL
+            let curMapped = mappedPDFData
+            lock.unlock()
+
             let cgDoc: CGPDFDocument?
             if tier == .draft {
-                if draftCGDoc == nil, let url = pdfURL {
-                    draftCGDoc = Self.openCGPDFDocument(url: url, mappedData: mappedPDFData)
+                draftColdDecodes += 1
+                if draftColdDecodes >= cgDocRecycleInterval {
+                    draftCGDoc = nil
+                    draftColdDecodes = 0
+                }
+                if draftCGDoc == nil, let url = curURL {
+                    draftCGDoc = Self.openCGPDFDocument(url: url, mappedData: curMapped)
                 }
                 cgDoc = draftCGDoc
             } else {
-                if retinaCGDoc == nil, let url = pdfURL {
-                    retinaCGDoc = Self.openCGPDFDocument(url: url, mappedData: mappedPDFData)
+                retinaColdDecodes += 1
+                if retinaColdDecodes >= cgDocRecycleInterval {
+                    retinaCGDoc = nil
+                    retinaColdDecodes = 0
+                }
+                if retinaCGDoc == nil, let url = curURL {
+                    retinaCGDoc = Self.openCGPDFDocument(url: url, mappedData: curMapped)
                 }
                 cgDoc = retinaCGDoc
             }
@@ -394,8 +451,47 @@ final class MacProgressivePDFRenderer {
             slot.template.draw(in: ctx, size: slot.size)
         }
 
+        if !isHoboSpread && paperMode == .sepia {
+            ctx.saveGState()
+            ctx.setBlendMode(.multiply)
+            ctx.setFillColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0)
+            ctx.fill(fullRect)
+            ctx.restoreGState()
+        }
+
         ctx.flush()
         IOSurfaceUnlock(surface, [], nil)
+
+        // Optional Dark Paper invert+hue-preserve pass directly into a pooled IOSurface!
+        if !isHoboSpread && paperMode == .dark,
+           let dst = MacIOSurfacePool.shared.acquire(tier: tier, width: pixelW, height: pixelH, colorSpace: colorSpace) {
+            let input = CIImage(ioSurface: surface)
+            var outImg = input
+            if let inv = CIFilter(name: "CIColorInvert") {
+                inv.setValue(outImg, forKey: kCIInputImageKey)
+                if let o = inv.outputImage { outImg = o }
+            }
+            if let hue = CIFilter(name: "CIHueAdjust") {
+                hue.setValue(outImg, forKey: kCIInputImageKey)
+                hue.setValue(Float.pi, forKey: kCIInputAngleKey)
+                if let o = hue.outputImage { outImg = o }
+            }
+            if let tone = CIFilter(name: "CIColorControls") {
+                tone.setValue(outImg, forKey: kCIInputImageKey)
+                tone.setValue(0.06, forKey: kCIInputBrightnessKey)
+                tone.setValue(0.92, forKey: kCIInputContrastKey)
+                if let o = tone.outputImage { outImg = o }
+            }
+            Self.darkPaperCIContext().render(outImg, to: dst, bounds: input.extent, colorSpace: colorSpace)
+            MacIOSurfacePool.shared.recycle(surface, tier: tier, colorSpaceName: csName)
+            return MacRenderedPageSurface(
+                surface: dst,
+                tier: tier,
+                pixelW: pixelW,
+                pixelH: pixelH,
+                colorSpaceName: csName
+            )
+        }
 
         return MacRenderedPageSurface(
             surface: surface,

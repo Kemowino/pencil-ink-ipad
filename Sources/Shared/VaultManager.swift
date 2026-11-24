@@ -448,8 +448,8 @@ final class VaultManager: ObservableObject {
 
                     let vals = try? itemURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
                     if vals?.isDirectory == true {
-                        // Skip `.ink.d` internal folders if any exist locally
-                        if itemURL.lastPathComponent.hasSuffix(".ink.d") {
+                        // Skip `.ink.d` internal folders and iOS Share Sheet's ephemeral `Inbox` folder
+                        if itemURL.lastPathComponent.hasSuffix(".ink.d") || relPath == "Inbox" {
                             enumerator.skipDescendants()
                             continue
                         }
@@ -686,7 +686,21 @@ final class VaultManager: ObservableObject {
         refreshPDFList()
     }
 
-    func importPDFCopy(from sourceURL: URL, intoFolder relativeFolder: String) throws -> (url: URL, relPath: String) {
+    func isURLInsideVault(_ url: URL) -> Bool {
+        guard let root = standardizedRootPath() else { return false }
+        let target = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let prefix = root.hasSuffix("/") ? root : (root + "/")
+        guard target.hasPrefix(prefix) else { return false }
+        // Files copied into iOS `Documents/Inbox` are ephemeral share staging copies, not vault documents.
+        let rel = String(target.dropFirst(prefix.count))
+        return !rel.hasPrefix("Inbox/")
+    }
+
+    func importPDFCopy(
+        from sourceURL: URL,
+        intoFolder relativeFolder: String,
+        customTitle: String? = nil
+    ) throws -> (url: URL, relPath: String) {
         guard let dir = directoryURL(for: relativeFolder) else {
             throw NSError(domain: "VaultManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Select a vault folder first."])
         }
@@ -694,7 +708,10 @@ final class VaultManager: ObservableObject {
         defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
         let data = try Data(contentsOf: sourceURL)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let target = uniqueFileURL(in: dir, baseName: sourceURL.deletingPathExtension().lastPathComponent, ext: "pdf")
+        let desiredStem = (customTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? customTitle!
+            : sourceURL.deletingPathExtension().lastPathComponent
+        let target = uniqueFileURL(in: dir, baseName: desiredStem, ext: "pdf")
         try writeCoordinated(data: data, to: target)
         let rel = relativePath(for: target)
         refreshPDFList()

@@ -123,11 +123,7 @@ struct LibraryView: View {
         }
     }
 
-    private var pageBackground: Color {
-        colorScheme == .dark
-            ? Color(red: 0.105, green: 0.108, blue: 0.120)
-            : Color(red: 0.965, green: 0.968, blue: 0.978)
-    }
+    private var pageBackground: Color { DesignTokens.canvasBackdrop(colorScheme) }
 
     private var gridColumns: [GridItem] {
         let minW: CGFloat = (horizontalSizeClass == .compact) ? 140 : 158

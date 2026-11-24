@@ -361,7 +361,7 @@ private final class InlineTextBoxEditorView: UIView, UITextViewDelegate {
         textView.textColor = PageCanvasView.displayColor(for: box.color, smartDark: smartDarkInk)
         textView.tintColor = UIColor.systemBlue
         if let bgHex = box.bgColor, !bgHex.isEmpty {
-            textView.backgroundColor = UIColor(hex: bgHex).withAlphaComponent(smartDarkInk ? 0.24 : 0.88)
+            textView.backgroundColor = UIColor.cached(hex: bgHex).withAlphaComponent(smartDarkInk ? 0.24 : 0.88)
             textView.layer.cornerRadius = 5
         } else {
             textView.backgroundColor = UIColor.systemBlue.withAlphaComponent(smartDarkInk ? 0.08 : 0.04)
@@ -613,9 +613,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     }
 
     private func resolvedCanvasBackdropColor() -> UIColor {
-        traitCollection.userInterfaceStyle == .dark
-            ? UIColor(red: 0.11, green: 0.114, blue: 0.129, alpha: 1.0)
-            : UIColor(red: 0.902, green: 0.910, blue: 0.929, alpha: 1.0)
+        DesignTokens.uiCanvasBackdrop.resolvedColor(with: traitCollection)
     }
 
     private func applyOpaqueCanvasBackdrop() {
@@ -3270,7 +3268,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         idleCheckWorkItem?.cancel()
         syncManager?.cancelScheduledSync(for: relativePath)
         if !toolState.isWriting {
-            DispatchQueue.main.async { self.toolState.isWriting = true }
+            toolState.isWriting = true
         }
 
         if toolState.tool == .lasso {
@@ -3626,7 +3624,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         defer {
             activePageView = nil
             if toolState.isWriting {
-                DispatchQueue.main.async { self.toolState.isWriting = false }
+                toolState.isWriting = false
             }
             flushPendingRemoteDoc()
             activeSmoother = nil
@@ -3709,7 +3707,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
         }
         activePageView = nil
         if toolState.isWriting {
-            DispatchQueue.main.async { self.toolState.isWriting = false }
+            toolState.isWriting = false
         }
         activeSmoother = nil
         activeStartPoint = nil

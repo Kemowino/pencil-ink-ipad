@@ -303,8 +303,19 @@ final class AppSettings: ObservableObject {
         if let v = s.compactToolbar { compactToolbar = v }
     }
 
+    private var persistWorkItem: DispatchWorkItem?
+
     private func persist() {
         guard !loading else { return }
+        persistWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.writeSnapshotNow()
+        }
+        persistWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
+    private func writeSnapshotNow() {
         let snap = Snapshot(
             appTheme: appTheme,
             pdfReadingMode: pdfReadingMode,

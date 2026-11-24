@@ -9,9 +9,9 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
     var activeWorkspaceProvider: (() -> MacWorkspaceWindowController?)?
     var onWindowClosed: (() -> Void)?
 
-    private let statusLabel = NSTextField(labelWithString: "Ready. Open a PDF tab in Workspace, then click Run v4.2 Self-Test.")
+    private let statusLabel = NSTextField(labelWithString: "Ready. Open a PDF tab in Workspace, then click Run v5.0 Self-Test.")
     private let progressBar = NSProgressIndicator()
-    private let runTestBtn = NSButton(title: "Run v4.2 Self-Test (~24s)", target: nil, action: nil)
+    private let runTestBtn = NSButton(title: "Run v5.0 Self-Test (~24s)", target: nil, action: nil)
     private let liveMonitorBtn = NSButton(title: "Start Live 1 Hz Monitor", target: nil, action: nil)
     private let copyBtn = NSButton(title: "Copy Report", target: nil, action: nil)
     private let saveBtn = NSButton(title: "Save Report…", target: nil, action: nil)
@@ -32,7 +32,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             backing: .buffered,
             defer: false
         )
-        win.title = "Pencil Ink v4.2 — Sub-5 EI Self-Test & Live Monitor"
+        win.title = "Pencil Ink v5.0 — Sub-5 EI Self-Test & Live Monitor"
         win.minSize = NSSize(width: 640, height: 420)
         win.center()
         super.init(window: win)
@@ -103,9 +103,9 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         reportTextView.textContainerInset = NSSize(width: 10, height: 10)
         reportTextView.autoresizingMask = [.width]
         reportTextView.string = """
-        Pencil Ink Native v4.2 (Intel x86_64) — Sub-5 EI Objective Diagnostics
+        Pencil Ink Native v5.0 (Intel x86_64) — Sub-5 EI Objective Diagnostics
         ======================================================================
-        • Click "Run v4.2 Self-Test (~24s)" with a PDF tab open to measure:
+        • Click "Run v5.0 Self-Test (~24s)" with a PDF tab open to measure:
             1. Idle Baseline (4.5s — Gate: < 0.5 EI, 0% AMD)
             2. Smooth Scroll (4.5s — Tier-1 Draft IOSurface + GPU translate — Gate: <= 10.0 EI)
             3. Fast Flick Skim (4.0s — High-velocity Tier-0 skip — Gate: <= 10.0 EI)
@@ -158,7 +158,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         MacIOSurfacePool.shared.resetCounters()
         lastLiveSnapshot = MacDiagnosticsCollector.captureSnapshot()
         let cal = MacEnergyImpactCalibrator.shared.weights.sourceDescription
-        fullReportText = "=== Live 1 Hz Telemetry Monitor (v4.2 IOSurface-VSync | \(cal)) ===\n"
+        fullReportText = "=== Live 1 Hz Telemetry Monitor (v5.0 IOSurface-VSync | \(cal)) ===\n"
         reportTextView.string = fullReportText
         liveMonitorBtn.title = "Stop Live Monitor"
         runTestBtn.isEnabled = false
@@ -211,7 +211,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         }
         stopLiveMonitor()
         guard let ws = activeWorkspaceProvider?(), ws.activeReaderSession != nil else {
-            statusLabel.stringValue = "Open a PDF tab inside the Workspace window first, then click Run v4.2 Self-Test."
+            statusLabel.stringValue = "Open a PDF tab inside the Workspace window first, then click Run v5.0 Self-Test."
             NSSound.beep()
             return
         }
@@ -226,7 +226,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             guard let self else { return }
             await self.executeSelfTest(on: ws)
             self.isRunningTest = false
-            self.runTestBtn.title = "Run v4.2 Self-Test (~24s)"
+            self.runTestBtn.title = "Run v5.0 Self-Test (~24s)"
             self.liveMonitorBtn.isEnabled = true
         }
     }
@@ -240,7 +240,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         ws.setToolMode(.read)
         MacIOSurfacePool.shared.resetCounters()
 
-        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "4.2.0"
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "5.0.0"
         let osVer = ProcessInfo.processInfo.operatingSystemVersionString
         fullReportText = """
         # Pencil Ink Native v\(ver) — Sub-5 EI Efficiency Report
@@ -340,7 +340,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
 
         statusLabel.stringValue = cancelTestRequested
             ? "Self-test cancelled."
-            : "v4.2 Self-test complete! Click \"Copy Report\" to share exact objective telemetry."
+            : "v5.0 Self-test complete! Click \"Copy Report\" to share exact objective telemetry."
         window?.makeKeyAndOrderFront(nil)
     }
 
@@ -451,13 +451,13 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         let text = fullReportText.isEmpty ? reportTextView.string : fullReportText
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        statusLabel.stringValue = "Copied v4.2 diagnostics report to clipboard!"
+        statusLabel.stringValue = "Copied v5.0 diagnostics report to clipboard!"
     }
 
     @objc private func saveReport() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "PencilInk-v4.2-Diagnostics.txt"
+        panel.nameFieldStringValue = "PencilInk-v5.0-Diagnostics.txt"
         guard let win = window else { return }
         panel.beginSheetModal(for: win) { [weak self] resp in
             guard resp == .OK, let url = panel.url, let self else { return }

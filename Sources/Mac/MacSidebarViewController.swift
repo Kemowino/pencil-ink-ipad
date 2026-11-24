@@ -72,6 +72,7 @@ final class MacSidebarViewController: NSViewController,
     override func loadView() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 600))
         root.wantsLayer = true
+        root.layer?.backgroundColor = DesignTokens.nsSidebarBg.cgColor
         self.view = root
         setupUI()
     }

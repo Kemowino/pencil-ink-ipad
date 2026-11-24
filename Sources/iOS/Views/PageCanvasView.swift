@@ -1133,6 +1133,12 @@ private final class LiveInkOverlayView: UIView {
     var mode: Mode = .none
     var smartDarkInk: Bool = false
 
+    private static let eraserFillCG = UIColor(white: 0.45, alpha: 0.14).cgColor
+    private static let eraserStrokeCG = UIColor(white: 0.35, alpha: 0.90).cgColor
+    private static let lassoFillCG = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 0.09).cgColor
+    private static let lassoStrokeCG = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0).cgColor
+    private static let lassoBoxFillCG = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 0.05).cgColor
+
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         switch mode {
@@ -1160,9 +1166,9 @@ private final class LiveInkOverlayView: UIView {
             ctx.saveGState()
             let r = max(2, radius)
             let ringRect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
-            ctx.setFillColor(UIColor(white: 0.45, alpha: 0.14).cgColor)
+            ctx.setFillColor(Self.eraserFillCG)
             ctx.fillEllipse(in: ringRect)
-            ctx.setStrokeColor(UIColor(white: 0.35, alpha: 0.9).cgColor)
+            ctx.setStrokeColor(Self.eraserStrokeCG)
             ctx.setLineWidth(1.4 / max(0.5, zoomScale))
             ctx.strokeEllipse(in: ringRect)
             ctx.restoreGState()
@@ -1211,11 +1217,11 @@ private final class LiveInkOverlayView: UIView {
             path.move(to: poly[0])
             for i in 1..<poly.count { path.addLine(to: poly[i]) }
             ctx.addPath(path)
-            ctx.setFillColor(UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 0.09).cgColor)
+            ctx.setFillColor(Self.lassoFillCG)
             ctx.fillPath()
 
             ctx.addPath(path)
-            ctx.setStrokeColor(UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0).cgColor)
+            ctx.setStrokeColor(Self.lassoStrokeCG)
             ctx.setLineWidth(1.8 / sc)
             ctx.setLineDash(phase: 0, lengths: [6.0 / sc, 4.0 / sc])
             ctx.strokePath()
@@ -1232,7 +1238,6 @@ private final class LiveInkOverlayView: UIView {
             ctx.restoreGState()
 
             let h = sel.handles(zoomScale: sc)
-            let accent = UIColor(red: 0.04, green: 0.52, blue: 1.0, alpha: 1.0)
             ctx.saveGState()
             if sel.rotation != 0 {
                 ctx.translateBy(x: h.cx, y: h.cy)
@@ -1240,10 +1245,10 @@ private final class LiveInkOverlayView: UIView {
                 ctx.translateBy(x: -h.cx, y: -h.cy)
             }
             let boxRect = CGRect(x: h.bx0, y: h.by0, width: h.bx1 - h.bx0, height: h.by1 - h.by0)
-            ctx.setFillColor(accent.withAlphaComponent(0.05).cgColor)
+            ctx.setFillColor(Self.lassoBoxFillCG)
             ctx.fill(boxRect)
 
-            ctx.setStrokeColor(accent.cgColor)
+            ctx.setStrokeColor(Self.lassoStrokeCG)
             ctx.setLineWidth(1.6 / sc)
             ctx.setLineDash(phase: 0, lengths: [5.0 / sc, 4.0 / sc])
             ctx.stroke(boxRect)
@@ -1255,14 +1260,14 @@ private final class LiveInkOverlayView: UIView {
 
             let rHandle = 5.4 / sc
             let rotRect = CGRect(x: h.cx - rHandle, y: h.rotY - rHandle, width: rHandle * 2, height: rHandle * 2)
-            ctx.setFillColor(accent.cgColor)
+            ctx.setFillColor(Self.lassoStrokeCG)
             ctx.fillEllipse(in: rotRect)
             ctx.setStrokeColor(UIColor.white.cgColor)
             ctx.setLineWidth(1.5 / sc)
             ctx.strokeEllipse(in: rotRect)
 
             ctx.setFillColor(UIColor.white.cgColor)
-            ctx.setStrokeColor(accent.cgColor)
+            ctx.setStrokeColor(Self.lassoStrokeCG)
             ctx.setLineWidth(1.8 / sc)
             for c in h.corners {
                 let cr = CGRect(x: c.x - rHandle, y: c.y - rHandle, width: rHandle * 2, height: rHandle * 2)

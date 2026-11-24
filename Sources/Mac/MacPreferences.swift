@@ -27,9 +27,59 @@ enum MacToolMode: Int, CaseIterable {
     }
 }
 
+enum MacPaperMode: String, CaseIterable {
+    case original = "original"
+    case sepia = "sepia"
+    case dark = "dark"
+
+    var title: String {
+        switch self {
+        case .original: return "Original Paper"
+        case .sepia: return "Warm Sepia"
+        case .dark: return "Dark Paper"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .original: return "sun.max"
+        case .sepia: return "book.fill"
+        case .dark: return "moon.fill"
+        }
+    }
+
+    var paperColor: NSColor {
+        switch self {
+        case .original: return .white
+        case .sepia: return NSColor(red: 0.965, green: 0.935, blue: 0.870, alpha: 1.0)
+        case .dark: return NSColor(red: 0.110, green: 0.115, blue: 0.130, alpha: 1.0)
+        }
+    }
+}
+
+enum MacLibraryDisplayMode: String {
+    case grid = "grid"
+    case list = "list"
+}
+
+enum MacLibrarySortMode: String, CaseIterable {
+    case date = "date"
+    case name = "name"
+    case annotated = "annotated"
+
+    var title: String {
+        switch self {
+        case .date: return "Date Modified"
+        case .name: return "Name"
+        case .annotated: return "Annotated First"
+        }
+    }
+}
+
 extension Notification.Name {
     static let macToolPrefsDidChange = Notification.Name("pencilink.mac.toolPrefsDidChange")
     static let macRenderQualityDidChange = Notification.Name("pencilink.mac.renderQualityDidChange")
+    static let macPaperModeDidChange = Notification.Name("pencilink.mac.paperModeDidChange")
 }
 
 /// Ultra-lean UserDefaults preferences for Intel macOS (zero SwiftUI / Combine overhead on scroll!).
@@ -53,6 +103,23 @@ final class MacPreferences {
                 NotificationCenter.default.post(name: .macRenderQualityDidChange, object: nil)
             }
         }
+    }
+
+    var paperMode: MacPaperMode = .original {
+        didSet {
+            if paperMode != oldValue {
+                schedulePersist()
+                NotificationCenter.default.post(name: .macPaperModeDidChange, object: nil)
+            }
+        }
+    }
+
+    var libraryDisplayMode: MacLibraryDisplayMode = .grid {
+        didSet { if libraryDisplayMode != oldValue { schedulePersist() } }
+    }
+
+    var librarySortMode: MacLibrarySortMode = .date {
+        didSet { if librarySortMode != oldValue { schedulePersist() } }
     }
 
     // Highlighter defaults (exact same palette harmony as iPadOS)
@@ -110,6 +177,9 @@ final class MacPreferences {
     private struct Snapshot: Codable {
         var syncMode: String?
         var highQualityImages: Bool?
+        var paperMode: String?
+        var libraryDisplayMode: String?
+        var librarySortMode: String?
         var hlColors: [String]?
         var hlColorIndex: Int?
         var hlSizes: [Double]?
@@ -139,6 +209,9 @@ final class MacPreferences {
         defer { loading = false }
         if let v = s.syncMode, let m = MacSyncMode(rawValue: v) { syncMode = m }
         if let hq = s.highQualityImages { highQualityImages = hq }
+        if let pm = s.paperMode, let parsed = MacPaperMode(rawValue: pm) { paperMode = parsed }
+        if let dm = s.libraryDisplayMode, let parsed = MacLibraryDisplayMode(rawValue: dm) { libraryDisplayMode = parsed }
+        if let sm = s.librarySortMode, let parsed = MacLibrarySortMode(rawValue: sm) { librarySortMode = parsed }
         if let c = s.hlColors, !c.isEmpty { hlColors = c }
         if let i = s.hlColorIndex { hlColorIndex = max(0, min(hlColors.count - 1, i)) }
         if let sz = s.hlSizes, sz.count == 3 { hlSizes = sz }
@@ -170,6 +243,9 @@ final class MacPreferences {
         let snap = Snapshot(
             syncMode: syncMode.rawValue,
             highQualityImages: highQualityImages,
+            paperMode: paperMode.rawValue,
+            libraryDisplayMode: libraryDisplayMode.rawValue,
+            librarySortMode: librarySortMode.rawValue,
             hlColors: hlColors,
             hlColorIndex: hlColorIndex,
             hlSizes: hlSizes,

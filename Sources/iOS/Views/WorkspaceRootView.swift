@@ -4,6 +4,7 @@ struct WorkspaceRootView: View {
     let syncManagerRef: DriveSyncManager
     @EnvironmentObject var vault: VaultManager
     @EnvironmentObject var tabManager: TabManager
+    @EnvironmentObject var incomingFiles: IncomingFileManager
     @EnvironmentObject var settings: AppSettings
 
     private var shouldShowTabBar: Bool {
@@ -57,6 +58,22 @@ struct WorkspaceRootView: View {
         .onAppear {
             tabManager.restoreSessionIfNeeded(from: vault)
         }
+        .sheet(item: $incomingFiles.pendingFile, onDismiss: {
+            if incomingFiles.pendingFile != nil {
+                incomingFiles.finishPending(deleteStagedFile: true)
+            }
+        }) { incoming in
+            IncomingImportSheet(incoming: incoming)
+                .preferredColorScheme(settings.appTheme.preferredColorScheme)
+        }
+        .alert("Could Not Open File", isPresented: Binding(
+            get: { incomingFiles.stagingError != nil },
+            set: { if !$0 { incomingFiles.stagingError = nil } }
+        )) {
+            Button("OK", role: .cancel) { incomingFiles.stagingError = nil }
+        } message: {
+            Text(incomingFiles.stagingError ?? "")
+        }
     }
 }
 
@@ -109,21 +126,9 @@ private struct GoodnotesTabBar: View {
     private let plusFrameH: CGFloat = 28
     #endif
 
-    private var trackBg: Color {
-        colorScheme == .dark
-            ? Color(red: 0.082, green: 0.086, blue: 0.098)
-            : Color(red: 0.895, green: 0.905, blue: 0.925)
-    }
-
-    private var activeTabFill: Color {
-        colorScheme == .dark
-            ? Color(red: 0.135, green: 0.140, blue: 0.156)
-            : Color.white
-    }
-
-    private var bottomHairline: Color {
-        colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.10)
-    }
+    private var trackBg: Color { DesignTokens.tabTrack(colorScheme) }
+    private var activeTabFill: Color { DesignTokens.chromePrimary(colorScheme) }
+    private var bottomHairline: Color { DesignTokens.hairline(colorScheme) }
 
     private var inactiveDivider: Color {
         colorScheme == .dark ? Color.white.opacity(0.14) : Color.black.opacity(0.13)
