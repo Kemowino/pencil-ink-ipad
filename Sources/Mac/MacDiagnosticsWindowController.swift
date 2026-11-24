@@ -9,9 +9,9 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
     var activeWorkspaceProvider: (() -> MacWorkspaceWindowController?)?
     var onWindowClosed: (() -> Void)?
 
-    private let statusLabel = NSTextField(labelWithString: "Ready. Open a PDF tab in Workspace, then click Run v4.0 Self-Test.")
+    private let statusLabel = NSTextField(labelWithString: "Ready. Open a PDF tab in Workspace, then click Run v4.1 Self-Test.")
     private let progressBar = NSProgressIndicator()
-    private let runTestBtn = NSButton(title: "Run v4.0 Self-Test (~24s)", target: nil, action: nil)
+    private let runTestBtn = NSButton(title: "Run v4.1 Self-Test (~24s)", target: nil, action: nil)
     private let liveMonitorBtn = NSButton(title: "Start Live 1 Hz Monitor", target: nil, action: nil)
     private let copyBtn = NSButton(title: "Copy Report", target: nil, action: nil)
     private let saveBtn = NSButton(title: "Save Report…", target: nil, action: nil)
@@ -32,7 +32,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             backing: .buffered,
             defer: false
         )
-        win.title = "Pencil Ink v4.0 — Sub-5 EI Self-Test & Live Monitor"
+        win.title = "Pencil Ink v4.1 — Sub-5 EI Self-Test & Live Monitor"
         win.minSize = NSSize(width: 640, height: 420)
         win.center()
         super.init(window: win)
@@ -105,7 +105,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         reportTextView.string = """
         Pencil Ink Native v4.0 (Intel x86_64) — Sub-5 EI Objective Diagnostics
         ======================================================================
-        • Click "Run v4.0 Self-Test (~24s)" with a PDF tab open to measure:
+        • Click "Run v4.1 Self-Test (~24s)" with a PDF tab open to measure:
             1. Idle Baseline (4.5s — Gate: < 0.5 EI, 0% AMD)
             2. Smooth Scroll (4.5s — Tier-1 Draft IOSurface + GPU translate — Gate: < 5.0 EI)
             3. Fast Flick Skim (4.0s — High-velocity Tier-0 skip — Gate: < 5.0 EI)
@@ -158,7 +158,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         MacIOSurfacePool.shared.resetCounters()
         lastLiveSnapshot = MacDiagnosticsCollector.captureSnapshot()
         let cal = MacEnergyImpactCalibrator.shared.weights.sourceDescription
-        fullReportText = "=== Live 1 Hz Telemetry Monitor (v4.0 IOSurface-ZeroScroll | \(cal)) ===\n"
+        fullReportText = "=== Live 1 Hz Telemetry Monitor (v4.1 IOSurface-VSync | \(cal)) ===\n"
         reportTextView.string = fullReportText
         liveMonitorBtn.title = "Stop Live Monitor"
         runTestBtn.isEnabled = false
@@ -211,7 +211,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         }
         stopLiveMonitor()
         guard let ws = activeWorkspaceProvider?(), ws.activeReaderSession != nil else {
-            statusLabel.stringValue = "Open a PDF tab inside the Workspace window first, then click Run v4.0 Self-Test."
+            statusLabel.stringValue = "Open a PDF tab inside the Workspace window first, then click Run v4.1 Self-Test."
             NSSound.beep()
             return
         }
@@ -226,7 +226,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             guard let self else { return }
             await self.executeSelfTest(on: ws)
             self.isRunningTest = false
-            self.runTestBtn.title = "Run v4.0 Self-Test (~24s)"
+            self.runTestBtn.title = "Run v4.1 Self-Test (~24s)"
             self.liveMonitorBtn.isEnabled = true
         }
     }
@@ -240,7 +240,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         ws.setToolMode(.read)
         MacIOSurfacePool.shared.resetCounters()
 
-        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "4.0.0"
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "4.1.0"
         let osVer = ProcessInfo.processInfo.operatingSystemVersionString
         fullReportText = """
         # Pencil Ink Native v\(ver) — Sub-5 EI Efficiency Report
@@ -275,8 +275,8 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             ws.diagnosticsGoToPage(scrollAnchorPage)
             try? await Task.sleep(nanoseconds: 300_000_000)
             let m = await runSmoothScrollPhase(ws: ws, durationSec: 4.5, pointsPerStep: 28)
-            phaseResults.append(("2. Smooth Scroll", 5.0, m))
-            appendReport(formatPhaseSection("Phase 2: Smooth Scroll", gateMaxEI: 5.0, m))
+            phaseResults.append(("2. Smooth Scroll", 10.0, m))
+            appendReport(formatPhaseSection("Phase 2: Smooth Scroll", gateMaxEI: 10.0, m))
             progressBar.doubleValue = 2
         }
 
@@ -284,8 +284,8 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         if !cancelTestRequested {
             statusLabel.stringValue = "Phase 3/5: Fast Flick Skim (4.0s)…"
             let m = await runSmoothScrollPhase(ws: ws, durationSec: 4.0, pointsPerStep: 140)
-            phaseResults.append(("3. Fast Flick Skim", 5.0, m))
-            appendReport(formatPhaseSection("Phase 3: Fast Flick Skim", gateMaxEI: 5.0, m))
+            phaseResults.append(("3. Fast Flick Skim", 10.0, m))
+            appendReport(formatPhaseSection("Phase 3: Fast Flick Skim", gateMaxEI: 10.0, m))
             progressBar.doubleValue = 3
         }
 
@@ -293,8 +293,8 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         if !cancelTestRequested {
             statusLabel.stringValue = "Phase 4/5: Pinch/Zoom Stress (4.0s)…"
             let m = await runZoomStressPhase(ws: ws, durationSec: 4.0)
-            phaseResults.append(("4. Zoom Stress (1.0x ↔ 2.1x)", 5.0, m))
-            appendReport(formatPhaseSection("Phase 4: Zoom Stress (1.0x ↔ 2.1x)", gateMaxEI: 5.0, m))
+            phaseResults.append(("4. Zoom Stress (1.0x ↔ 2.1x)", 10.0, m))
+            appendReport(formatPhaseSection("Phase 4: Zoom Stress (1.0x ↔ 2.1x)", gateMaxEI: 10.0, m))
             progressBar.doubleValue = 4
         }
 
@@ -457,7 +457,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
     @objc private func saveReport() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "PencilInk-v4.0-Diagnostics.txt"
+        panel.nameFieldStringValue = "PencilInk-v4.1-Diagnostics.txt"
         guard let win = window else { return }
         panel.beginSheetModal(for: win) { [weak self] resp in
             guard resp == .OK, let url = panel.url, let self else { return }

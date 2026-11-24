@@ -1352,7 +1352,7 @@ final class MacWorkspaceWindowController: NSWindowController,
         let textTotal = session.inkDoc.texts.values.reduce(0) { $0 + $1.count }
         let fileName = session.pdfURL?.lastPathComponent ?? session.title
         let cal = MacEnergyImpactCalibrator.shared.weights.sourceDescription
-        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-ZeroScroll-v4, Cal=\(cal))"
+        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-VSync-v4.1, Cal=\(cal))"
     }
 
     func diagnosticsPageCount() -> Int { activeReaderSession?.virtualResult?.slots.count ?? 0 }

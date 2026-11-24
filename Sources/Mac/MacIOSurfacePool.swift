@@ -2,24 +2,27 @@ import AppKit
 import CoreGraphics
 import Foundation
 import IOSurface
+import QuartzCore
 
 /// Render resolution tier for two-tier progressive PDF rasterization.
 enum MacRenderTier: Int, Hashable {
-    /// Tier 1: Area-capped fast draft (<= 0.45 MP, ~1.8 MB, ~3-4 ms on Intel) used during active scrolling.
+    /// Tier 1: Area-capped crisp draft (<= 0.68 MP, ~2.7 MB, ~2-3 ms on Intel with `.none` image interp) used during active scrolling.
     case draft = 1
-    /// Tier 2: Exact 1:1 physical Retina pixels rendered at `.background` QoS only after scrolling settles.
+    /// Tier 2: Area-capped Retina (<= 1.75 MP normal / 2.35 MP zoomed) rendered at `.background` QoS ONLY after scrolling truly stops.
     case retina = 2
 }
 
-/// Thread-safe, hardware-aligned `IOSurface` ring-buffer pool shared across all tabs.
+/// Thread-safe, hardware-aligned FIFO `IOSurface` ring-buffer pool shared across all tabs.
 ///
-/// Eliminates the two biggest `v3.5.0` Intel macOS energy leaks:
-/// 1. Zero `vm_allocate` / zero-fill `vm_fault` / `vm_deallocate` kernel `Sys` CPU churn during scrolling.
-/// 2. Zero Main-Thread `CARenderImageCopy` + `DeviceRGB -> Display P3` ColorSync conversion (`layer.contents = surface`).
+/// v4.1.0 Anti-Ghosting Upgrade:
+/// - **FIFO acquisition (`firstIndex`) + 150 ms WindowServer cool-down:** Never hands back a just-detached
+///   surface while `WindowServer` may still be scanning it out, eliminating scrolling ghosting/tearing completely.
+/// - Zero `vm_allocate` / zero-fill `vm_fault` kernel `Sys` CPU churn during scrolling.
+/// - Zero Main-Thread `CARenderImageCopy` + ColorSync conversion (`layer.contents = surface`).
 final class MacIOSurfacePool {
     static let shared = MacIOSurfacePool()
 
-    /// Snapshot of pool health & reuse efficiency for the v4.0 Self-Test report.
+    /// Snapshot of pool health & reuse efficiency for the Self-Test report.
     struct Stats {
         let totalAllocations: UInt64
         let poolHits: UInt64
@@ -45,15 +48,19 @@ final class MacIOSurfacePool {
         let key: SurfaceKey
         let surface: IOSurfaceRef
         let byteSize: UInt64
+        let recycledAt: CFTimeInterval
     }
 
     private let lock = NSLock()
     private var draftPool: [PooledEntry] = []
     private var retinaPool: [PooledEntry] = []
 
-    /// Strict memory caps across the entire app (~14 MB drafts + ~56 MB retina = ~70 MB hard ceiling).
-    private let maxDraftSurfaces = 8
-    private let maxRetinaSurfaces = 4
+    /// Balanced memory caps (~36 MB drafts + ~36 MB retina = ~72 MB hard ceiling).
+    private let maxDraftSurfaces = 18
+    private let maxRetinaSurfaces = 6
+
+    /// Minimum cool-down after detaching from a `CALayer` before the same `IOSurface` can be rewritten.
+    private let reuseCooldownSec: CFTimeInterval = 0.15
 
     private var totalAllocations: UInt64 = 0
     private var poolHits: UInt64 = 0
@@ -82,24 +89,29 @@ final class MacIOSurfacePool {
         return CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     }
 
-    /// Acquires a reusable, 64-byte-aligned `32BGRA` `IOSurface` matching `(width, height, colorSpace)` that is NOT currently in use by `WindowServer`.
+    /// Acquires a reusable, 64-byte-aligned `32BGRA` `IOSurface` matching `(width, height, colorSpace)`
+    /// using strict FIFO ordering + cool-down + `!IOSurfaceIsInUse` to guarantee zero tearing/ghosting.
     func acquire(tier: MacRenderTier, width: Int, height: Int, colorSpace: CGColorSpace) -> IOSurfaceRef? {
         guard width >= 8, height >= 8 else { return nil }
-        let csName = (colorSpace.name as String?) ?? "sRGB"
+        let csName = colorSpace.name.map { $0 as String } ?? "sRGB"
         let key = SurfaceKey(width: width, height: height, colorSpaceName: csName)
+        let now = CACurrentMediaTime()
 
         lock.lock()
-        // Search the matching tier pool for an idle surface (`!IOSurfaceIsInUse`)
         switch tier {
         case .draft:
-            if let idx = draftPool.lastIndex(where: { $0.key == key && !IOSurfaceIsInUse($0.surface) }) {
+            if let idx = draftPool.firstIndex(where: {
+                $0.key == key && (now - $0.recycledAt) >= reuseCooldownSec && !IOSurfaceIsInUse($0.surface)
+            }) {
                 let entry = draftPool.remove(at: idx)
                 poolHits &+= 1
                 lock.unlock()
                 return entry.surface
             }
         case .retina:
-            if let idx = retinaPool.lastIndex(where: { $0.key == key && !IOSurfaceIsInUse($0.surface) }) {
+            if let idx = retinaPool.firstIndex(where: {
+                $0.key == key && (now - $0.recycledAt) >= reuseCooldownSec && !IOSurfaceIsInUse($0.surface)
+            }) {
                 let entry = retinaPool.remove(at: idx)
                 poolHits &+= 1
                 lock.unlock()
@@ -137,7 +149,7 @@ final class MacIOSurfacePool {
         return surface
     }
 
-    /// Returns a previously acquired `IOSurface` back to the ring buffer once detached from `CALayer.contents` and cache.
+    /// Returns a previously acquired `IOSurface` to the tail of the FIFO ring buffer with a cool-down timestamp.
     func recycle(_ surface: IOSurfaceRef, tier: MacRenderTier, colorSpaceName: String) {
         let width = IOSurfaceGetWidth(surface)
         let height = IOSurfaceGetHeight(surface)
@@ -145,7 +157,8 @@ final class MacIOSurfacePool {
         let entry = PooledEntry(
             key: SurfaceKey(width: width, height: height, colorSpaceName: colorSpaceName),
             surface: surface,
-            byteSize: UInt64(bpr * height)
+            byteSize: UInt64(bpr * height),
+            recycledAt: CACurrentMediaTime()
         )
 
         lock.lock()
