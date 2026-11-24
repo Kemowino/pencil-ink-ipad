@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-3.1.0}"
+          TAG="v${VER:-3.2.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Intel macOS Energy Fix, Native macOS UI Overhaul & Built-In Objective Performance/Battery Self-Test: True Zero-Overlay Read Mode (nil PDFPageOverlayViewProvider on unannotated pages), Disabled PDFKit Data Detectors & Background Vision Scanning, 160ms Throttled Zoom Vector Redraws, Single-Pass Dark Paper CIColorMatrix, Native 2-Pane SplitView Library with Cover Thumbnails & Unified Search Toolbar, Polished Reader Toolbar & Proportional Swatch Bar, plus Built-In 5-Phase Performance & Battery Self-Test + Live 1 Hz Monitor (Cmd+Option+B)." \
+              --notes "Pencil Ink Native $TAG — Telemetry-Driven Intel macOS Battery & GPU Breakthrough: Eliminates CoreImage/CIFilter completely with Zero-CIFilter tile-cached pure CoreGraphics Dark & Sepia Paper via MacThemedPDFDocument/MacThemedPDFPage (stops 30W / 54% AMD Radeon wakeups & 98% Dark Paper scroll CPU), GPU-First 60Hz Live Pinch-to-Zoom (eliminates 216% CPU zoom tile thrashing), removes unsafe ObjC perform() selector call, adds Two-Page Spread (Cmd+Shift+2), full-height macOS Library sidebar, wider 2,500+ page indicator, and readable Main/GCD thread labels in Self-Test." \
               --latest
           fi

@@ -125,6 +125,7 @@ final class MacPDFWindowController: NSWindowController,
         super.init(window: win)
         win.delegate = self
 
+        MacPaperThemeRenderer.setMode(MacPreferences.shared.paperMode)
         setupToolbar()
         setupSplitView()
         setupObservers()
@@ -1091,6 +1092,18 @@ final class MacPDFWindowController: NSWindowController,
         pdfView.scaleFactor = max(0.35, min(4.0, factor))
     }
 
+    func diagnosticsPreviewZoom(_ factor: CGFloat) {
+        pdfView.previewLiveZoom(to: factor)
+    }
+
+    func diagnosticsCommitZoom() {
+        pdfView.commitLiveZoom()
+    }
+
+    @objc func toggleTwoUpAction() {
+        pdfView.displayMode = (pdfView.displayMode == .twoUpContinuous) ? .singlePageContinuous : .twoUpContinuous
+    }
+
     func diagnosticsScrollBy(deltaY: CGFloat) -> Bool {
         guard let scroll = pdfView.documentView?.enclosingScrollView,
               let docView = scroll.documentView else { return false }
@@ -1502,6 +1515,9 @@ final class MacPDFWindowController: NSWindowController,
             modeSegment.setImage(NSImage(systemSymbolName: "book", accessibilityDescription: "Read"), forSegment: 0)
             modeSegment.setImage(NSImage(systemSymbolName: "highlighter", accessibilityDescription: "Highlight"), forSegment: 1)
             modeSegment.setImage(NSImage(systemSymbolName: "textbox", accessibilityDescription: "Text"), forSegment: 2)
+            modeSegment.setWidth(76, forSegment: 0)
+            modeSegment.setWidth(94, forSegment: 1)
+            modeSegment.setWidth(72, forSegment: 2)
             modeSegment.selectedSegment = pdfView.toolMode.rawValue
             modeSegment.target = self
             modeSegment.action = #selector(modeSegmentChanged)
@@ -1544,7 +1560,7 @@ final class MacPDFWindowController: NSWindowController,
             pageField.alignment = .center
             pageField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             pageField.bezelStyle = .roundedBezel
-            pageField.frame = NSRect(x: 0, y: 0, width: 84, height: 24)
+            pageField.frame = NSRect(x: 0, y: 0, width: 106, height: 24)
             pageField.target = self
             pageField.action = #selector(pageFieldSubmitted)
             item.view = pageField

@@ -254,9 +254,10 @@ final class MacLibraryWindowController: NSWindowController,
         sidebarVC.view = sidebarContainer
 
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
-        sidebarItem.minimumThickness = 185
+        sidebarItem.minimumThickness = 195
         sidebarItem.maximumThickness = 280
         sidebarItem.canCollapse = false
+        sidebarItem.allowsFullHeightLayout = true
 
         // Right Pane: Rich Document List + Status Footer
         let contentVC = NSViewController()

@@ -386,23 +386,37 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         let start = MacDiagnosticsCollector.captureSnapshot()
         var frameMs: [Double] = []
         let baseScale = max(0.5, reader.diagnosticsScaleFactor())
-        let t0 = CACurrentMediaTime()
-        var lastTick = t0
-        var stepIdx = 0
+        let halfDur = max(1.0, durationSec * 0.45)
 
-        while !cancelTestRequested && (CACurrentMediaTime() - t0) < durationSec {
-            let phase = sin(Double(stepIdx) * 0.14) // oscillates smoothly between 1.0x and 2.1x
-            let factor = baseScale * CGFloat(1.55 + 0.55 * phase)
-            reader.diagnosticsSetScaleFactor(factor)
-            stepIdx += 1
-            try? await Task.sleep(nanoseconds: 25_000_000) // 40 Hz pinch simulation
+        // Gesture 1: Smooth 60Hz pinch-in 1.0x -> 2.1x, then commit crisp tiles
+        var t0 = CACurrentMediaTime()
+        var lastTick = t0
+        while !cancelTestRequested && (CACurrentMediaTime() - t0) < halfDur {
+            let frac = min(1.0, (CACurrentMediaTime() - t0) / halfDur)
+            reader.diagnosticsPreviewZoom(baseScale * CGFloat(1.0 + 1.1 * frac))
+            try? await Task.sleep(nanoseconds: 16_000_000)
             let now = CACurrentMediaTime()
             frameMs.append((now - lastTick) * 1000.0)
             lastTick = now
         }
-        reader.zoomToFitAction()
-        // Wait 250ms to capture settled vector redraw
+        reader.diagnosticsCommitZoom()
         try? await Task.sleep(nanoseconds: 250_000_000)
+
+        // Gesture 2: Smooth 60Hz pinch-out 2.1x -> 1.0x, then commit crisp tiles
+        t0 = CACurrentMediaTime()
+        lastTick = t0
+        while !cancelTestRequested && (CACurrentMediaTime() - t0) < halfDur {
+            let frac = min(1.0, (CACurrentMediaTime() - t0) / halfDur)
+            reader.diagnosticsPreviewZoom(baseScale * CGFloat(2.1 - 1.1 * frac))
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            let now = CACurrentMediaTime()
+            frameMs.append((now - lastTick) * 1000.0)
+            lastTick = now
+        }
+        reader.diagnosticsCommitZoom()
+        reader.zoomToFitAction()
+        try? await Task.sleep(nanoseconds: 250_000_000)
+
         let end = MacDiagnosticsCollector.captureSnapshot()
         return MacDiagnosticsCollector.computeInterval(from: start, to: end, frameDurationsMs: frameMs)
     }

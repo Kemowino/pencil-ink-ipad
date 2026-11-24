@@ -298,8 +298,15 @@ enum MacDiagnosticsCollector {
         )
     }
 
+    private static let mainThreadID: UInt64 = {
+        var tid: UInt64 = 0
+        pthread_threadid_np(nil, &tid)
+        return tid
+    }()
+
     private static func sampleThreads() -> [UInt64: MacThreadSample] {
         var result: [UInt64: MacThreadSample] = [:]
+        let mainTID = mainThreadID
         var threadList: thread_act_array_t?
         var threadCount: mach_msg_type_number_t = 0
         let kr = task_threads(mach_task_self_, &threadList, &threadCount)
@@ -332,9 +339,14 @@ enum MacDiagnosticsCollector {
             }
             let uniqueID = (kr2 == KERN_SUCCESS) ? idInfo.thread_id : UInt64(i)
 
-            let name = withUnsafeBytes(of: ext.pth_name) { raw -> String in
+            var name = withUnsafeBytes(of: ext.pth_name) { raw -> String in
                 let bytes = raw.prefix { $0 != 0 }
                 return String(decoding: bytes, as: UTF8.self)
+            }
+            if uniqueID == mainTID {
+                name = "Main Thread"
+            } else if name.isEmpty {
+                name = "GCD/PDFKit Worker #\(uniqueID % 1000)"
             }
             let cpuSec = Double(ext.pth_user_time + ext.pth_system_time) / 1_000_000_000.0
             result[uniqueID] = MacThreadSample(threadID: uniqueID, name: name, cpuSeconds: cpuSec)

@@ -224,7 +224,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
             return reader?.hasTextSelection ?? false
         case #selector(menuExportAnnotatedPDF), #selector(menuToggleSidebar), #selector(menuFind),
              #selector(menuModeRead), #selector(menuModeHighlight), #selector(menuModeTextBox),
-             #selector(menuToggleBookmark), #selector(menuZoomIn), #selector(menuZoomOut), #selector(menuZoomFit):
+             #selector(menuToggleBookmark), #selector(menuZoomIn), #selector(menuZoomOut), #selector(menuZoomFit), #selector(menuToggleTwoUp):
             return reader != nil
         default:
             return true
@@ -241,6 +241,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     @objc private func menuZoomIn() { activeReaderController()?.zoomInAction() }
     @objc private func menuZoomOut() { activeReaderController()?.zoomOutAction() }
     @objc private func menuZoomFit() { activeReaderController()?.zoomToFitAction() }
+    @objc private func menuToggleTwoUp() { activeReaderController()?.toggleTwoUpAction() }
     @objc private func menuPaperOriginal() { MacPreferences.shared.paperMode = .original }
     @objc private func menuPaperSepia() { MacPreferences.shared.paperMode = .sepia }
     @objc private func menuPaperDark() { MacPreferences.shared.paperMode = .dark }
@@ -331,6 +332,9 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         viewMenu.addItem(withTitle: "Zoom In", action: #selector(menuZoomIn), keyEquivalent: "=")
         viewMenu.addItem(withTitle: "Zoom Out", action: #selector(menuZoomOut), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Fit to Window", action: #selector(menuZoomFit), keyEquivalent: "0")
+        let twoUpItem = NSMenuItem(title: "Toggle Two-Page Spread", action: #selector(menuToggleTwoUp), keyEquivalent: "2")
+        twoUpItem.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(twoUpItem)
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Original Paper", action: #selector(menuPaperOriginal), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Warm Sepia Paper", action: #selector(menuPaperSepia), keyEquivalent: "")
