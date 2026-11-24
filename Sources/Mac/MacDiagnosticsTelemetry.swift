@@ -47,7 +47,9 @@ struct MacBatterySample {
     let percent: Int
     let voltageMV: Int
     let amperageMA: Int
+    /// Actual Mac system load in Watts (reads `PowerTelemetryData.SystemLoad` on AC/Battery; falls back to battery discharge W).
     let watts: Double
+    let isSystemLoadMetric: Bool
     let isCharging: Bool
     let externalConnected: Bool
 }
@@ -63,6 +65,7 @@ struct MacProcessSnapshot {
     let sysCPUSec: Double
     let billedSysSec: Double
     let processGPUSec: Double
+    let billedEnergyRaw: UInt64
     let qosInteractiveSec: Double
     let qosInitiatedSec: Double
     let qosDefaultSec: Double
@@ -91,6 +94,7 @@ struct MacIntervalMetrics {
     let cpuPercentSys: Double
     let billedSysPercent: Double
     let processGPUPercent: Double
+    let billedEnergyPerSec: Double
     let estimatedEnergyImpact: Double
     let pkgIdleWakeupsPerSec: Double
     let interruptWakeupsPerSec: Double
@@ -143,6 +147,7 @@ enum MacDiagnosticsCollector {
         let userSec = rc == 0 ? ticksToSeconds(rusage.ri_user_time) : 0
         let sysSec = rc == 0 ? ticksToSeconds(rusage.ri_system_time) : 0
         let billedSec = rc == 0 ? ticksToSeconds(rusage.ri_billed_system_time) : 0
+        let billedEnergy = rc == 0 ? rusage.ri_billed_energy : 0
         let qosUI = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_user_interactive) : 0
         let qosInit = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_user_initiated) : 0
         let qosDef = rc == 0 ? ticksToSeconds(rusage.ri_cpu_time_qos_default) : 0
@@ -176,6 +181,7 @@ enum MacDiagnosticsCollector {
             sysCPUSec: sysSec,
             billedSysSec: billedSec,
             processGPUSec: procGPUSec,
+            billedEnergyRaw: billedEnergy,
             qosInteractiveSec: qosUI,
             qosInitiatedSec: qosInit,
             qosDefaultSec: qosDef,
@@ -207,6 +213,8 @@ enum MacDiagnosticsCollector {
         let dSys = max(0, end.sysCPUSec - start.sysCPUSec)
         let dBilled = max(0, end.billedSysSec - start.billedSysSec)
         let dProcGPU = max(0, end.processGPUSec - start.processGPUSec)
+        let dEnergy = end.billedEnergyRaw >= start.billedEnergyRaw ? (end.billedEnergyRaw - start.billedEnergyRaw) : 0
+        let energyPerSec = Double(dEnergy) / dt
         let userPct = (dUser / dt) * 100.0
         let sysPct = (dSys / dt) * 100.0
         let billedPct = (dBilled / dt) * 100.0
@@ -286,6 +294,7 @@ enum MacDiagnosticsCollector {
             cpuPercentSys: sysPct,
             billedSysPercent: billedPct,
             processGPUPercent: procGPUPct,
+            billedEnergyPerSec: energyPerSec,
             estimatedEnergyImpact: energyApprox,
             pkgIdleWakeupsPerSec: pkgPerSec,
             interruptWakeupsPerSec: intPerSec,
@@ -371,14 +380,14 @@ enum MacDiagnosticsCollector {
     private static func sampleBattery() -> MacBatterySample {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
         guard service != 0 else {
-            return MacBatterySample(available: false, percent: 0, voltageMV: 0, amperageMA: 0, watts: 0, isCharging: false, externalConnected: true)
+            return MacBatterySample(available: false, percent: 0, voltageMV: 0, amperageMA: 0, watts: 0, isSystemLoadMetric: false, isCharging: false, externalConnected: true)
         }
         defer { IOObjectRelease(service) }
 
         var propsRef: Unmanaged<CFMutableDictionary>?
         guard IORegistryEntryCreateCFProperties(service, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
               let dict = propsRef?.takeRetainedValue() as? [String: Any] else {
-            return MacBatterySample(available: false, percent: 0, voltageMV: 0, amperageMA: 0, watts: 0, isCharging: false, externalConnected: true)
+            return MacBatterySample(available: false, percent: 0, voltageMV: 0, amperageMA: 0, watts: 0, isSystemLoadMetric: false, isCharging: false, externalConnected: true)
         }
 
         let voltage = (dict["Voltage"] as? NSNumber)?.intValue ?? 0
@@ -389,14 +398,28 @@ enum MacDiagnosticsCollector {
         let pct = max(0, min(100, Int((curCap / maxCap * 100.0).rounded())))
         let charging = (dict["IsCharging"] as? Bool) ?? false
         let extConn = (dict["ExternalConnected"] as? Bool) ?? false
-        let watts = (Double(voltage) * Double(abs(amp))) / 1_000_000.0
+
+        // Prefer true Mac system load (`PowerTelemetryData.SystemLoad` in mW) so AC charging current never pollutes readings!
+        var watts: Double = 0
+        var isSysLoad = false
+        if let ptd = dict["PowerTelemetryData"] as? [String: Any],
+           let sysLoadMW = (ptd["SystemLoad"] as? NSNumber)?.doubleValue, sysLoadMW > 0 {
+            watts = sysLoadMW / 1000.0
+            isSysLoad = true
+        } else if !extConn || amp < 0 {
+            watts = (Double(voltage) * Double(abs(amp))) / 1_000_000.0
+        } else {
+            // Charging on AC without SystemLoad telemetry: do not misreport charging rate as system draw
+            watts = 0
+        }
 
         return MacBatterySample(
-            available: true,
+            available: isSysLoad || !extConn || amp < 0,
             percent: pct,
             voltageMV: voltage,
             amperageMA: amp,
             watts: watts,
+            isSystemLoadMetric: isSysLoad,
             isCharging: charging,
             externalConnected: extConn
         )

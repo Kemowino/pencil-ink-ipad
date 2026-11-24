@@ -436,8 +436,8 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             ? "N/A"
             : m.gpus.map { "\($0.name): \($0.utilizationPercent)%" }.joined(separator: " | ")
         let battLine = m.battery.available
-            ? String(format: "%.2f W (%d mV, %d mA, %d%%, %@)", m.battery.watts, m.battery.voltageMV, m.battery.amperageMA, m.battery.percent, m.battery.externalConnected ? (m.battery.isCharging ? "Charging" : "AC") : "On Battery")
-            : "No Battery Sensor"
+            ? String(format: "%.2f W [%@] (%d mV, %d mA, %d%%, %@)", m.battery.watts, m.battery.isSystemLoadMetric ? "SysLoad" : "BattDischarge", m.battery.voltageMV, m.battery.amperageMA, m.battery.percent, m.battery.externalConnected ? (m.battery.isCharging ? "AC Charging" : "AC") : "On Battery")
+            : "On AC (unplug for battery discharge W)"
         let threadsLine = m.topThreads.isEmpty
             ? "None (>0.15%)"
             : m.topThreads.map { String(format: "%@ (%.1f%%)", $0.name, $0.cpuPercent) }.joined(separator: ", ")

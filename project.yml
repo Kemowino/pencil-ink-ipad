@@ -23,8 +23,8 @@ targets:
       properties:
         CFBundleDisplayName: Pencil Ink
         CFBundleName: PencilInkNative
-        CFBundleShortVersionString: "3.4.0"
-        CFBundleVersion: "27"
+        CFBundleShortVersionString: "3.5.0"
+        CFBundleVersion: "28"
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         UISupportsDocumentBrowser: true
@@ -63,11 +63,12 @@ targets:
       properties:
         CFBundleDisplayName: Pencil Ink
         CFBundleName: PencilInkNative
-        CFBundleShortVersionString: "3.4.0"
-        CFBundleVersion: "27"
+        CFBundleShortVersionString: "3.5.0"
+        CFBundleVersion: "28"
         LSMinimumSystemVersion: "13.0"
         NSHighResolutionCapable: true
         NSSupportsAutomaticGraphicsSwitching: true
+        UIDesignRequiresCompatibility: true
         NSPrincipalClass: NSApplication
         LSApplicationCategoryType: public.app-category.productivity
         CFBundleDocumentTypes:
