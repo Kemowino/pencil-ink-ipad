@@ -231,7 +231,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v4.1.0")
+                        Text("v4.2.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }

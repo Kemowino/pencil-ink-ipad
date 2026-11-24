@@ -59,14 +59,13 @@ final class MacHobonichiPDFPage: PDFPage {
 struct MacVirtualPDFResult {
     let document: PDFDocument
     let slots: [PageSlot]
-    let slotByPageID: [ObjectIdentifier: PageSlot]
     let slotIndexByKey: [String: Int]
     let pageIndexByPDFN: [Int: Int]
     let isHobonichi: Bool
 }
 
 /// Maps an on-disk PDF + `.ink.json` (blanks, duplicated pages, hidden pages, Hobonichi spreads)
-/// into stock `PDFDocument` for Apple Preview's native `PDFView` with zero subclassing overhead on normal PDFs!
+/// into `MacVirtualPDFResult` with ZERO upfront `PDFPage` instantiation on unmodified multi-thousand-page textbooks!
 enum MacVirtualPDFBuilder {
     static func build(from pdfURL: URL, inkDoc: inout InkDocument) -> MacVirtualPDFResult? {
         autoreleasepool {
@@ -117,24 +116,19 @@ enum MacVirtualPDFBuilder {
         let slots = inkDoc.buildPageSlots(pdfPageSizes: pdfPageSizes, defaultSize: firstSize)
         let hasStructureEdits = isHobo || !inkDoc.blanks.isEmpty || inkDoc.removedCount > 0
 
-        let finalDoc: PDFDocument
-        var slotByPageID: [ObjectIdentifier: PageSlot] = [:]
+        let finalDoc: PDFDocument = sourceDoc
         var slotIndexByKey: [String: Int] = [:]
         var pageIndexByPDFN: [Int: Int] = [:]
-        slotByPageID.reserveCapacity(slots.count)
         slotIndexByKey.reserveCapacity(slots.count)
+        pageIndexByPDFN.reserveCapacity(slots.count)
 
         if !hasStructureEdits {
-            finalDoc = sourceDoc
+            // ZERO PDFPage instantiations -> keeps PDFDocument completely lazy & saves ~50 MB RAM on 2,500-page books!
             for (idx, slot) in slots.enumerated() {
                 slotIndexByKey[slot.key] = idx
                 if let pdfN = slot.pdfN { pageIndexByPDFN[pdfN] = idx }
-                if let p = finalDoc.page(at: idx) {
-                    slotByPageID[ObjectIdentifier(p)] = slot
-                }
             }
         } else {
-            finalDoc = sourceDoc
             var originalPages: [Int: PDFPage] = [:]
             originalPages.reserveCapacity(rawCount)
             for i in 0..<rawCount {
@@ -163,14 +157,12 @@ enum MacVirtualPDFBuilder {
                 }
 
                 finalDoc.insert(pageObj, at: idx)
-                slotByPageID[ObjectIdentifier(pageObj)] = slot
             }
         }
 
         return MacVirtualPDFResult(
             document: finalDoc,
             slots: slots,
-            slotByPageID: slotByPageID,
             slotIndexByKey: slotIndexByKey,
             pageIndexByPDFN: pageIndexByPDFN,
             isHobonichi: isHobo

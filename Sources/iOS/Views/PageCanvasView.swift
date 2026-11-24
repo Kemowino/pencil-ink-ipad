@@ -66,6 +66,12 @@ final class PageCanvasView: UIView {
         "lineWidth": NSNull()
     ]
 
+    private static let wrappingParagraphStyle: NSParagraphStyle = {
+        let p = NSMutableParagraphStyle()
+        p.lineBreakMode = .byWordWrapping
+        return p.copy() as! NSParagraphStyle
+    }()
+
     /// Lazily created ONLY if the user switches to Dark Paper mode (0 GPU/Metal cost in Original & Sepia modes!).
     private static var lazyCIContext: CIContext?
     private static let ciContextLock = NSLock()
@@ -967,11 +973,12 @@ final class PageCanvasView: UIView {
             ctx.fill(CGRect(origin: .zero, size: slot.size))
             ctx.translateBy(x: 0, y: slot.size.height)
             ctx.scaleBy(x: 1, y: -1)
-            let destRect = CGRect(origin: .zero, size: slot.size)
-            let xform = cgPage.getDrawingTransform(.cropBox, rect: destRect, rotate: 0, preserveAspectRatio: true)
-            ctx.concatenate(xform)
-            ctx.clip(to: cgPage.getBoxRect(.cropBox))
-            ctx.drawPDFPage(cgPage)
+            PlatformGraphics.drawPDFPageEdgeToEdge(
+                cgPage,
+                in: ctx,
+                targetW: slot.size.width,
+                targetH: slot.size.height
+            )
         } else if let pdfN = slot.effectivePDFPageNumber, let page = pdfDoc?.page(at: pdfN - 1) {
             ctx.setFillColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
             ctx.fill(CGRect(origin: .zero, size: slot.size))
@@ -1057,12 +1064,10 @@ final class PageCanvasView: UIView {
 
             let textColor = displayColor(for: box.color, smartDark: smartDarkInk)
             let font = box.resolvedUIFont()
-            let para = NSMutableParagraphStyle()
-            para.lineBreakMode = .byWordWrapping
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
                 .foregroundColor: textColor,
-                .paragraphStyle: para
+                .paragraphStyle: Self.wrappingParagraphStyle
             ]
             let drawRect = rect.insetBy(dx: 6, dy: 4)
             (box.text as NSString).draw(with: drawRect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attrs, context: nil)

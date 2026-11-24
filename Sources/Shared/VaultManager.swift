@@ -134,7 +134,7 @@ final class VaultManager: ObservableObject {
         } else {
             favoritePaths.insert(relativePath)
         }
-        saveMetadata()
+        UserDefaults.standard.set(Array(favoritePaths), forKey: favoritePathsKey)
     }
 
     func isFavorite(_ relativePath: String) -> Bool {
@@ -142,12 +142,13 @@ final class VaultManager: ObservableObject {
     }
 
     func recordRecentlyOpened(_ relativePath: String) {
+        if recentPaths.first == relativePath { return }
         recentPaths.removeAll { $0 == relativePath }
         recentPaths.insert(relativePath, at: 0)
         if recentPaths.count > 16 {
             recentPaths = Array(recentPaths.prefix(16))
         }
-        saveMetadata()
+        UserDefaults.standard.set(recentPaths, forKey: recentPathsKey)
     }
 
     func clearThumbnailCache(completion: (() -> Void)? = nil) {
@@ -192,7 +193,9 @@ final class VaultManager: ObservableObject {
 
     func setCoverColor(for relativePath: String, paletteID: Int) {
         coverColors[relativePath] = paletteID
-        saveMetadata()
+        if let data = try? JSONEncoder().encode(coverColors) {
+            UserDefaults.standard.set(data, forKey: coverColorsKey)
+        }
     }
 
     func cycleCoverColor(for item: PDFItem) {
@@ -205,7 +208,7 @@ final class VaultManager: ObservableObject {
 
     func markAsJournal(_ relativePath: String) {
         journalPaths.insert(relativePath)
-        saveMetadata()
+        UserDefaults.standard.set(Array(journalPaths), forKey: journalPathsKey)
     }
 
     func standardizedRootPath() -> String? {

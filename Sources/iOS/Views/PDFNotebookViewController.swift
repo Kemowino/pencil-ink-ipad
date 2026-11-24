@@ -860,6 +860,15 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
 
     private func evictOffscreenBitmaps(keepOnlyVisible: Bool) {
         PageRasterCache.shared.removeAllRAM()
+        syncManager?.trimInMemoryCaches(keeping: relativePath)
+        renderQueue.async { [weak self] in
+            self?.renderQueueCGDoc = nil
+            self?.coldDecodeCount = 0
+        }
+        overviewThumbQueue.async { [weak self] in
+            self?.overviewThumbCGDoc = nil
+            self?.overviewThumbColdCount = 0
+        }
         for pv in mountedPageViews.values {
             pv.clearZoomDetail()
         }
@@ -3839,6 +3848,7 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
     private func startLaserLoop() {
         guard laserDisplayLink == nil else { return }
         let link = CADisplayLink(target: DisplayLinkProxy(self), selector: #selector(DisplayLinkProxy.tick))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         laserDisplayLink = link
     }

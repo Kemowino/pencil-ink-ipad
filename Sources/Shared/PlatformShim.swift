@@ -92,6 +92,31 @@ enum PlatformGraphics {
         return box.size
     }
 
+    /// Explicit edge-to-edge `cropBox` + `rotationAngle` PDF page transform (supports scaling UP > 1.0x).
+    /// Assumes a standard bottom-left CoreGraphics coordinate system covering `(0, 0, targetW, targetH)`.
+    static func drawPDFPageEdgeToEdge(_ cgPage: CGPDFPage, in ctx: CGContext, targetW: CGFloat, targetH: CGFloat) {
+        let crop = cgPage.getBoxRect(.cropBox)
+        guard crop.width > 0.1, crop.height > 0.1, targetW > 0.1, targetH > 0.1 else { return }
+
+        let rotCW = ((Int(cgPage.rotationAngle) % 360) + 360) % 360
+        let isSideways = (rotCW == 90 || rotCW == 270)
+        let effW = isSideways ? crop.height : crop.width
+        let effH = isSideways ? crop.width : crop.height
+
+        let scale = min(targetW / effW, targetH / effH)
+
+        ctx.saveGState()
+        ctx.translateBy(x: targetW * 0.5, y: targetH * 0.5)
+        ctx.scaleBy(x: scale, y: scale)
+        if rotCW != 0 {
+            ctx.rotate(by: -CGFloat(rotCW) * (.pi / 180.0))
+        }
+        ctx.translateBy(x: -(crop.minX + crop.width * 0.5), y: -(crop.minY + crop.height * 0.5))
+        ctx.clip(to: crop)
+        ctx.drawPDFPage(cgPage)
+        ctx.restoreGState()
+    }
+
     /// Renders a compact cover preview thumbnail of page 1 directly via CoreGraphics (shared by iOS & macOS VaultManager).
     static func renderPDFCoverImage(cgPage: CGPDFPage, pageSize: CGSize, targetWidth: CGFloat = 240.0, maxPixels: CGFloat = 240_000) -> PlatformImage? {
         autoreleasepool {
@@ -116,12 +141,8 @@ enum PlatformGraphics {
             ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
             ctx.fill(CGRect(x: 0, y: 0, width: pxW, height: pxH))
             ctx.setShouldAntialias(true)
-            ctx.interpolationQuality = .none
-            let destRect = CGRect(x: 0, y: 0, width: CGFloat(pxW), height: CGFloat(pxH))
-            let xform = cgPage.getDrawingTransform(.cropBox, rect: destRect, rotate: 0, preserveAspectRatio: true)
-            ctx.concatenate(xform)
-            ctx.clip(to: cgPage.getBoxRect(.cropBox))
-            ctx.drawPDFPage(cgPage)
+            ctx.interpolationQuality = .low
+            drawPDFPageEdgeToEdge(cgPage, in: ctx, targetW: CGFloat(pxW), targetH: CGFloat(pxH))
 
             guard let cgImg = ctx.makeImage() else { return nil }
             #if canImport(UIKit)

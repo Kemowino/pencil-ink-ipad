@@ -142,6 +142,17 @@ final class PageRasterCache {
 
     func removeAllRAM() {
         ramCache.removeAllObjects()
+        Self.releaseScratchBuffers()
+    }
+
+    static func releaseScratchBuffers() {
+        encodeLock.lock()
+        reusableScratchPtr?.deallocate()
+        reusableScratchPtr = nil
+        reusableDstPtr?.deallocate()
+        reusableDstPtr = nil
+        reusableDstCap = 0
+        encodeLock.unlock()
     }
 
     func clearAllCaches(completion: (() -> Void)? = nil) {

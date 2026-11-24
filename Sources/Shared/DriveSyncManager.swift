@@ -179,6 +179,8 @@ final class DriveSyncManager: ObservableObject {
     private let client: GoogleDriveClient
     private var logStates: [String: BookLogState] = [:]
     private var logSeen: [String: [String: RemoteLogEntry]] = [:]
+    private var logCacheLRU: [String] = []
+    private let maxInMemoryBookLogs = 12
     private struct PendingFollowup {
         let pdfURL: URL
         let relativePath: String
@@ -1235,6 +1237,7 @@ final class DriveSyncManager: ObservableObject {
         st.base = snapshot(of: merged)
         logStates[inkRelPath] = st
         logSeen[inkRelPath] = seen
+        touchBookLogLRU(inkRelPath)
         saveLogState(st, for: inkRelPath)
 
         let uploadedCount = dirtyFiles.count
@@ -1648,11 +1651,40 @@ final class DriveSyncManager: ObservableObject {
         }
         if let decoded {
             logStates[inkRelPath] = decoded
+            touchBookLogLRU(inkRelPath)
             return decoded
         }
         let fresh = BookLogState(label: config.deviceLabel)
         logStates[inkRelPath] = fresh
+        touchBookLogLRU(inkRelPath)
         return fresh
+    }
+
+
+    private func touchBookLogLRU(_ inkRelPath: String) {
+        if let idx = logCacheLRU.firstIndex(of: inkRelPath) {
+            logCacheLRU.remove(at: idx)
+        }
+        logCacheLRU.append(inkRelPath)
+        while logCacheLRU.count > maxInMemoryBookLogs {
+            let victim = logCacheLRU.removeFirst()
+            if activeSyncTasks[victim] == nil {
+                logStates.removeValue(forKey: victim)
+                logSeen.removeValue(forKey: victim)
+            }
+        }
+    }
+
+    /// Releases cached in-memory CRDT log tables for inactive books (all persisted on disk in `sync-logs/`).
+    func trimInMemoryCaches(keeping activeRelativePath: String? = nil) {
+        let keepInk: String? = activeRelativePath.map {
+            $0.hasSuffix(".ink.json") ? $0 : ($0 + ".ink.json")
+        }
+        for key in Array(logStates.keys) where key != keepInk && activeSyncTasks[key] == nil {
+            logStates.removeValue(forKey: key)
+            logSeen.removeValue(forKey: key)
+        }
+        logCacheLRU.removeAll { logStates[$0] == nil }
     }
 
     private let logIOQueue = DispatchQueue(label: "com.pencilink.synclog.io", qos: .utility)

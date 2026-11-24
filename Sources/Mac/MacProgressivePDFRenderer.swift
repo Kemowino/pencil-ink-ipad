@@ -156,10 +156,10 @@ final class MacProgressivePDFRenderer {
     static func draftPixelSize(forPageSize pageSize: CGSize) -> (Int, Int) {
         let w = max(1.0, pageSize.width)
         let h = max(1.0, pageSize.height)
-        let maxPixels: CGFloat = 1_050_000.0
+        let maxPixels: CGFloat = 640_000.0
         let area = w * h
         let scale = sqrt(maxPixels / area)
-        let clampedScale = min(scale, 1.50)
+        let clampedScale = min(scale, 1.30)
         let pw = max(32, Int((w * clampedScale).rounded()) & ~1)
         let ph = max(32, Int((h * clampedScale).rounded()) & ~1)
         return (pw, ph)
@@ -167,10 +167,10 @@ final class MacProgressivePDFRenderer {
 
     /// Computes area-capped Tier 2 crisp Retina pixel dimensions (<= 1.85 MP normal, <= 2.40 MP when zoomed).
     static func retinaPixelSize(forViewSize viewSize: CGSize, backingScale: CGFloat, isZoomedIn: Bool = false) -> (Int, Int) {
-        let effectiveScale = min(backingScale, isZoomedIn ? 1.90 : 1.70)
+        let effectiveScale = min(backingScale, isZoomedIn ? 1.85 : 1.55)
         var pw = viewSize.width * effectiveScale
         var ph = viewSize.height * effectiveScale
-        let maxPixels: CGFloat = isZoomedIn ? 2_400_000.0 : 1_850_000.0
+        let maxPixels: CGFloat = isZoomedIn ? 2_200_000.0 : 1_550_000.0
         let area = pw * ph
         if area > maxPixels {
             let k = sqrt(maxPixels / area)
@@ -359,7 +359,7 @@ final class MacProgressivePDFRenderer {
         // Vector PDF text stays 100% antialiased CoreText regardless of interpolationQuality;
         // `.none` on draft & `.low` on settled Retina cuts embedded-image CPU filtering drastically!
         if tier == .draft {
-            ctx.interpolationQuality = .none
+            ctx.interpolationQuality = .low
         } else {
             ctx.interpolationQuality = highQuality ? .high : .low
         }
@@ -408,25 +408,6 @@ final class MacProgressivePDFRenderer {
 
     /// Explicit edge-to-edge `cropBox` + `rotationAngle` transform (supports scaling UP > 1.0x for Retina & slides).
     static func drawPDFPageEdgeToEdge(_ cgPage: CGPDFPage, in ctx: CGContext, pixelW: Int, pixelH: Int) {
-        let crop = cgPage.getBoxRect(.cropBox)
-        guard crop.width > 0.1, crop.height > 0.1 else { return }
-
-        let rotCW = ((cgPage.rotationAngle % 360) + 360) % 360
-        let isSideways = (rotCW == 90 || rotCW == 270)
-        let effW = isSideways ? crop.height : crop.width
-        let effH = isSideways ? crop.width : crop.height
-
-        let scale = min(CGFloat(pixelW) / effW, CGFloat(pixelH) / effH)
-
-        ctx.saveGState()
-        ctx.translateBy(x: CGFloat(pixelW) * 0.5, y: CGFloat(pixelH) * 0.5)
-        ctx.scaleBy(x: scale, y: scale)
-        if rotCW != 0 {
-            ctx.rotate(by: -CGFloat(rotCW) * (.pi / 180.0))
-        }
-        ctx.translateBy(x: -(crop.minX + crop.width * 0.5), y: -(crop.minY + crop.height * 0.5))
-        ctx.clip(to: crop)
-        ctx.drawPDFPage(cgPage)
-        ctx.restoreGState()
+        PlatformGraphics.drawPDFPageEdgeToEdge(cgPage, in: ctx, targetW: CGFloat(pixelW), targetH: CGFloat(pixelH))
     }
 }

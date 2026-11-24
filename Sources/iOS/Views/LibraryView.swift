@@ -477,7 +477,9 @@ struct LibraryView: View {
                 ForEach(visiblePDFs) { item in
                     GoodnotesDocumentTile(
                         item: item,
-                        vault: vault,
+                        coverColorID: vault.coverColors[item.relativePath],
+                        cachedThumb: vault.cachedCoverThumb(for: item),
+                        onLoadThumb: { done in vault.loadCoverThumb(for: item, completion: done) },
                         onOpen: { openItem(item) },
                         onRename: {
                             renameText = item.name
@@ -931,7 +933,9 @@ private struct GoodnotesFolderArtwork: View {
 
 private struct GoodnotesDocumentTile: View {
     let item: PDFItem
-    @ObservedObject var vault: VaultManager
+    let coverColorID: Int?
+    let cachedThumb: UIImage?
+    let onLoadThumb: (@escaping (UIImage?) -> Void) -> Void
     let onOpen: () -> Void
     let onRename: () -> Void
     let onCycleColor: () -> Void
@@ -941,7 +945,7 @@ private struct GoodnotesDocumentTile: View {
     @State private var thumb: UIImage? = nil
 
     private var palette: CoverPalette {
-        HobonichiEngine.palette(for: item.name, customID: vault.coverColors[item.relativePath])
+        HobonichiEngine.palette(for: item.name, customID: coverColorID)
     }
 
     var body: some View {
@@ -1074,10 +1078,10 @@ private struct GoodnotesDocumentTile: View {
         }
         .onAppear {
             if thumb == nil {
-                if let cached = vault.cachedCoverThumb(for: item) {
+                if let cached = cachedThumb {
                     thumb = cached
                 } else {
-                    vault.loadCoverThumb(for: item) { img in
+                    onLoadThumb { img in
                         thumb = img
                     }
                 }
