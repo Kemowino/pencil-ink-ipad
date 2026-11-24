@@ -7,7 +7,6 @@ private extension NSToolbarItem.Identifier {
     static let sidebarToggle = NSToolbarItem.Identifier("pencilink.sidebarToggle")
     static let toolMode = NSToolbarItem.Identifier("pencilink.toolMode")
     static let bookmark = NSToolbarItem.Identifier("pencilink.bookmark")
-    static let paperMode = NSToolbarItem.Identifier("pencilink.paperMode")
     static let zoomControls = NSToolbarItem.Identifier("pencilink.zoomControls")
     static let pageIndicator = NSToolbarItem.Identifier("pencilink.pageIndicator")
     static let syncStatus = NSToolbarItem.Identifier("pencilink.syncStatus")
@@ -56,14 +55,10 @@ final class MacPDFWindowController: NSWindowController,
     private static let iconSyncing = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.icloud", accessibilityDescription: "Syncing")
     private static let iconSyncError = NSImage(systemSymbolName: "exclamationmark.icloud", accessibilityDescription: "Sync Error")
     private static let iconSyncOff = NSImage(systemSymbolName: "icloud.slash", accessibilityDescription: "Disconnected")
-    private static let iconPaperOrig = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Original Paper")
-    private static let iconPaperSepia = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Warm Sepia")
-    private static let iconPaperDark = NSImage(systemSymbolName: "moon.fill", accessibilityDescription: "Dark Paper")
 
     // Toolbar controls
     private let modeSegment = NSSegmentedControl()
     private let bookmarkButton = NSButton()
-    private let paperButton = NSButton()
     private let pageField = NSTextField()
     private let syncButton = NSButton(title: "", target: nil, action: nil)
 
@@ -125,7 +120,6 @@ final class MacPDFWindowController: NSWindowController,
         super.init(window: win)
         win.delegate = self
 
-        MacPaperThemeRenderer.setMode(MacPreferences.shared.paperMode)
         setupToolbar()
         setupSplitView()
         setupObservers()
@@ -146,7 +140,7 @@ final class MacPDFWindowController: NSWindowController,
     // MARK: - Native AppKit Toolbar & Split View
 
     private func setupToolbar() {
-        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("PencilInkMacToolbarV31"))
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("PencilInkMacToolbarV34"))
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
@@ -227,12 +221,6 @@ final class MacPDFWindowController: NSWindowController,
             selector: #selector(handlePageChanged),
             name: .PDFViewPageChanged,
             object: pdfView
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handlePaperModePrefChanged),
-            name: .macPaperModeDidChange,
-            object: nil
         )
         NotificationCenter.default.addObserver(
             self,
@@ -385,9 +373,9 @@ final class MacPDFWindowController: NSWindowController,
         pdfView.pageOverlayViewProvider = shouldAttach ? self : nil
         overlayProviderAttached = shouldAttach
 
+        pdfView.disableMacOS26DocumentAnalysis()
         pdfView.document = res.document
         pdfView.autoScales = true
-        pdfView.applyPaperMode(MacPreferences.shared.paperMode)
 
         if let idx = preservePageIndex, idx >= 0, idx < res.document.pageCount, let p = res.document.page(at: idx) {
             pdfView.go(to: p)
@@ -1084,7 +1072,12 @@ final class MacPDFWindowController: NSWindowController,
         let count = pdfView.document?.pageCount ?? 0
         let strokeTotal = inkDoc.pages.values.reduce(0) { $0 + $1.count }
         let textTotal = inkDoc.texts.values.reduce(0) { $0 + $1.count }
-        return "\(pdfURL.lastPathComponent) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, overlayProvider=\(overlayProviderAttached ? "attached" : "nil"))"
+        let analysis = pdfView.documentAnalysisStatusDescription()
+        return "\(pdfURL.lastPathComponent) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, overlayProvider=\(overlayProviderAttached ? "attached" : "nil"), docAnalysis=\(analysis))"
+    }
+
+    func diagnosticsDocumentAnalysisState() -> String {
+        pdfView.documentAnalysisStatusDescription()
     }
 
     func diagnosticsPageCount() -> Int { pdfView.document?.pageCount ?? 0 }
@@ -1207,44 +1200,6 @@ final class MacPDFWindowController: NSWindowController,
         sidebarVC.updateBookmarks(currentBookmarkItems())
         updatePageIndicatorAndBookmarkUI()
         scheduleSave()
-    }
-
-    @objc private func showPaperMenu(_ sender: NSButton) {
-        let menu = NSMenu()
-        let cur = MacPreferences.shared.paperMode
-        for (idx, m) in MacPaperMode.allCases.enumerated() {
-            let item = NSMenuItem(title: m.title, action: #selector(selectPaperModeFromMenu(_:)), keyEquivalent: "")
-            item.tag = idx
-            item.target = self
-            item.state = (m == cur) ? .on : .off
-            menu.addItem(item)
-        }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
-    }
-
-    @objc private func selectPaperModeFromMenu(_ sender: NSMenuItem) {
-        guard sender.tag >= 0 && sender.tag < MacPaperMode.allCases.count else { return }
-        MacPreferences.shared.paperMode = MacPaperMode.allCases[sender.tag]
-    }
-
-    private func updatePaperButtonIcon() {
-        switch MacPreferences.shared.paperMode {
-        case .original:
-            paperButton.image = Self.iconPaperOrig
-            paperButton.toolTip = "Paper Mode: Original"
-        case .sepia:
-            paperButton.image = Self.iconPaperSepia
-            paperButton.toolTip = "Paper Mode: Warm Sepia"
-        case .dark:
-            paperButton.image = Self.iconPaperDark
-            paperButton.toolTip = "Paper Mode: Dark Paper"
-        }
-    }
-
-    @objc private func handlePaperModePrefChanged() {
-        let mode = MacPreferences.shared.paperMode
-        pdfView.applyPaperMode(mode)
-        updatePaperButtonIcon()
     }
 
     @objc private func zoomSegmentClicked(_ sender: NSSegmentedControl) {
@@ -1500,11 +1455,11 @@ final class MacPDFWindowController: NSWindowController,
     // MARK: - NSToolbarDelegate
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .syncStatus, .diagnostics]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .paperMode, .syncStatus, .diagnostics]
+        [.sidebarToggle, .bookmark, .flexibleSpace, .toolMode, .flexibleSpace, .pageIndicator, .zoomControls, .syncStatus, .diagnostics]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -1544,15 +1499,6 @@ final class MacPDFWindowController: NSWindowController,
             bookmarkButton.action = #selector(toggleBookmarkAction)
             item.view = bookmarkButton
             item.label = "Bookmark"
-
-        case .paperMode:
-            paperButton.bezelStyle = .texturedRounded
-            paperButton.imagePosition = .imageOnly
-            paperButton.target = self
-            paperButton.action = #selector(showPaperMenu(_:))
-            updatePaperButtonIcon()
-            item.view = paperButton
-            item.label = "Paper Mode"
 
         case .zoomControls:
             let seg = NSSegmentedControl(

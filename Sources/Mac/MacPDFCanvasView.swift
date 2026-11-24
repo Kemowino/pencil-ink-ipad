@@ -1,6 +1,7 @@
 import AppKit
 import PDFKit
 import QuartzCore
+import ObjectiveC.runtime
 
 protocol MacPDFCanvasDelegate: AnyObject {
     func canvasView(_ view: MacPDFCanvasView, overlayFor page: PDFPage) -> MacPageOverlayView?
@@ -14,14 +15,11 @@ protocol MacPDFCanvasDelegate: AnyObject {
     func canvasViewDidClickOutsideTextBox(_ view: MacPDFCanvasView)
 }
 
-/// Pure AppKit `PDFView` subclass engineered from v3.1.0 objective Intel telemetry:
-/// - **ZERO `CoreImage` / ZERO `CIFilter`:** Paper Modes (Original / Sepia / Dark) are baked ONCE into
-///   PDFKit's `CATiledLayer` cache via `MacThemedPDFPage` — cutting Dark Paper scroll from 97.8% CPU / 30.3W / 54% AMD
-///   straight down to Original Paper baseline (~16% CPU / ~7W / 0% AMD)!
-/// - **GPU-First Live Pinch-to-Zoom:** Scales the CoreAnimation layer at 60 FPS (0% tile thrashing, 0% 2,500-page relayouts)
-///   during active pinch gestures and commits crisp vector tiles ONCE when the gesture ends!
-/// - `enableDataDetectors = false`, `pageShadowsEnabled = false` (replaced by crisp 0.75pt CoreGraphics page border),
-///   and `interpolationQuality = .high` (crisp Preview-grade diagrams; Phase 2 already ran at 6.9W with `.high`).
+/// Pure AppKit `PDFView` subclass engineered for minimum power on Intel Macs:
+/// - **Disables macOS 26 `PDFPageAnalyzerV2` / `VNRecognizeDocumentsRequest`** via typed Objective-C runtime IMP
+///   for `-[PDFView setDocumentAnalysisEnabled:]` (FB24211659) — eliminates the 6-thread Vision CPU storm & 100% AMD Radeon GPU wakeups!
+/// - **GPU-First 60 Hz Live Pinch-to-Zoom:** Scales CoreAnimation layer during active gestures and commits vector tiles ONCE on release.
+/// - **Zero Paper Filters / Zero `CIFilter` / Zero `pageShadowsEnabled`** — pure Preview tile rendering.
 final class MacPDFCanvasView: PDFView {
     weak var canvasDelegate: MacPDFCanvasDelegate?
     var toolMode: MacToolMode = .read {
@@ -32,22 +30,27 @@ final class MacPDFCanvasView: PDFView {
         }
     }
 
+    override var document: PDFDocument? {
+        willSet {
+            disableMacOS26DocumentAnalysis()
+        }
+        didSet {
+            disableMacOS26DocumentAnalysis()
+        }
+    }
+
     private var activeHighlightPage: PDFPage? = nil
-    private var appliedPaperMode: MacPaperMode? = nil
-    private weak var appliedDocView: NSView? = nil
 
     // Live GPU pinch-to-zoom state
     private var isLiveZooming = false
     private var liveZoomBaseScale: CGFloat = 1.0
     private var liveZoomTargetScale: CGFloat = 1.0
 
-    private static let originalBgColor = NSColor(name: nil) { appearance in
+    private static let backdropColor = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(red: 0.118, green: 0.122, blue: 0.137, alpha: 1.0)
             : NSColor(red: 0.902, green: 0.910, blue: 0.925, alpha: 1.0)
     }
-    private static let sepiaBgColor = NSColor(red: 0.875, green: 0.845, blue: 0.785, alpha: 1.0)
-    private static let darkBgColor = NSColor(red: 0.082, green: 0.086, blue: 0.098, alpha: 1.0)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -68,48 +71,37 @@ final class MacPDFCanvasView: PDFView {
         pageShadowsEnabled = false
         interpolationQuality = MacPreferences.shared.highQualityImages ? .high : .low
         enableDataDetectors = false
-        backgroundColor = Self.originalBgColor
+        backgroundColor = Self.backdropColor
+        disableMacOS26DocumentAnalysis()
+    }
+
+    /// Disables macOS 26's automatic Vision ML document/table analyzer (`PDFPageAnalyzerV2` -> `VNRecognizeDocumentsRequest`)
+    /// using a type-safe Objective-C runtime `IMP` call so `ObjCBool(false)` is passed cleanly without KVC or `perform()` boxing bugs.
+    @discardableResult
+    func disableMacOS26DocumentAnalysis() -> String {
+        let setSel = NSSelectorFromString("setDocumentAnalysisEnabled:")
+        if let method = class_getInstanceMethod(type(of: self), setSel) {
+            typealias SetterIMP = @convention(c) (AnyObject, Selector, ObjCBool) -> Void
+            let fn = unsafeBitCast(method_getImplementation(method), to: SetterIMP.self)
+            fn(self, setSel, ObjCBool(false))
+        }
+        return documentAnalysisStatusDescription()
+    }
+
+    func documentAnalysisStatusDescription() -> String {
+        let getSel = NSSelectorFromString("isDocumentAnalysisEnabled")
+        if let method = class_getInstanceMethod(type(of: self), getSel) {
+            typealias GetterIMP = @convention(c) (AnyObject, Selector) -> ObjCBool
+            let fn = unsafeBitCast(method_getImplementation(method), to: GetterIMP.self)
+            return fn(self, getSel).boolValue ? "ON" : "OFF"
+        }
+        return "N/A"
     }
 
     func applyRenderQuality(highQualityImages: Bool) {
         let target: PDFInterpolationQuality = highQualityImages ? .high : .low
         guard interpolationQuality != target else { return }
         interpolationQuality = target
-        flushTileCachesPreservingScroll()
-    }
-
-    // MARK: - Zero-CIFilter Paper Mode Switching (Tile-Cached Pure CoreGraphics!)
-
-    func applyPaperMode(_ mode: MacPaperMode) {
-        MacPaperThemeRenderer.setMode(mode)
-        guard let docView = documentView else { return }
-        let modeChanged = (appliedPaperMode != nil && appliedPaperMode != mode)
-        if appliedPaperMode == mode && appliedDocView === docView { return }
-        appliedPaperMode = mode
-        appliedDocView = docView
-
-        // Guarantee ZERO CoreImage filters are ever attached to documentView!
-        if !docView.contentFilters.isEmpty { docView.contentFilters = [] }
-        if docView.layerUsesCoreImageFilters { docView.layerUsesCoreImageFilters = false }
-
-        switch mode {
-        case .original:
-            docView.enclosingScrollView?.appearance = nil
-            backgroundColor = Self.originalBgColor
-        case .sepia:
-            docView.enclosingScrollView?.appearance = NSAppearance(named: .aqua)
-            backgroundColor = Self.sepiaBgColor
-        case .dark:
-            docView.enclosingScrollView?.appearance = NSAppearance(named: .darkAqua)
-            backgroundColor = Self.darkBgColor
-        }
-
-        if modeChanged {
-            flushTileCachesPreservingScroll()
-        }
-    }
-
-    private func flushTileCachesPreservingScroll() {
         if let rootLayer = documentView?.layer {
             Self.invalidateLayerTree(rootLayer)
         }
@@ -126,7 +118,7 @@ final class MacPDFCanvasView: PDFView {
         }
     }
 
-    // MARK: - GPU-First Live Pinch-to-Zoom (Eliminates 215% CPU / 30W Tile Thrashing!)
+    // MARK: - GPU-First Live Pinch-to-Zoom (Zero Tile Thrashing!)
 
     override func magnify(with event: NSEvent) {
         let phase = event.phase
@@ -156,7 +148,6 @@ final class MacPDFCanvasView: PDFView {
         liveZoomTargetScale = max(0.30, min(5.0, targetScale))
         guard let scroll = documentView?.enclosingScrollView,
               let clipLayer = scroll.contentView.layer else {
-            // Fallback if layer-backed clip view isn't ready
             scrollToScaleDirect(liveZoomTargetScale)
             return
         }

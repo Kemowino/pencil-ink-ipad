@@ -253,9 +253,6 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     @objc private func menuToggleHighQualityImages() {
         MacPreferences.shared.highQualityImages.toggle()
     }
-    @objc private func menuPaperOriginal() { MacPreferences.shared.paperMode = .original }
-    @objc private func menuPaperSepia() { MacPreferences.shared.paperMode = .sepia }
-    @objc private func menuPaperDark() { MacPreferences.shared.paperMode = .dark }
     @objc private func menuSyncNow() {
         if let active = activeReaderController() {
             active.syncNowAction()
@@ -346,10 +343,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         let twoUpItem = NSMenuItem(title: "Toggle Two-Page Spread", action: #selector(menuToggleTwoUp), keyEquivalent: "2")
         twoUpItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(twoUpItem)
-        viewMenu.addItem(.separator())
-        viewMenu.addItem(withTitle: "Original Paper", action: #selector(menuPaperOriginal), keyEquivalent: "")
-        viewMenu.addItem(withTitle: "Warm Sepia Paper", action: #selector(menuPaperSepia), keyEquivalent: "")
-        viewMenu.addItem(withTitle: "Dark Paper", action: #selector(menuPaperDark), keyEquivalent: "")
+
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "High-Quality Image Resampling", action: #selector(menuToggleHighQualityImages), keyEquivalent: "")
         viewItem.submenu = viewMenu

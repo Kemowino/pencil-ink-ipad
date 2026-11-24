@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-3.3.0}"
+          TAG="v${VER:-3.4.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — 1-Pass Zero-Allocation Exclusion Dark Paper (eliminates 2x PDF draw + transparency-layer 102% CPU spike), Disabled VisionKit Live Text Background GPU Scanning (AppleLiveTextEnabled=false), Fast Bilinear Image Resampling (View menu toggle for High-Quality), Zero-Overhead Original Paper Fast-Path, No 2,500-Page Relayout on Paper Switch, plus Per-Process GPU% (TASK_POWER_INFO_V2) & Apples-to-Apples Phase 2 vs Phase 5 Self-Test." \
+              --notes "Pencil Ink Native $TAG — Step 2 Efficiency Proof Build: Disables macOS 26 PDFPageAnalyzerV2 / VNRecognizeDocumentsRequest Vision ML background pipeline via type-safe Objective-C runtime IMP for -[PDFView setDocumentAnalysisEnabled:] (FB24211659) to eliminate the 6-thread 75-137% CPU storm and 100% AMD Radeon GPU wakeups; removes Dark & Sepia Paper Mode completely and restores stock PDFDocument with zero subclassing overhead; upgrades Self-Test with docAnalysis=OFF runtime verification, Phase 5 Post-Skim Idle Check, AMD%, and ΔW vs Idle." \
               --latest
           fi

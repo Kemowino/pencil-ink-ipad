@@ -1,20 +1,6 @@
 import Foundation
 import AppKit
 
-enum MacPaperMode: String, CaseIterable {
-    case original = "original"
-    case sepia = "sepia"
-    case dark = "dark"
-
-    var title: String {
-        switch self {
-        case .original: return "Original Paper"
-        case .sepia: return "Warm Sepia"
-        case .dark: return "Dark Paper"
-        }
-    }
-}
-
 enum MacSyncMode: String, CaseIterable {
     case smart = "smart"
     case manual = "manual"
@@ -42,7 +28,6 @@ enum MacToolMode: Int, CaseIterable {
 }
 
 extension Notification.Name {
-    static let macPaperModeDidChange = Notification.Name("pencilink.mac.paperModeDidChange")
     static let macToolPrefsDidChange = Notification.Name("pencilink.mac.toolPrefsDidChange")
     static let macRenderQualityDidChange = Notification.Name("pencilink.mac.renderQualityDidChange")
 }
@@ -55,15 +40,6 @@ final class MacPreferences {
     private let key = "pencilink.mac.prefs.v1"
     private var loading = false
     private var persistTimer: DispatchSourceTimer?
-
-    var paperMode: MacPaperMode = .original {
-        didSet {
-            if paperMode != oldValue {
-                schedulePersist()
-                NotificationCenter.default.post(name: .macPaperModeDidChange, object: nil)
-            }
-        }
-    }
 
     var syncMode: MacSyncMode = .smart {
         didSet { if syncMode != oldValue { schedulePersist() } }
@@ -132,7 +108,6 @@ final class MacPreferences {
     }
 
     private struct Snapshot: Codable {
-        var paperMode: String?
         var syncMode: String?
         var highQualityImages: Bool?
         var hlColors: [String]?
@@ -162,7 +137,6 @@ final class MacPreferences {
               let s = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         loading = true
         defer { loading = false }
-        if let v = s.paperMode, let m = MacPaperMode(rawValue: v) { paperMode = m }
         if let v = s.syncMode, let m = MacSyncMode(rawValue: v) { syncMode = m }
         if let hq = s.highQualityImages { highQualityImages = hq }
         if let c = s.hlColors, !c.isEmpty { hlColors = c }
@@ -194,7 +168,6 @@ final class MacPreferences {
 
     private func writeNow() {
         let snap = Snapshot(
-            paperMode: paperMode.rawValue,
             syncMode: syncMode.rawValue,
             highQualityImages: highQualityImages,
             hlColors: hlColors,

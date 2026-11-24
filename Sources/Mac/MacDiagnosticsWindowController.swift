@@ -13,7 +13,7 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
 
     private let statusLabel = NSTextField(labelWithString: "Ready. Open any PDF textbook, then click Run 5-Phase Self-Test.")
     private let progressBar = NSProgressIndicator()
-    private let runTestBtn = NSButton(title: "Run 5-Phase Self-Test (~20s)", target: nil, action: nil)
+    private let runTestBtn = NSButton(title: "Run 5-Phase Self-Test (~24s)", target: nil, action: nil)
     private let liveMonitorBtn = NSButton(title: "Start Live 1 Hz Monitor", target: nil, action: nil)
     private let copyBtn = NSButton(title: "Copy Report", target: nil, action: nil)
     private let saveBtn = NSButton(title: "Save Report…", target: nil, action: nil)
@@ -107,12 +107,12 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         reportTextView.string = """
         Pencil Ink Native (Intel x86_64) — Objective Performance & Battery Diagnostics
         =============================================================================
-        • Click "Run 5-Phase Self-Test (~20s)" with a PDF open to measure:
-            1. Idle Baseline (checks background CPU, timers, idle wakeups)
-            2. Smooth Scroll — Original Paper (FPS, P95 frame time, CPU%, iGPU%, Watts)
-            3. Fast Page-Jump Skim (PDFKit decode speed & memory footprint)
-            4. Pinch/Zoom Stress (verifies throttled vector redraws & zero 60Hz CPU spike)
-            5. Smooth Scroll — Dark Paper (measures single-pass Dark Paper GPU cost)
+        • Click "Run 5-Phase Self-Test (~24s)" with a PDF open to measure:
+            1. Idle Baseline (4.5s — checks baseline CPU, timers, idle wakeups & system floor W)
+            2. Smooth Scroll (4.5s — FPS, P95 frame time, CPU%, Proc GPU%, AMD%, ΔW)
+            3. Fast Page-Jump Skim (4.0s — 26 page jumps, tests Vision/PDFPageAnalyzerV2 kill)
+            4. Pinch/Zoom Stress (4.0s — 60 Hz GPU pinch preview + vector commit)
+            5. Post-Skim Idle Check (5.5s — verifies ZERO Vision backlog & 0% AMD after skim!)
         • Or click "Start Live 1 Hz Monitor" and scroll manually to inspect real-time
           CPU%, top threads by name, idle wakeups/s, iGPU%, and real battery Watts.
         """
@@ -158,7 +158,8 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         }
         guard !isRunningTest else { return }
         lastLiveSnapshot = MacDiagnosticsCollector.captureSnapshot()
-        fullReportText = "=== Live 1 Hz Telemetry Monitor ===\n"
+        let daState = activeReaderProvider?()?.diagnosticsDocumentAnalysisState() ?? "No PDF"
+        fullReportText = "=== Live 1 Hz Telemetry Monitor (docAnalysis=\(daState)) ===\n"
         reportTextView.string = fullReportText
         liveMonitorBtn.title = "Stop Live Monitor"
         runTestBtn.isEnabled = false
@@ -177,11 +178,10 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
                     : "N/A"
                 let topT = m.topThreads.prefix(2).map { "\($0.name):\(String(format: "%.1f%%", $0.cpuPercent))" }.joined(separator: ", ")
                 let line = String(
-                    format: "CPU:%5.1f%% (U:%4.1f S:%4.1f) | EstEI:%5.1f | Wkup:%4.0f/s | <5ms:%3.0f/s | Mem:%4.0fMB | Ov:%d(vis:%d d:%d) | %@ | %@ | Top:[%@]\n",
+                    format: "CPU:%5.1f%% (U:%4.1f S:%4.1f) | PGPU:%4.1f%% | EstEI:%5.1f | Wkup:%3.0f/s | Mem:%4.0fMB | %@ | %@ | Top:[%@]\n",
                     m.cpuPercentTotal, m.cpuPercentUser, m.cpuPercentSys,
-                    m.estimatedEnergyImpact, m.pkgIdleWakeupsPerSec, m.timerUnder5msPerSec,
-                    m.memoryMB, m.overlaysMounted, m.committedViewsVisible, m.overlayDraws,
-                    gpuStr, battStr, topT
+                    m.processGPUPercent, m.estimatedEnergyImpact, m.pkgIdleWakeupsPerSec,
+                    m.memoryMB, gpuStr, battStr, topT
                 )
                 self.appendReport(line)
             }
@@ -226,26 +226,24 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
             guard let self else { return }
             await self.executeSelfTest(on: reader)
             self.isRunningTest = false
-            self.runTestBtn.title = "Run 5-Phase Self-Test (~20s)"
+            self.runTestBtn.title = "Run 5-Phase Self-Test (~24s)"
             self.liveMonitorBtn.isEnabled = true
         }
     }
 
     private func executeSelfTest(on reader: MacPDFWindowController) async {
         let env = reader.diagnosticsEnvironmentSummary()
-        let savedMode = MacPreferences.shared.paperMode
         let savedPage = reader.diagnosticsCurrentPageIndex()
         let savedTool = reader.diagnosticsToolMode()
 
         // Ensure reader window is visible so WindowServer actually composites every frame!
         reader.window?.orderFront(nil)
         reader.setToolMode(.read)
-        MacPreferences.shared.paperMode = .original
 
-        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "3.1.0"
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "3.4.0"
         let osVer = ProcessInfo.processInfo.operatingSystemVersionString
         fullReportText = """
-        # Pencil Ink Native v\(ver) — Intel macOS Self-Test Report
+        # Pencil Ink Native v\(ver) — Intel macOS Efficiency Proof Report
         - macOS: \(osVer) | Cores: \(ProcessInfo.processInfo.activeProcessorCount) | RAM: \(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024)) GB
         - Document: \(env)
         - Timestamp: \(ISO8601DateFormatter().string(from: Date()))
@@ -253,36 +251,37 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
         """
         reportTextView.string = fullReportText
 
-        // Brief 0.6s settle before Phase 1
-        try? await Task.sleep(nanoseconds: 600_000_000)
+        // 1.0s settle before Phase 1 so open/focus work finishes
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
 
         var phaseResults: [(name: String, m: MacIntervalMetrics)] = []
+        var idleWattsBaseline: Double = 0.0
 
-        // Phase 1: Idle Baseline (3.5s)
+        // Phase 1: Idle Baseline (4.5s)
         if !cancelTestRequested {
-            statusLabel.stringValue = "Phase 1/5: Measuring Idle Baseline (3.5s) — please keep hands off trackpad…"
-            let m = await runIdlePhase(durationSec: 3.5)
-            phaseResults.append(("1. Idle Baseline (Original)", m))
-            appendReport(formatPhaseSection("Phase 1: Idle Baseline (Original Paper)", m))
+            statusLabel.stringValue = "Phase 1/5: Measuring Idle Baseline (4.5s) — please keep hands off trackpad…"
+            let m = await runIdlePhase(durationSec: 4.5)
+            idleWattsBaseline = m.battery.available ? m.battery.watts : 0.0
+            phaseResults.append(("1. Idle Baseline", m))
+            appendReport(formatPhaseSection("Phase 1: Idle Baseline", m))
             progressBar.doubleValue = 1
         }
 
-        // Pick a consistent mid-book start page so Phase 2 (Original) & Phase 5 (Dark Paper) scroll the EXACT SAME pages!
         let totalP = max(1, reader.diagnosticsPageCount())
         let scrollAnchorPage = min(max(0, totalP - 12), min(50, totalP / 4))
 
-        // Phase 2: Smooth Scroll — Original Paper (4.5s)
+        // Phase 2: Smooth Scroll (4.5s)
         if !cancelTestRequested {
-            statusLabel.stringValue = "Phase 2/5: Smooth Scroll — Original Paper (4.5s)…"
+            statusLabel.stringValue = "Phase 2/5: Smooth Scroll (4.5s)…"
             reader.diagnosticsGoToPage(scrollAnchorPage)
             try? await Task.sleep(nanoseconds: 250_000_000)
             let m = await runSmoothScrollPhase(reader: reader, durationSec: 4.5, pointsPerStep: 28)
-            phaseResults.append(("2. Smooth Scroll (Original)", m))
-            appendReport(formatPhaseSection("Phase 2: Smooth Scroll (Original Paper)", m))
+            phaseResults.append(("2. Smooth Scroll", m))
+            appendReport(formatPhaseSection("Phase 2: Smooth Scroll", m))
             progressBar.doubleValue = 2
         }
 
-        // Phase 3: Fast Page-Jump Skim (4.0s)
+        // Phase 3: Fast Page-Jump Skim (4.0s — 26 new pages)
         if !cancelTestRequested {
             statusLabel.stringValue = "Phase 3/5: Fast Page-Jump Skim (4.0s)…"
             let m = await runPageSkimPhase(reader: reader, durationSec: 4.0)
@@ -293,43 +292,48 @@ final class MacDiagnosticsWindowController: NSWindowController, NSWindowDelegate
 
         // Phase 4: Pinch / Zoom Stress (4.0s)
         if !cancelTestRequested {
-            statusLabel.stringValue = "Phase 4/5: Zoom Stress Test (4.0s)…"
+            statusLabel.stringValue = "Phase 4/5: Pinch/Zoom Stress (4.0s)…"
             let m = await runZoomStressPhase(reader: reader, durationSec: 4.0)
-            phaseResults.append(("4. Zoom Stress (1.0x ↔ 2.2x)", m))
-            appendReport(formatPhaseSection("Phase 4: Zoom Stress (1.0x ↔ 2.2x)", m))
+            phaseResults.append(("4. Zoom Stress (1.0x ↔ 2.1x)", m))
+            appendReport(formatPhaseSection("Phase 4: Zoom Stress (1.0x ↔ 2.1x)", m))
             progressBar.doubleValue = 4
         }
 
-        // Phase 5: Smooth Scroll — Dark Paper (4.5s, EXACT SAME pages as Phase 2!)
+        // Phase 5: Post-Skim Idle Check (5.5s after 1.0s settle — proves ZERO Vision backlog & 0% AMD GPU!)
         if !cancelTestRequested {
-            statusLabel.stringValue = "Phase 5/5: Smooth Scroll — Dark Paper (4.5s)…"
-            reader.diagnosticsGoToPage(scrollAnchorPage)
-            MacPreferences.shared.paperMode = .dark
-            try? await Task.sleep(nanoseconds: 450_000_000)
-            let m = await runSmoothScrollPhase(reader: reader, durationSec: 4.5, pointsPerStep: 28)
-            phaseResults.append(("5. Smooth Scroll (Dark Paper)", m))
-            appendReport(formatPhaseSection("Phase 5: Smooth Scroll (Dark Paper)", m))
+            statusLabel.stringValue = "Phase 5/5: Post-Skim Idle Check (5.5s) — verifying zero background Vision backlog…"
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let m = await runIdlePhase(durationSec: 5.5)
+            phaseResults.append(("5. Post-Skim Idle Check", m))
+            appendReport(formatPhaseSection("Phase 5: Post-Skim Idle Check", m))
             progressBar.doubleValue = 5
         }
 
         // Restore original user state
-        MacPreferences.shared.paperMode = savedMode
         reader.setToolMode(savedTool)
         reader.diagnosticsRestore(pageIndex: savedPage)
 
-        // Summary Markdown Table
+        // Summary Markdown Table (with AMD% & ΔW vs Phase 1 Idle Baseline!)
         if !phaseResults.isEmpty {
             var table = "\n## Summary Table\n"
-            table += "| Phase | CPU% (U/S) | Proc GPU% | Est EI | Wkup/s | FPS (P95) | Mem | Watts | Pages |\n"
-            table += "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n"
+            table += "| Phase | CPU% (U/S) | Proc GPU% | AMD% | Est EI | FPS (P95) | Mem | Sys W (ΔW) |\n"
+            table += "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n"
             for (name, m) in phaseResults {
                 let fpsCol = m.fps > 0 ? String(format: "%.0f (%.1fms)", m.fps, m.p95FrameMs) : "—"
-                let wCol = m.battery.available ? String(format: "%.1fW", m.battery.watts) : "N/A"
+                let amdPct = m.gpus.first(where: { $0.name.localizedCaseInsensitiveContains("AMD") || $0.name.localizedCaseInsensitiveContains("Radeon") })?.utilizationPercent ?? 0
+                let wCol: String
+                if m.battery.available {
+                    let deltaW = m.battery.watts - idleWattsBaseline
+                    let sign = deltaW >= 0 ? "+" : ""
+                    wCol = String(format: "%.1fW (%@%.1fW)", m.battery.watts, sign, deltaW)
+                } else {
+                    wCol = "N/A"
+                }
                 table += String(
-                    format: "| %@ | %.1f%% (%.1f/%.1f) | %.1f%% | %.1f | %.0f | %@ | %.0fMB | %@ | %d |\n",
+                    format: "| %@ | %.1f%% (%.1f/%.1f) | %.1f%% | %d%% | %.1f | %@ | %.0fMB | %@ |\n",
                     name, m.cpuPercentTotal, m.cpuPercentUser, m.cpuPercentSys,
-                    m.processGPUPercent, m.estimatedEnergyImpact, m.pkgIdleWakeupsPerSec,
-                    fpsCol, m.memoryMB, wCol, m.pageChanges
+                    m.processGPUPercent, amdPct, m.estimatedEnergyImpact,
+                    fpsCol, m.memoryMB, wCol
                 )
             }
             appendReport(table)
