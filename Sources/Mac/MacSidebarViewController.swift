@@ -25,6 +25,7 @@ struct MacSearchResultItem {
     let selection: PDFSelection
 }
 
+@MainActor
 protocol MacSidebarDelegate: AnyObject {
     func sidebarDidSelectPage(at index: Int)
     func sidebarDidSelectSearchResult(_ item: MacSearchResultItem)

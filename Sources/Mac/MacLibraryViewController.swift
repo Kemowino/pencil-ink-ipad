@@ -225,7 +225,6 @@ final class MacLibraryViewController: NSViewController,
         sidebarTable.addTableColumn(sCol)
         sidebarTable.headerView = nil
         sidebarTable.style = .sourceList
-        sidebarTable.selectionHighlightStyle = .sourceList
         sidebarTable.rowHeight = 26
         sidebarTable.dataSource = self
         sidebarTable.delegate = self

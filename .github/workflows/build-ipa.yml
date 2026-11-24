@@ -19,7 +19,9 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        run: xcodegen generate
+        run: |
+          rm -f Sources/Mac/MacLitePDFCanvasView.swift Sources/Mac/MacPDFWindowController.swift Sources/Mac/MacLibraryWindowController.swift Sources/Mac/MacPDFCanvasView.swift
+          xcodegen generate
 
       - name: Build iOS/iPadOS Release .app
         run: |

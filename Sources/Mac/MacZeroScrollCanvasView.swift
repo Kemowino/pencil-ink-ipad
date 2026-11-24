@@ -2,6 +2,7 @@ import AppKit
 import PDFKit
 import QuartzCore
 
+@MainActor
 protocol MacZeroScrollCanvasDelegate: AnyObject {
     func zeroCanvas(_ view: MacZeroScrollCanvasView, strokesForPageKey key: String) -> [InkStroke]
     func zeroCanvas(_ view: MacZeroScrollCanvasView, textBoxesForPageKey key: String) -> [InkTextBox]

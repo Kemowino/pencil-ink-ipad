@@ -1156,7 +1156,7 @@ final class MacWorkspaceWindowController: NSWindowController,
             list.append(finalBox)
             session.inkDoc.texts[key] = list
             canvasView.refreshOverlay(forPageKey: key, strokes: session.inkDoc.pages[key] ?? [], textBoxes: list, hiddenTextBoxID: nil)
-            pushUndo(.texts(pageKey: key, added: [finalBox], removed: []))
+            pushUndo(.texts(pageKey: key, added: [finalBox], removed: []), on: session)
             scheduleSave(for: session)
         }
         window?.makeFirstResponder(canvasView)

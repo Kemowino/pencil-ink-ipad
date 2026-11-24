@@ -85,7 +85,7 @@ final class MacPageOverlayView: NSView {
         "position": NSNull()
     ]
 
-    private static let wrappingParagraphStyle: NSParagraphStyle = {
+    private nonisolated static let wrappingParagraphStyle: NSParagraphStyle = {
         let p = NSMutableParagraphStyle()
         p.lineBreakMode = .byWordWrapping
         return p.copy() as! NSParagraphStyle
