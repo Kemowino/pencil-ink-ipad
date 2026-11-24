@@ -1271,11 +1271,12 @@ final class MacZeroScrollCanvasView: NSView {
                 pixelW: pw,
                 pixelH: ph,
                 highQuality: hq,
+                paperMode: paperMode,
                 colorSpace: cs
             ) { [weak self] surfaceObj in
                 guard let self, let surfaceObj, let targetLayer = self.activeLayers[idx] else { return }
-                if targetLayer.appliedTier == .retina && surfaceObj.tier == .draft { return }
-                targetLayer.applySurface(surfaceObj, backingScale: backing, highQuality: hq)
+                if targetLayer.appliedTier == .retina && targetLayer.appliedPaperMode == paperMode && surfaceObj.tier == .draft { return }
+                targetLayer.applySurface(surfaceObj, backingScale: backing, highQuality: hq, paperMode: paperMode)
             }
         }
 

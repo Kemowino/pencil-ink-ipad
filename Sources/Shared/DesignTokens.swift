@@ -99,7 +99,7 @@ enum DesignTokens {
 
     static func color(_ light: RGBA, dark: RGBA, scheme: ColorScheme) -> Color {
         let c = (scheme == .dark) ? dark : light
-        return Color(red: c.r, green: c.g, blue: c.b, opacity: c.a)
+        return Color(red: Double(c.r), green: Double(c.g), blue: Double(c.b), opacity: Double(c.a))
     }
 
     static func canvasBackdrop(_ scheme: ColorScheme) -> Color {
@@ -126,8 +126,9 @@ enum DesignTokens {
     static func accent(_ scheme: ColorScheme) -> Color {
         color(lightAccent, dark: darkAccent, scheme: scheme)
     }
-    static let warmGold = Color(red: warmGoldRGB.r, green: warmGoldRGB.g, blue: warmGoldRGB.b)
-    static let emerald  = Color(red: emeraldRGB.r, green: emeraldRGB.g, blue: emeraldRGB.b)
-    static let coralRed = Color(red: coralRedRGB.r, green: coralRedRGB.g, blue: coralRedRGB.b)
+    static let warmGold     = Color(red: Double(warmGoldRGB.r), green: Double(warmGoldRGB.g), blue: Double(warmGoldRGB.b))
+    static let emerald      = Color(red: Double(emeraldRGB.r), green: Double(emeraldRGB.g), blue: Double(emeraldRGB.b))
+    static let coralRed     = Color(red: Double(coralRedRGB.r), green: Double(coralRedRGB.g), blue: Double(coralRedRGB.b))
+    static let skyFolderTop = Color(red: Double(skyFolderTopRGB.r), green: Double(skyFolderTopRGB.g), blue: Double(skyFolderTopRGB.b))
     #endif
 }

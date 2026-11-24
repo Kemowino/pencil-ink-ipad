@@ -191,11 +191,7 @@ struct IncomingImportSheet: View {
                                     path: folder.relativePath,
                                     depth: folderFilter.isEmpty ? min(depth, 3) : 0,
                                     iconName: "folder.fill",
-                                    iconColor: Color(
-                                        red: DesignTokens.skyFolderTopRGB.r,
-                                        green: DesignTokens.skyFolderTopRGB.g,
-                                        blue: DesignTokens.skyFolderTopRGB.b
-                                    )
+                                    iconColor: DesignTokens.skyFolderTop
                                 )
                             }
                         } header: {

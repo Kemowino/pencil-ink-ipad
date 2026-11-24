@@ -86,11 +86,11 @@ final class MacPageOverlayView: NSView {
         "position": NSNull()
     ]
 
-    private nonisolated static let wrappingParagraphStyle: NSParagraphStyle = {
+    private nonisolated static func makeWrappingParagraphStyle() -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         p.lineBreakMode = .byWordWrapping
         return p.copy() as! NSParagraphStyle
-    }()
+    }
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
@@ -412,7 +412,7 @@ final class MacPageOverlayView: NSView {
             ctx.restoreGState()
         }
 
-        let para = wrappingParagraphStyle
+        let para = makeWrappingParagraphStyle()
         for box in boxes {
             if box.id == hiddenID { continue }
             let trimmed = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
