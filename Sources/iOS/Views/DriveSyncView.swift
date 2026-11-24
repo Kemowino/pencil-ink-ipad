@@ -7,26 +7,132 @@ struct SyncStatusDotButton: View {
 
     private var dotColor: Color {
         switch syncManager.visualState {
-        case .ok: return Color(red: 0.19, green: 0.82, blue: 0.35)
+        case .ok: return DesignTokens.emerald
         case .syncing: return Color(red: 0.04, green: 0.52, blue: 1.0)
-        case .error: return Color(red: 1.0, green: 0.27, blue: 0.23)
+        case .error: return DesignTokens.coralRed
         case .disconnected: return Color(white: 0.56)
         }
     }
 
     var body: some View {
         Button(action: action) {
-            ZStack {
-                Circle()
-                    .fill(dotColor.opacity(syncManager.visualState == .syncing ? 0.34 : 0.22))
-                    .frame(width: 20, height: 20)
-                Circle()
-                    .fill(dotColor)
-                    .frame(width: 10, height: 10)
+            HStack(spacing: 5) {
+                ZStack {
+                    if syncManager.isTransferActive && syncManager.syncProgressFraction >= 0 {
+                        Circle()
+                            .stroke(dotColor.opacity(0.22), lineWidth: 2.4)
+                            .frame(width: 22, height: 22)
+                        Circle()
+                            .trim(from: 0, to: CGFloat(max(0.05, min(1.0, syncManager.syncProgressFraction))))
+                            .stroke(dotColor, style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .frame(width: 22, height: 22)
+                            .animation(.easeOut(duration: 0.18), value: syncManager.syncProgressFraction)
+                        Circle()
+                            .fill(dotColor)
+                            .frame(width: 7, height: 7)
+                    } else {
+                        Circle()
+                            .fill(dotColor.opacity(syncManager.visualState == .syncing ? 0.34 : 0.20))
+                            .frame(width: 20, height: 20)
+                        Circle()
+                            .fill(dotColor)
+                            .frame(width: 10, height: 10)
+                    }
+                }
+                .frame(width: 24, height: 24)
+
+                if syncManager.isTransferActive && syncManager.syncProgressFraction >= 0 {
+                    Text("\(Int((syncManager.syncProgressFraction * 100.0).rounded()))%")
+                        .font(.system(size: 11, weight: .bold))
+                        .monospacedDigit()
+                        .foregroundColor(dotColor)
+                }
             }
-            .frame(width: 32, height: 32)
+            .padding(.horizontal, syncManager.isTransferActive && syncManager.syncProgressFraction >= 0 ? 7 : 4)
+            .frame(minWidth: 32, minHeight: 32)
+            .background(
+                Capsule()
+                    .fill(syncManager.isTransferActive && syncManager.syncProgressFraction >= 0 ? dotColor.opacity(0.12) : Color.clear)
+            )
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Isolated, zero-idle-cost inline sync progress strip visible directly in Library & Notebook chrome
+/// without opening any sheet or popover. Renders 0 pixels when idle!
+struct InlineSyncProgressStrip: View {
+    @ObservedObject var syncManager: DriveSyncManager
+    var compact: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        if syncManager.isTransferActive {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    if syncManager.syncProgressFraction < 0 {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath.icloud.fill")
+                            .font(.system(size: compact ? 11.5 : 13, weight: .semibold))
+                            .foregroundColor(DesignTokens.accent(colorScheme))
+                    }
+
+                    Text(syncManager.syncPhaseLabel.isEmpty ? syncManager.statusText : syncManager.syncPhaseLabel)
+                        .font(.system(size: compact ? 11 : 12, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 6)
+
+                    if syncManager.syncProgressFraction >= 0 {
+                        Text("\(Int((syncManager.syncProgressFraction * 100.0).rounded()))%")
+                            .font(.system(size: compact ? 11 : 11.5, weight: .bold))
+                            .monospacedDigit()
+                            .foregroundColor(DesignTokens.accent(colorScheme))
+                    }
+
+                    if !syncManager.syncSpeedText.isEmpty {
+                        Text(syncManager.syncSpeedText)
+                            .font(.system(size: compact ? 10.5 : 11, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundColor(.secondary)
+                    }
+
+                    Button {
+                        syncManager.cancelActiveTransfer()
+                        Haptics.light()
+                    } label: {
+                        Image(systemName: "pause.circle.fill")
+                            .font(.system(size: compact ? 14 : 15))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, compact ? 14 : 18)
+                .padding(.vertical, compact ? 5 : 7)
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(DesignTokens.accent(colorScheme).opacity(0.14))
+                        let frac = syncManager.syncProgressFraction < 0
+                            ? 0.28
+                            : max(0.03, min(1.0, syncManager.syncProgressFraction))
+                        Rectangle()
+                            .fill(DesignTokens.accent(colorScheme))
+                            .frame(width: geo.size.width * CGFloat(frac))
+                            .animation(.easeOut(duration: 0.18), value: frac)
+                    }
+                }
+                .frame(height: 2.5)
+            }
+            .background(DesignTokens.chromeSecondary(colorScheme))
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
     }
 }
 
@@ -99,14 +205,24 @@ struct SyncStatusPopoverView: View {
 
             HStack(spacing: 8) {
                 if syncManager.config.isConnected {
-                    Button {
-                        onSyncNow()
-                    } label: {
-                        Text(syncManager.visualState == .syncing ? "Syncing…" : "Sync Now")
-                            .frame(maxWidth: .infinity)
+                    if syncManager.isTransferActive {
+                        Button {
+                            syncManager.cancelActiveTransfer()
+                        } label: {
+                            Text("Pause (Resumable)")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    } else {
+                        Button {
+                            onSyncNow()
+                        } label: {
+                            Text(syncManager.visualState == .syncing ? "Syncing…" : "Sync Now")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(syncManager.visualState == .syncing)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(syncManager.visualState == .syncing)
                 }
                 Button("Settings") {
                     onOpenSettings()
@@ -329,6 +445,36 @@ struct DriveSyncSettingsSheet: View {
                             Label("Sync Vault & Download New PDFs Now", systemImage: "arrow.triangle.2.circlepath")
                         }
                         .disabled(syncManager.visualState == .syncing || vault.vaultURL == nil)
+
+                        Button {
+                            Task {
+                                let res = await syncManager.purgeExpiredDriveTrash(force: true)
+                                feedbackMessage = "Drive Trash (.PencilInk-Trash): purged \(res.purged) expired (>120d), \(res.remaining) remaining."
+                                feedbackIsError = false
+                            }
+                        } label: {
+                            HStack {
+                                Label("Purge Expired Drive Trash (>120d)", systemImage: "clock.arrow.circlepath")
+                                Spacer()
+                                if syncManager.trashedItemsCount > 0 {
+                                    Text("\(syncManager.trashedItemsCount)")
+                                        .font(.caption.monospacedDigit().weight(.semibold))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .disabled(syncManager.isTransferActive)
+
+                        Button(role: .destructive) {
+                            Task {
+                                let n = await syncManager.emptyDriveTrashNow()
+                                feedbackMessage = "Permanently deleted \(n) item\(n == 1 ? "" : "s") from .PencilInk-Trash."
+                                feedbackIsError = false
+                            }
+                        } label: {
+                            Label("Empty Drive Trash Now", systemImage: "trash.slash")
+                        }
+                        .disabled(syncManager.isTransferActive)
 
                         Button(role: .destructive) {
                             syncManager.disconnect()

@@ -61,10 +61,11 @@ struct BookLogState: Codable {
     var dirty: [String] = []
     var ids: [String: String] = [:]
     var seenMd5: [String: String] = [:]
+    var lastUploadedMd5: [String: String] = [:]
     var base: BookSyncSnapshot? = nil
 
     enum CodingKeys: String, CodingKey {
-        case label, folderId, own, ownBlanks, ownBookmarks, ownRemoved, ownTexts, erased, dirty, ids, seenMd5, base
+        case label, folderId, own, ownBlanks, ownBookmarks, ownRemoved, ownTexts, erased, dirty, ids, seenMd5, lastUploadedMd5, base
     }
 
     init(label: String) {
@@ -84,6 +85,7 @@ struct BookLogState: Codable {
         dirty = (try? c.decode([String].self, forKey: .dirty)) ?? []
         ids = (try? c.decode([String: String].self, forKey: .ids)) ?? [:]
         seenMd5 = (try? c.decode([String: String].self, forKey: .seenMd5)) ?? [:]
+        lastUploadedMd5 = (try? c.decode([String: String].self, forKey: .lastUploadedMd5)) ?? [:]
         base = try? c.decode(BookSyncSnapshot.self, forKey: .base)
     }
 
@@ -142,6 +144,25 @@ struct BookLogState: Codable {
 
 /// Manages fast, bidirectional Google Drive CRDT delta sync for Pencil Ink Native.
 /// Fully compatible with Obsidian Pencil Ink's `.ink.d` folder & `log_<device>_*.json` format.
+struct TrashManifestEntry: Codable, Sendable, Equatable {
+    var relativePath: String
+    var kind: String // "file" | "folder"
+    var deletedAtMs: Int64
+    var device: String
+}
+
+struct TrashManifest: Codable, Sendable {
+    var v: Int = 1
+    var entries: [String: TrashManifestEntry] = [:]
+}
+
+enum LightChangeCheckResult {
+    case noChanges
+    case bookChanged
+    case vaultStructureChanged
+    case failed
+}
+
 @MainActor
 final class DriveSyncManager: ObservableObject {
     @Published var config: DriveConfig
@@ -155,7 +176,34 @@ final class DriveSyncManager: ObservableObject {
     @Published var sessionBooksSynced: Int = 0
     @Published var activeBookName: String = ""
     @Published var syncProgressText: String = ""
+    /// Byte-accurate transfer fraction `0.0...1.0`, or `-1.0` for indeterminate scanning.
+    @Published var syncProgressFraction: Double = 0.0
+    /// Compact inline label displayed directly in iPadOS & macOS chrome (no extra window needed!).
+    @Published var syncPhaseLabel: String = ""
+    /// Live smoothed transfer rate (e.g. "6.2 MB/s") when chunked transfer is active.
+    @Published var syncSpeedText: String = ""
+    /// True whenever any Drive upload, download, or vault sync is actively running.
+    @Published var isTransferActive: Bool = false
+    /// Number of items currently resting in `.PencilInk-Trash` (120-day auto-purge).
+    @Published var trashedItemsCount: Int = 0
     @Published var isSyncingVault: Bool = false
+
+    /// Optional callback invoked when a remote deletion from `.PencilInk-Trash` removes a local file/folder.
+    var onRemoteDeletedPath: ((_ relativePath: String, _ isFolder: Bool) -> Void)?
+
+    private let changesTokenKey = "pencilink.native.drive.changesToken.v1"
+    private let lastTrashPurgeKey = "pencilink.native.drive.lastTrashPurge.v1"
+    private var knownRemotePDFPathsLower: Set<String> = []
+    private var cachedTrashManifestFileID: String? = nil
+    private var cachedTrashManifestMD5: String = ""
+    private var cachedTrashManifest: TrashManifest = TrashManifest()
+    private var activeSingleUploadTask: Task<Void, Never>? = nil
+    private var pendingSingleUploads: [(pdfURL: URL, relativePath: String)] = []
+    private var firstDirtyAt: [String: Date] = [:]
+    private var isLightChangeCheckRunning: Bool = false
+    private var lastProgressPublishAt: TimeInterval = 0
+    private var speedWindowStartAt: TimeInterval = 0
+    private var speedWindowStartBytes: Int64 = 0
 
     private static let sharedISOFull: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -260,14 +308,145 @@ final class DriveSyncManager: ObservableObject {
     }
 
     func disconnect() {
+        cancelActiveTransfer()
         config.accessToken = ""
         config.refreshToken = ""
         config.expiresAt = 0
         lastError = ""
         lastDiagnostic = ""
+        clearChangesToken()
+        knownRemotePDFPathsLower.removeAll()
+        cachedTrashManifestFileID = nil
+        cachedTrashManifestMD5 = ""
+        cachedTrashManifest = TrashManifest()
+        trashedItemsCount = 0
+        firstDirtyAt.removeAll()
         saveConfig()
         visualState = .disconnected
         statusText = "Not Connected"
+    }
+
+    func cancelActiveTransfer() {
+        pendingSingleUploads.removeAll()
+        activeVaultSyncTask?.cancel()
+        activeSingleUploadTask?.cancel()
+        activeSingleUploadTask = nil
+    }
+
+    private func changesTokenStorageKey() -> String {
+        let folder = config.driveFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(changesTokenKey).\(WireCodec.md5Hex(Data(folder.utf8)))"
+    }
+
+    private func savedChangesToken() -> String? {
+        let s = UserDefaults.standard.string(forKey: changesTokenStorageKey())
+        return (s?.isEmpty == false) ? s : nil
+    }
+
+    private func saveChangesToken(_ token: String) {
+        guard !token.isEmpty else { return }
+        UserDefaults.standard.set(token, forKey: changesTokenStorageKey())
+    }
+
+    private func clearChangesToken() {
+        UserDefaults.standard.removeObject(forKey: changesTokenStorageKey())
+    }
+
+    /// Ultra-lightweight (~300 bytes on reused HTTP/2 socket) Drive Changes check for sub-10s cross-device sync!
+    /// Does ZERO Drive folder listing, ZERO file downloads, and ZERO UI updates when nothing changed.
+    func checkDriveChangesLightly(forBookRelativePath relativePath: String?) async -> LightChangeCheckResult {
+        guard config.isConnected, !isLightChangeCheckRunning, !isSyncingVault, activeSyncTasks.isEmpty else {
+            return .noChanges
+        }
+        isLightChangeCheckRunning = true
+        defer { isLightChangeCheckRunning = false }
+
+        await client.updateConfig(config)
+        do {
+            guard let token = savedChangesToken() else {
+                let startTok = try await client.getStartPageToken()
+                saveChangesToken(startTok)
+                return .noChanges
+            }
+
+            let delta = try await client.listChangesSince(pageToken: token, ownDeviceLabel: config.deviceLabel)
+            saveChangesToken(delta.newStartPageToken)
+
+            guard delta.hasRelevantChanges else {
+                return .noChanges
+            }
+
+            if let rel = relativePath {
+                let inkRel = rel.hasSuffix(".ink.json") ? rel : (rel + ".ink.json")
+                var bookFolderIDs = Set<String>()
+                if let fid = logStates[inkRel]?.folderId, !fid.isEmpty {
+                    bookFolderIDs.insert(fid)
+                }
+                if let extras = extraFolderCache[inkRel] {
+                    for e in extras { bookFolderIDs.insert(e) }
+                }
+                if bookFolderIDs.isEmpty || !delta.changedParentIDs.isDisjoint(with: bookFolderIDs) || !delta.changedFileIDs.isDisjoint(with: bookFolderIDs) {
+                    return .bookChanged
+                }
+            }
+
+            return delta.hasVaultStructureChanges ? .vaultStructureChanged : .noChanges
+        } catch {
+            return .failed
+        }
+    }
+
+    private func beginTransferProgress(phase: String, fraction: Double = -1.0) {
+        isTransferActive = true
+        syncPhaseLabel = phase
+        syncProgressText = phase
+        syncProgressFraction = fraction
+        syncSpeedText = ""
+        speedWindowStartAt = Date().timeIntervalSinceReferenceDate
+        speedWindowStartBytes = 0
+        lastProgressPublishAt = 0
+    }
+
+    private func updateTransferProgress(
+        phase: String,
+        completedBytes: Int64,
+        totalBytes: Int64,
+        forcePublish: Bool = false
+    ) {
+        let now = Date().timeIntervalSinceReferenceDate
+        if !forcePublish && (now - lastProgressPublishAt) < 0.22 {
+            return
+        }
+        lastProgressPublishAt = now
+
+        let frac: Double = totalBytes > 0
+            ? max(0.0, min(1.0, Double(completedBytes) / Double(totalBytes)))
+            : -1.0
+        syncProgressFraction = frac
+        syncPhaseLabel = phase
+        syncProgressText = phase
+
+        let dt = now - speedWindowStartAt
+        if dt >= 0.4 && completedBytes > speedWindowStartBytes {
+            let bps = Double(completedBytes - speedWindowStartBytes) / dt
+            if bps >= 1_048_576 {
+                syncSpeedText = String(format: "%.1f MB/s", bps / 1_048_576.0)
+            } else if bps >= 1024 {
+                syncSpeedText = String(format: "%.0f KB/s", bps / 1024.0)
+            }
+            if dt >= 3.0 {
+                speedWindowStartAt = now
+                speedWindowStartBytes = completedBytes
+            }
+        }
+    }
+
+    private func endTransferProgress() {
+        isTransferActive = false
+        syncProgressFraction = 0.0
+        syncPhaseLabel = ""
+        syncProgressText = ""
+        syncSpeedText = ""
     }
 
     // MARK: - Device Key Codec (100% Compatible with Obsidian Pencil Ink `PENCIL-INK-DEVICE:...`)
@@ -334,6 +513,8 @@ final class DriveSyncManager: ObservableObject {
         folderCheckAt.removeAll()
         extraFolderCache.removeAll()
         resolvedPathCache.removeAll()
+        clearChangesToken()
+        knownRemotePDFPathsLower.removeAll()
         saveConfig()
         if config.isConnected {
             visualState = .ok
@@ -404,16 +585,24 @@ final class DriveSyncManager: ObservableObject {
     func scheduleBookSync(
         pdfURL: URL,
         relativePath: String,
-        delaySeconds: TimeInterval = 4.0,
+        delaySeconds: TimeInterval = 1.6,
         localDocProvider: @escaping () -> InkDocument,
         onMerged: @escaping (InkDocument) -> Void
     ) {
         guard config.isConnected, config.autoSync, isSmartSyncEnabled() else { return }
         let inkRelPath = relativePath.hasSuffix(".ink.json") ? relativePath : (relativePath + ".ink.json")
         debounceTimers[inkRelPath]?.cancel()
+
+        let now = Date()
+        let firstDirty = firstDirtyAt[inkRelPath] ?? now
+        if firstDirtyAt[inkRelPath] == nil { firstDirtyAt[inkRelPath] = now }
+        let elapsedSinceFirst = now.timeIntervalSince(firstDirty)
+        let effectiveDelay: TimeInterval = (elapsedSinceFirst >= 8.0) ? 0.35 : max(0.2, delaySeconds)
+
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.debounceTimers.removeValue(forKey: inkRelPath)
+            self.firstDirtyAt.removeValue(forKey: inkRelPath)
             if self.activeSyncTasks[inkRelPath] != nil {
                 self.pendingFollowups[inkRelPath] = PendingFollowup(
                     pdfURL: pdfURL,
@@ -436,8 +625,7 @@ final class DriveSyncManager: ObservableObject {
             }
         }
         debounceTimers[inkRelPath] = item
-        // Smart idle debounce (4s default): batches continuous writing/typing into ONE clean upload!
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.2, delaySeconds), execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay, execute: item)
     }
 
     /// Translates a local PDF rename to Google Drive (renaming `<Book.pdf.ink.d>`, `<Book.pdf>`, and `<Book.pdf.ink.json>` if present)
@@ -554,6 +742,8 @@ final class DriveSyncManager: ObservableObject {
             visualState = .ok
             statusText = "Synced"
             if renamedAny {
+                knownRemotePDFPathsLower.remove(oldRelativePath.lowercased())
+                knownRemotePDFPathsLower.insert(newRelativePath.lowercased())
                 lastSyncedAt = Date()
             }
             return renamedAny
@@ -648,54 +838,361 @@ final class DriveSyncManager: ObservableObject {
         _ = await syncVault(vault: vault, force: true)
     }
 
-    /// Uploads a newly created or imported local PDF (plus its initial `.ink.json` if present, e.g. Hobonichi journal)
-    /// to Google Drive immediately so other devices (iPhone/iPad/Mac) automatically download it.
+    /// Uploads newly created or imported local PDFs sequentially in **8 MB resumable chunks**.
     func uploadNewBookToDrive(pdfURL: URL, relativePath: String) {
         guard config.isConnected, config.autoSync, config.syncPDFs else { return }
-        let currentCfg = config
-        Task { @MainActor [weak self] in
+        let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if !pendingSingleUploads.contains(where: { $0.relativePath.lowercased() == cleanRel.lowercased() }) {
+            pendingSingleUploads.append((pdfURL, cleanRel))
+        }
+        guard activeSingleUploadTask == nil else { return }
+
+        activeSingleUploadTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.client.updateConfig(currentCfg)
-            let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let rawDir = (cleanRel as NSString).deletingLastPathComponent
-            let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
-            let fileName = (cleanRel as NSString).lastPathComponent
-            do {
-                self.visualState = .syncing
-                self.syncProgressText = "Uploading \(fileName)…"
-                self.statusText = "Uploading…"
-                let parentID = try await self.client.ensureRemoteDir(relativeDir: dir)
-                let existing = try await self.client.findChildren(parentID: parentID, name: fileName)
-                if existing.isEmpty {
-                    _ = try await self.client.uploadPDFFile(fileURL: pdfURL, name: fileName, parentID: parentID)
+            defer { self.activeSingleUploadTask = nil }
+            while !self.pendingSingleUploads.isEmpty {
+                if Task.isCancelled { break }
+                let next = self.pendingSingleUploads.removeFirst()
+                let currentCfg = self.config
+                await self.client.updateConfig(currentCfg)
+                let rawDir = (next.relativePath as NSString).deletingLastPathComponent
+                let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
+                let fileName = (next.relativePath as NSString).lastPathComponent
+                do {
+                    self.visualState = .syncing
+                    self.statusText = "Uploading…"
+                    self.beginTransferProgress(phase: "↑ Uploading \(fileName)…", fraction: 0.0)
+                    let parentID = try await self.client.ensureRemoteDir(relativeDir: dir)
+                    let existing = try await self.client.findChildren(parentID: parentID, name: fileName)
+                    if existing.isEmpty {
+                        _ = try await self.client.uploadPDFFileChunked(
+                            fileURL: next.pdfURL,
+                            name: fileName,
+                            parentID: parentID,
+                            resumeKey: next.relativePath
+                        ) { [weak self] upBytes, totBytes in
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                let label = "↑ \(fileName) · \(self.formatBytes(upBytes)) / \(self.formatBytes(totBytes))"
+                                self.updateTransferProgress(phase: label, completedBytes: upBytes, totalBytes: totBytes)
+                            }
+                        }
+                    }
+                    self.knownRemotePDFPathsLower.insert(next.relativePath.lowercased())
+                    let sidecar = InkDocument.sidecarURL(for: next.pdfURL)
+                    if FileManager.default.fileExists(atPath: sidecar.path) {
+                        let local = await Task.detached(priority: .utility) { InkDocument.load(for: next.pdfURL) }.value
+                        _ = await self.syncBook(pdfURL: next.pdfURL, relativePath: next.relativePath, localDoc: local, forceFolderScan: true)
+                    }
+                    let totals = await self.client.getTransferTotals()
+                    self.sessionBytesUp = totals.up
+                    self.sessionBytesDown = totals.down
+                    self.lastSyncedAt = Date()
+                    self.lastError = ""
+                    self.endTransferProgress()
+                    self.visualState = .ok
+                    self.statusText = "Synced"
+                } catch DriveClientError.cancelled {
+                    self.pendingSingleUploads.removeAll()
+                    self.endTransferProgress()
+                    self.visualState = .ok
+                    self.statusText = "Paused (Resumable)"
+                    break
+                } catch is CancellationError {
+                    self.pendingSingleUploads.removeAll()
+                    self.endTransferProgress()
+                    self.visualState = .ok
+                    self.statusText = "Paused (Resumable)"
+                    break
+                } catch {
+                    self.endTransferProgress()
+                    self.lastError = error.localizedDescription
+                    self.visualState = .error
+                    self.statusText = "Sync Error"
                 }
-                let sidecar = InkDocument.sidecarURL(for: pdfURL)
-                if FileManager.default.fileExists(atPath: sidecar.path) {
-                    let local = await Task.detached(priority: .utility) { InkDocument.load(for: pdfURL) }.value
-                    _ = await self.syncBook(pdfURL: pdfURL, relativePath: cleanRel, localDoc: local, forceFolderScan: true)
-                }
-                let totals = await self.client.getTransferTotals()
-                self.sessionBytesUp = totals.up
-                self.sessionBytesDown = totals.down
-                self.lastSyncedAt = Date()
-                self.lastError = ""
-                self.syncProgressText = ""
-                self.visualState = .ok
-                self.statusText = "Synced"
-            } catch {
-                self.syncProgressText = ""
-                self.lastError = error.localizedDescription
-                self.visualState = .error
-                self.statusText = "Sync Error"
             }
         }
     }
 
-    /// Full Bidirectional Vault Sync (Global across iPhone/LiveContainer, iPad, and Mac):
-    /// 1. Scans the Google Drive sync root folder for ALL `.pdf` files and `.ink.d` annotation folders.
-    /// 2. Downloads any remote PDFs missing locally (streaming to disk, smallest first for instant UI feedback).
-    /// 3. Uploads any local PDFs missing on Google Drive (when `config.syncPDFs` is enabled).
-    /// 4. Syncs `.ink.d` & `txt_*.json` annotations for EVERY book that has EITHER local ink OR remote annotations!
+    // MARK: - `.PencilInk-Trash` 120-Day Deletion Sync (Files, Journals, & Folders)
+
+    private func loadTrashManifest(trashFolderID: String) async throws -> TrashManifest {
+        let matches = try await client.findChildren(parentID: trashFolderID, name: ".trash-manifest.json")
+        guard let meta = matches.first else {
+            cachedTrashManifestFileID = nil
+            cachedTrashManifestMD5 = ""
+            cachedTrashManifest = TrashManifest()
+            return cachedTrashManifest
+        }
+        cachedTrashManifestFileID = meta.id
+        let rev = "\(meta.md5Checksum ?? "")|\(meta.modifiedTime ?? "")"
+        if !rev.isEmpty && rev == cachedTrashManifestMD5 {
+            return cachedTrashManifest
+        }
+        let raw = try await client.download(fileID: meta.id)
+        let decoded = (try? JSONDecoder().decode(TrashManifest.self, from: raw)) ?? TrashManifest()
+        cachedTrashManifest = decoded
+        cachedTrashManifestMD5 = rev
+        return decoded
+    }
+
+    private func saveTrashManifest(_ manifest: TrashManifest, trashFolderID: String) async throws {
+        let cutoffMs = Int64(Date().timeIntervalSince1970 * 1000) - Int64(GoogleDriveClient.trashRetentionDays) * 86_400_000
+        var pruned = manifest
+        pruned.entries = pruned.entries.filter { $0.value.deletedAtMs > cutoffMs }
+
+        let payload = try JSONEncoder().encode(pruned)
+        let uploaded = try await client.uploadMultipart(
+            fileID: cachedTrashManifestFileID,
+            name: ".trash-manifest.json",
+            parentID: trashFolderID,
+            payload: payload
+        )
+        cachedTrashManifestFileID = uploaded.id
+        cachedTrashManifestMD5 = "\(uploaded.md5Checksum ?? "")|\(uploaded.modifiedTime ?? "")"
+        cachedTrashManifest = pruned
+    }
+
+    private func cleanupLocalLogState(forPDFRelativePath relPath: String) {
+        let inkRel = relPath.hasSuffix(".ink.json") ? relPath : (relPath + ".ink.json")
+        debounceTimers[inkRel]?.cancel()
+        debounceTimers.removeValue(forKey: inkRel)
+        firstDirtyAt.removeValue(forKey: inkRel)
+        pendingFollowups.removeValue(forKey: inkRel)
+        logStates.removeValue(forKey: inkRel)
+        logSeen.removeValue(forKey: inkRel)
+        logCacheLRU.removeAll { $0 == inkRel }
+        folderCheckAt.removeValue(forKey: inkRel)
+        extraFolderCache.removeValue(forKey: inkRel)
+        resolvedPathCache.removeValue(forKey: inkRel)
+        let stateURL = logStateURL(for: inkRel)
+        logIOQueue.async { try? FileManager.default.removeItem(at: stateURL) }
+    }
+
+    private func migrateLocalLogState(from oldRelPath: String, to newRelPath: String) {
+        let oldInk = oldRelPath.hasSuffix(".ink.json") ? oldRelPath : (oldRelPath + ".ink.json")
+        let newInk = newRelPath.hasSuffix(".ink.json") ? newRelPath : (newRelPath + ".ink.json")
+        guard oldInk != newInk else { return }
+        let oldURL = logStateURL(for: oldInk)
+        var state = logStates.removeValue(forKey: oldInk)
+        if state == nil, let data = try? Data(contentsOf: oldURL),
+           let dec = try? JSONDecoder().decode(BookLogState.self, from: data) {
+            state = dec
+        }
+        if let st = state {
+            logStates[newInk] = st
+            saveLogState(st, for: newInk)
+        }
+        logIOQueue.async { try? FileManager.default.removeItem(at: oldURL) }
+        if let seen = logSeen.removeValue(forKey: oldInk) { logSeen[newInk] = seen }
+        folderCheckAt.removeValue(forKey: oldInk)
+        extraFolderCache.removeValue(forKey: oldInk)
+        resolvedPathCache.removeValue(forKey: oldInk)
+    }
+
+    @discardableResult
+    func deleteFileOnDrive(relativePath: String) async -> Bool {
+        let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        cleanupLocalLogState(forPDFRelativePath: cleanRel)
+        knownRemotePDFPathsLower.remove(cleanRel.lowercased())
+
+        guard config.isConnected else { return false }
+        await client.updateConfig(config)
+        visualState = .syncing
+        statusText = "Moving to Drive Trash…"
+        beginTransferProgress(phase: "Moving \((cleanRel as NSString).lastPathComponent) to Trash…", fraction: -1.0)
+
+        let rawDir = (cleanRel as NSString).deletingLastPathComponent
+        let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
+        let pdfName = (cleanRel as NSString).lastPathComponent
+        let inkFolderName = pdfName + ".ink.d"
+        let legacyInkName = pdfName + ".ink.json"
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        do {
+            let rootID = try await client.resolveRootFolderID()
+            let trashID = try await client.ensureTrashFolderID()
+            var movedAny = false
+
+            if let parentID = try await client.lookupRemoteDir(relativeDir: dir) {
+                let pdfs = try await client.findChildren(parentID: parentID, name: pdfName)
+                for f in pdfs {
+                    _ = try await client.moveItemToTrashFolder(
+                        fileID: f.id,
+                        currentParents: f.parents,
+                        trashFolderID: trashID,
+                        originalPath: cleanRel,
+                        kind: "file",
+                        deletedAtMs: nowMs
+                    )
+                    movedAny = true
+                }
+                let legacyInks = try await client.findChildren(parentID: parentID, name: legacyInkName)
+                for f in legacyInks {
+                    _ = try await client.moveItemToTrashFolder(
+                        fileID: f.id,
+                        currentParents: f.parents,
+                        trashFolderID: trashID,
+                        originalPath: cleanRel + ".ink.json",
+                        kind: "file",
+                        deletedAtMs: nowMs
+                    )
+                    movedAny = true
+                }
+            }
+
+            let inkFolders = try await client.findFoldersNamed(inkFolderName)
+            for f in inkFolders {
+                if let resolved = try await client.resolvePathUnderRoot(folder: f, rootID: rootID) {
+                    let expectedSuffix = cleanRel + ".ink.d"
+                    if resolved.lowercased() == expectedSuffix.lowercased() || resolved.lowercased().hasSuffix("/" + expectedSuffix.lowercased()) || dir.isEmpty {
+                        _ = try await client.moveItemToTrashFolder(
+                            fileID: f.id,
+                            currentParents: f.parents,
+                            trashFolderID: trashID,
+                            originalPath: resolved,
+                            kind: "inkFolder",
+                            deletedAtMs: nowMs
+                        )
+                        movedAny = true
+                    }
+                }
+            }
+
+            var manifest = try await loadTrashManifest(trashFolderID: trashID)
+            manifest.entries[cleanRel.lowercased()] = TrashManifestEntry(
+                relativePath: cleanRel,
+                kind: "file",
+                deletedAtMs: nowMs,
+                device: config.deviceLabel
+            )
+            try await saveTrashManifest(manifest, trashFolderID: trashID)
+            trashedItemsCount = max(trashedItemsCount + (movedAny ? 1 : 0), manifest.entries.count)
+
+            lastError = ""
+            lastSyncedAt = Date()
+            endTransferProgress()
+            visualState = .ok
+            statusText = "Synced"
+            return true
+        } catch {
+            endTransferProgress()
+            lastError = error.localizedDescription
+            visualState = .error
+            statusText = "Sync Error"
+            return false
+        }
+    }
+
+    @discardableResult
+    func deleteFolderOnDrive(relativeFolderPath: String, containedPDFRelativePaths: [String]) async -> Bool {
+        let cleanDir = relativeFolderPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !cleanDir.isEmpty else { return false }
+
+        for pdfRel in containedPDFRelativePaths {
+            cleanupLocalLogState(forPDFRelativePath: pdfRel)
+            knownRemotePDFPathsLower.remove(pdfRel.lowercased())
+        }
+
+        guard config.isConnected else { return false }
+        await client.updateConfig(config)
+        visualState = .syncing
+        statusText = "Moving folder to Trash…"
+        beginTransferProgress(phase: "Moving folder \((cleanDir as NSString).lastPathComponent) to Trash…", fraction: -1.0)
+
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        do {
+            let trashID = try await client.ensureTrashFolderID()
+            if let folderID = try await client.lookupRemoteDir(relativeDir: cleanDir) {
+                _ = try await client.moveItemToTrashFolder(
+                    fileID: folderID,
+                    currentParents: nil,
+                    trashFolderID: trashID,
+                    originalPath: cleanDir,
+                    kind: "folder",
+                    deletedAtMs: nowMs
+                )
+                await client.invalidateFolderCaches()
+            }
+
+            var manifest = try await loadTrashManifest(trashFolderID: trashID)
+            manifest.entries["folder:\(cleanDir.lowercased())"] = TrashManifestEntry(
+                relativePath: cleanDir,
+                kind: "folder",
+                deletedAtMs: nowMs,
+                device: config.deviceLabel
+            )
+            for pdfRel in containedPDFRelativePaths {
+                let c = pdfRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                manifest.entries[c.lowercased()] = TrashManifestEntry(
+                    relativePath: c,
+                    kind: "file",
+                    deletedAtMs: nowMs,
+                    device: config.deviceLabel
+                )
+            }
+            try await saveTrashManifest(manifest, trashFolderID: trashID)
+            trashedItemsCount = max(trashedItemsCount + 1, manifest.entries.count)
+
+            lastError = ""
+            lastSyncedAt = Date()
+            endTransferProgress()
+            visualState = .ok
+            statusText = "Synced"
+            return true
+        } catch {
+            endTransferProgress()
+            lastError = error.localizedDescription
+            visualState = .error
+            statusText = "Sync Error"
+            return false
+        }
+    }
+
+    @discardableResult
+    func purgeExpiredDriveTrash(force: Bool = false) async -> (purged: Int, remaining: Int) {
+        guard config.isConnected else { return (0, 0) }
+        let lastRun = UserDefaults.standard.double(forKey: lastTrashPurgeKey)
+        let nowSec = Date().timeIntervalSince1970
+        if !force && lastRun > 0 && (nowSec - lastRun) < 86_400 {
+            return (0, trashedItemsCount)
+        }
+        await client.updateConfig(config)
+        do {
+            let res = try await client.purgeExpiredTrash(retentionDays: GoogleDriveClient.trashRetentionDays)
+            UserDefaults.standard.set(nowSec, forKey: lastTrashPurgeKey)
+            trashedItemsCount = res.remaining
+            return res
+        } catch {
+            return (0, trashedItemsCount)
+        }
+    }
+
+    @discardableResult
+    func emptyDriveTrashNow() async -> Int {
+        guard config.isConnected else { return 0 }
+        await client.updateConfig(config)
+        visualState = .syncing
+        statusText = "Emptying Drive Trash…"
+        beginTransferProgress(phase: "Emptying Drive Trash…", fraction: -1.0)
+        do {
+            let removed = try await client.emptyTrashFolder()
+            trashedItemsCount = 0
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastTrashPurgeKey)
+            endTransferProgress()
+            visualState = .ok
+            statusText = "Synced"
+            return removed
+        } catch {
+            endTransferProgress()
+            lastError = error.localizedDescription
+            visualState = .error
+            statusText = "Sync Error"
+            return 0
+        }
+    }
+
     @discardableResult
     func syncVault(
         vault: VaultManager,
@@ -708,7 +1205,8 @@ final class DriveSyncManager: ObservableObject {
             guard config.autoSync, isSmartSyncEnabled() else {
                 return (0, 0, 0)
             }
-            if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < 90.0 {
+            let minInterval: TimeInterval = ProcessInfo.processInfo.isLowPowerModeEnabled ? 120.0 : 45.0
+            if let last = lastVaultSyncAt, Date().timeIntervalSince(last) < minInterval {
                 return (0, 0, 0)
             }
         }
@@ -720,12 +1218,12 @@ final class DriveSyncManager: ObservableObject {
             guard let self else { return (0, 0, 0) }
             self.isSyncingVault = true
             self.visualState = .syncing
-            self.statusText = "Scanning Drive…"
-            self.syncProgressText = "Checking Google Drive for new PDFs & notes…"
+            self.statusText = "Checking Drive…"
+            self.beginTransferProgress(phase: "Checking Google Drive…", fraction: -1.0)
             self.lastError = ""
             defer {
                 self.isSyncingVault = false
-                self.syncProgressText = ""
+                self.endTransferProgress()
                 self.lastVaultSyncAt = Date()
             }
 
@@ -734,13 +1232,36 @@ final class DriveSyncManager: ObservableObject {
             var syncedAnnotationsCount = 0
 
             do {
+                try Task.checkCancellation()
                 await self.client.updateConfig(self.config)
+
+                if !force, let savedToken = self.savedChangesToken(), !self.knownRemotePDFPathsLower.isEmpty {
+                    let hasUntrackedLocalPDF = self.config.syncPDFs && vault.pdfs.contains {
+                        !self.knownRemotePDFPathsLower.contains($0.relativePath.lowercased())
+                    }
+                    if !hasUntrackedLocalPDF {
+                        if let delta = try? await self.client.listChangesSince(pageToken: savedToken, ownDeviceLabel: self.config.deviceLabel) {
+                            self.saveChangesToken(delta.newStartPageToken)
+                            if !delta.hasRelevantChanges {
+                                _ = await self.purgeExpiredDriveTrash(force: false)
+                                self.lastSyncedAt = Date()
+                                self.visualState = .ok
+                                self.statusText = "Synced"
+                                return (0, 0, 0)
+                            }
+                        }
+                    }
+                }
+
+                try Task.checkCancellation()
+                self.statusText = "Scanning Drive…"
+                self.beginTransferProgress(phase: "Scanning vault on Google Drive…", fraction: -1.0)
+
+                let freshStartToken = try? await self.client.getStartPageToken()
                 let rootID = try await self.client.resolveRootFolderID()
                 let tree = try await self.client.listVaultTree(rootID: rootID)
                 await vault.refreshPDFListAsync()
 
-                // Smart vault-root prefix alignment (handles Drive having `My Notes/Folder/Book.pdf`
-                // while local vault root is `My Notes/`, or vice versa!)
                 let alignment = self.detectRootPrefixAlignment(localPDFs: vault.pdfs, remotePDFs: tree.pdfs)
 
                 func remoteToLocalRel(_ remoteRel: String) -> String {
@@ -765,71 +1286,226 @@ final class DriveSyncManager: ObservableObject {
                     return trimmed
                 }
 
-                // 1. Download any PDFs on Google Drive that are missing locally!
+                // 0a. Apply remote `.PencilInk-Trash` tombstones using aligned paths
+                if let trashID = try await self.client.findExistingTrashFolderID() {
+                    let manifest = try await self.loadTrashManifest(trashFolderID: trashID)
+                    var removedLocally = false
+                    for entry in manifest.entries.values {
+                        if entry.device == self.config.deviceLabel { continue }
+                        let alignedLocalRel = remoteToLocalRel(entry.relativePath)
+                        let candidates = Set([entry.relativePath, alignedLocalRel])
+                        if entry.kind == "folder" {
+                            for dirCand in candidates where !dirCand.isEmpty {
+                                let prefix = dirCand.lowercased() + "/"
+                                let matchingLocal = vault.pdfs.filter {
+                                    $0.relativeFolder.lowercased() == dirCand.lowercased()
+                                        || $0.relativePath.lowercased().hasPrefix(prefix)
+                                }
+                                let newestLocalMs = matchingLocal.map { Int64($0.modifiedAt.timeIntervalSince1970 * 1000) }.max() ?? 0
+                                if newestLocalMs <= entry.deletedAtMs {
+                                    self.onRemoteDeletedPath?(dirCand, true)
+                                    if vault.removeLocalFolderSilently(relativeFolder: dirCand) {
+                                        removedLocally = true
+                                    }
+                                }
+                            }
+                        } else if entry.kind == "file" {
+                            let candLower = Set(candidates.map { $0.lowercased() })
+                            if let localItem = vault.pdfs.first(where: { candLower.contains($0.relativePath.lowercased()) }) {
+                                let localMs = Int64(localItem.modifiedAt.timeIntervalSince1970 * 1000)
+                                if localMs <= entry.deletedAtMs {
+                                    self.onRemoteDeletedPath?(localItem.relativePath, false)
+                                    if vault.removeLocalFileSilently(relativePath: localItem.relativePath) {
+                                        self.cleanupLocalLogState(forPDFRelativePath: localItem.relativePath)
+                                        removedLocally = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if removedLocally {
+                        await vault.refreshPDFListAsync()
+                    }
+                }
+
+                let purgeRes = await self.purgeExpiredDriveTrash(force: false)
+                if purgeRes.remaining > 0 {
+                    self.trashedItemsCount = purgeRes.remaining
+                }
+
+                // 0b. Mirror exact folder hierarchy from Drive <-> Local (including empty & nested subfolders!)
+                var createdLocalFolders = 0
+                for remoteDir in tree.folderIDByPath.keys.sorted() where !remoteDir.isEmpty {
+                    let localDir = remoteToLocalRel(remoteDir)
+                    if !localDir.isEmpty && vault.ensureLocalFolderExists(relativePath: localDir) {
+                        createdLocalFolders += 1
+                    }
+                }
+                for localFolder in vault.allFolders {
+                    let remDir = localToRemoteRel(localFolder.relativePath)
+                    if !remDir.isEmpty && tree.folderIDByPath[remDir] == nil {
+                        _ = try? await self.client.ensureRemoteDir(relativeDir: remDir)
+                    }
+                }
+
+                // 0c. Zero-Bandwidth Move Detection: mirror folder reorganizations locally without re-downloading!
+                var movedLocallyCount = 0
+                if self.config.syncPDFs {
+                    let localLowerSet0 = Set(vault.pdfs.map { $0.relativePath.lowercased() })
+                    let remoteLowerSet0 = Set(tree.pdfs.map { remoteToLocalRel($0.relativePath).lowercased() })
+
+                    let localOnly = vault.pdfs.filter { !remoteLowerSet0.contains($0.relativePath.lowercased()) }
+                    let remoteOnly = tree.pdfs.filter { !localLowerSet0.contains(remoteToLocalRel($0.relativePath).lowercased()) }
+
+                    if !localOnly.isEmpty && !remoteOnly.isEmpty {
+                        var localBySig: [String: [PDFItem]] = [:]
+                        for loc in localOnly {
+                            let sz = ((try? FileManager.default.attributesOfItem(atPath: loc.url.path))?[.size] as? NSNumber)?.int64Value ?? -1
+                            guard sz > 0 else { continue }
+                            let sig = "\(loc.url.lastPathComponent.lowercased())|\(sz)"
+                            localBySig[sig, default: []].append(loc)
+                        }
+                        var remoteBySig: [String: [RemotePDFFile]] = [:]
+                        for rem in remoteOnly where rem.sizeBytes > 0 {
+                            let sig = "\(rem.meta.name.lowercased())|\(rem.sizeBytes)"
+                            remoteBySig[sig, default: []].append(rem)
+                        }
+                        for (sig, locGroup) in localBySig where locGroup.count == 1 {
+                            if let remGroup = remoteBySig[sig], remGroup.count == 1 {
+                                let locItem = locGroup[0]
+                                let targetLocalRel = remoteToLocalRel(remGroup[0].relativePath)
+                                if vault.moveLocalPDFSilently(from: locItem.relativePath, to: targetLocalRel) {
+                                    self.migrateLocalLogState(from: locItem.relativePath, to: targetLocalRel)
+                                    movedLocallyCount += 1
+                                }
+                            }
+                        }
+                    }
+                }
+                if createdLocalFolders > 0 || movedLocallyCount > 0 {
+                    await vault.refreshPDFListAsync()
+                }
+
+                var updatedKnownRemote = Set(tree.pdfs.map { remoteToLocalRel($0.relativePath).lowercased() })
+
+                // 1. Download missing PDFs in 8 MB resumable chunks (smallest first)
                 if self.config.syncPDFs {
                     var localLowerSet = Set(vault.pdfs.map { $0.relativePath.lowercased() })
                     let missingRemote = tree.pdfs
                         .filter { !localLowerSet.contains(remoteToLocalRel($0.relativePath).lowercased()) }
                         .sorted { $0.sizeBytes < $1.sizeBytes }
 
+                    let totalDownloadBytes = missingRemote.reduce(Int64(0)) { $0 + max(0, $1.sizeBytes) }
+                    var finishedDownloadBytes: Int64 = 0
                     let isoFull = Self.sharedISOFull
                     let isoBasic = Self.sharedISOBasic
 
                     for (idx, remote) in missingRemote.enumerated() {
+                        try Task.checkCancellation()
                         let localRel = remoteToLocalRel(remote.relativePath)
-                        let sizeLabel = remote.sizeBytes > 0 ? " (\(self.formatBytes(remote.sizeBytes)))" : ""
-                        self.syncProgressText = "Downloading PDF \(idx + 1)/\(missingRemote.count): \(remote.meta.name)\(sizeLabel)…"
+                        let shortName = remote.meta.name
+                        let baseDone = finishedDownloadBytes
                         self.statusText = "Downloading \(idx + 1)/\(missingRemote.count)…"
+                        self.updateTransferProgress(
+                            phase: "↓ \(idx + 1)/\(missingRemote.count) \(shortName)",
+                            completedBytes: baseDone,
+                            totalBytes: max(totalDownloadBytes, remote.sizeBytes),
+                            forcePublish: true
+                        )
                         do {
-                            let tempFile = try await self.client.downloadToFile(fileID: remote.meta.id)
+                            let tempFile = try await self.client.downloadFileChunked(
+                                meta: remote.meta,
+                                expectedSize: remote.sizeBytes
+                            ) { [weak self] fileDone, fileTotal in
+                                Task { @MainActor [weak self] in
+                                    guard let self else { return }
+                                    let aggDone = baseDone + fileDone
+                                    let aggTot = max(totalDownloadBytes, baseDone + fileTotal)
+                                    let lbl = "↓ \(idx + 1)/\(missingRemote.count) \(shortName) · \(self.formatBytes(fileDone)) / \(self.formatBytes(fileTotal))"
+                                    self.updateTransferProgress(phase: lbl, completedBytes: aggDone, totalBytes: aggTot)
+                                }
+                            }
                             let modDate: Date? = remote.meta.modifiedTime.flatMap {
                                 isoFull.date(from: $0) ?? isoBasic.date(from: $0)
                             }
                             _ = try vault.installDownloadedPDF(from: tempFile, relativePath: localRel, modifiedAt: modDate)
                             localLowerSet.insert(localRel.lowercased())
+                            finishedDownloadBytes += max(0, remote.sizeBytes)
                             downloadedCount += 1
-                            // Batch vault rescans every 5 downloads (plus final refresh) instead of O(N^2) per-file rescans!
-                            if downloadedCount % 5 == 0 {
+                            if downloadedCount % 4 == 0 {
                                 await vault.refreshPDFListAsync()
                             }
+                        } catch DriveClientError.cancelled {
+                            throw DriveClientError.cancelled
                         } catch {
-                            self.lastError = "Failed downloading \(remote.meta.name): \(error.localizedDescription)"
+                            self.lastError = "Failed downloading \(shortName): \(error.localizedDescription)"
                         }
                     }
 
-                    if downloadedCount > 0 && downloadedCount % 5 != 0 {
+                    if downloadedCount > 0 && downloadedCount % 4 != 0 {
                         await vault.refreshPDFListAsync()
                     }
 
-                    // 2. Upload any local PDFs that do not exist on Google Drive yet!
+                    // 2. Upload local PDFs missing on Drive in 8 MB resumable chunks
                     let remoteLowerSet = Set(tree.pdfs.map { $0.relativePath.lowercased() })
                     let missingOnDrive = vault.pdfs.filter { item in
                         let remRel = localToRemoteRel(item.relativePath)
                         return !remoteLowerSet.contains(remRel.lowercased())
                     }
 
+                    let uploadSizes: [Int64] = missingOnDrive.map { item in
+                        ((try? FileManager.default.attributesOfItem(atPath: item.url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                    }
+                    let totalUploadBytes = uploadSizes.reduce(Int64(0), +)
+                    var finishedUploadBytes: Int64 = 0
+
                     for (idx, item) in missingOnDrive.enumerated() {
+                        try Task.checkCancellation()
                         let remRel = localToRemoteRel(item.relativePath)
                         let rawDir = (remRel as NSString).deletingLastPathComponent
                         let dir = (rawDir == "." || rawDir == "/") ? "" : rawDir
                         let fileName = (remRel as NSString).lastPathComponent
-                        self.syncProgressText = "Uploading PDF \(idx + 1)/\(missingOnDrive.count): \(fileName)…"
+                        let fileSz = uploadSizes[idx]
+                        let baseUp = finishedUploadBytes
                         self.statusText = "Uploading \(idx + 1)/\(missingOnDrive.count)…"
+                        self.updateTransferProgress(
+                            phase: "↑ \(idx + 1)/\(missingOnDrive.count) \(fileName)",
+                            completedBytes: baseUp,
+                            totalBytes: max(totalUploadBytes, fileSz),
+                            forcePublish: true
+                        )
                         do {
                             vault.ensureSecurityScopeActive()
                             let parentID = try await self.client.ensureRemoteDir(relativeDir: dir)
                             let doubleCheck = try await self.client.findChildren(parentID: parentID, name: fileName)
                             if doubleCheck.isEmpty {
-                                _ = try await self.client.uploadPDFFile(fileURL: item.url, name: fileName, parentID: parentID)
+                                _ = try await self.client.uploadPDFFileChunked(
+                                    fileURL: item.url,
+                                    name: fileName,
+                                    parentID: parentID,
+                                    resumeKey: remRel
+                                ) { [weak self] upBytes, totBytes in
+                                    Task { @MainActor [weak self] in
+                                        guard let self else { return }
+                                        let aggUp = baseUp + upBytes
+                                        let aggTot = max(totalUploadBytes, baseUp + totBytes)
+                                        let lbl = "↑ \(idx + 1)/\(missingOnDrive.count) \(fileName) · \(self.formatBytes(upBytes)) / \(self.formatBytes(totBytes))"
+                                        self.updateTransferProgress(phase: lbl, completedBytes: aggUp, totalBytes: aggTot)
+                                    }
+                                }
                                 uploadedCount += 1
                             }
+                            updatedKnownRemote.insert(item.relativePath.lowercased())
+                            finishedUploadBytes += fileSz
+                        } catch DriveClientError.cancelled {
+                            throw DriveClientError.cancelled
                         } catch {
                             self.lastError = "Failed uploading \(fileName): \(error.localizedDescription)"
                         }
                     }
                 }
 
-                // 3. Sync annotations for EVERY local book that EITHER has local ink OR has a remote `.ink.d` folder!
+                // 3. Sync annotations for EVERY local book that EITHER has local ink OR has a remote `.ink.d` folder
                 let remoteAnnotatedLower = Set(tree.annotatedPDFPaths.map { remoteToLocalRel($0).lowercased() })
                 let remoteAnnotatedNames = Set(tree.annotatedPDFPaths.map { ($0 as NSString).lastPathComponent.lowercased() })
                 let booksToSync = vault.pdfs.filter { item in
@@ -839,7 +1515,11 @@ final class DriveSyncManager: ObservableObject {
                 }
 
                 for (idx, item) in booksToSync.enumerated() {
-                    self.syncProgressText = "Syncing notes \(idx + 1)/\(booksToSync.count): \(item.name)…"
+                    try Task.checkCancellation()
+                    let frac = Double(idx) / Double(max(1, booksToSync.count))
+                    self.syncProgressFraction = frac
+                    self.syncPhaseLabel = "Syncing notes \(idx + 1)/\(booksToSync.count): \(item.name)"
+                    self.syncProgressText = self.syncPhaseLabel
                     let bookURL = item.url
                     let local = await Task.detached(priority: .utility) { InkDocument.load(for: bookURL) }.value
                     if let (merged, changed) = await self.syncBook(
@@ -859,6 +1539,11 @@ final class DriveSyncManager: ObservableObject {
                     await vault.refreshPDFListAsync()
                 }
 
+                self.knownRemotePDFPathsLower = updatedKnownRemote
+                if let tok = freshStartToken {
+                    self.saveChangesToken(tok)
+                }
+
                 let totals = await self.client.getTransferTotals()
                 self.sessionBytesUp = totals.up
                 self.sessionBytesDown = totals.down
@@ -870,7 +1555,13 @@ final class DriveSyncManager: ObservableObject {
                     self.visualState = .error
                     self.statusText = "Sync Error"
                 }
-                self.lastDiagnostic = "Vault: \(tree.pdfs.count) on Drive · ↓\(downloadedCount) new PDFs · ↑\(uploadedCount) uploaded · \(syncedAnnotationsCount) notes synced"
+                self.lastDiagnostic = "Vault: \(tree.pdfs.count) on Drive · ↓\(downloadedCount) PDFs · ↑\(uploadedCount) uploaded · \(syncedAnnotationsCount) notes"
+            } catch DriveClientError.cancelled {
+                self.visualState = .ok
+                self.statusText = "Paused (Resumable)"
+            } catch is CancellationError {
+                self.visualState = .ok
+                self.statusText = "Paused (Resumable)"
             } catch {
                 self.lastError = error.localizedDescription
                 if let de = error as? DriveClientError, de.isFatalAuth {
@@ -1018,6 +1709,7 @@ final class DriveSyncManager: ObservableObject {
                     // Switched from an isolated/stray folder to the real MacBook folder!
                     // Re-upload our own local strokes & marks into the canonical folder cleanly.
                     st.ids.removeAll()
+                    st.lastUploadedMd5.removeAll()
                     seen.removeAll()
                     st.seenMd5.removeAll()
                     for key in st.own.keys { st.markDirty(BookLogState.pageFile(label: st.label, key: key)) }
@@ -1177,8 +1869,9 @@ final class DriveSyncManager: ObservableObject {
         let merged = deriveDoc(st: st, seen: seen, name: localDoc.name)
 
         let dirtyFiles = st.dirty
+        var actualUploadedCount = 0
         if !dirtyFiles.isEmpty {
-            var prepared: [(name: String, existingID: String?, payload: Data)] = []
+            var prepared: [(name: String, existingID: String?, payload: Data, md5: String)] = []
             for name in dirtyFiles {
                 let payload: Data
                 if name.hasSuffix("_erase.json") {
@@ -1193,31 +1886,40 @@ final class DriveSyncManager: ObservableObject {
                     let pageKey = BookLogState.keyOfFile(name)
                     payload = try WireCodec.encodePageShard(key: pageKey, strokes: st.own[pageKey] ?? [])
                 }
-                prepared.append((name, st.ids[name], payload))
-            }
-
-            let clientRef = self.client
-            let primaryID = folderID
-            let uploadedPairs: [(String, String)] = try await withThrowingTaskGroup(of: (String, String).self) { groupTask in
-                for item in prepared {
-                    groupTask.addTask {
-                        let meta = try await clientRef.uploadMultipart(
-                            fileID: item.existingID,
-                            name: item.name,
-                            parentID: primaryID,
-                            payload: item.payload
-                        )
-                        return (item.name, meta.id)
-                    }
+                let md5 = WireCodec.md5Hex(payload)
+                if st.ids[name] != nil && st.lastUploadedMd5[name] == md5 {
+                    st.dirty.removeAll { $0 == name }
+                    continue
                 }
-                var out: [(String, String)] = []
-                for try await pair in groupTask { out.append(pair) }
-                return out
+                prepared.append((name, st.ids[name], payload, md5))
             }
 
-            for (name, newID) in uploadedPairs {
-                st.ids[name] = newID
-                st.dirty.removeAll { $0 == name }
+            if !prepared.isEmpty {
+                let clientRef = self.client
+                let primaryID = folderID
+                let uploadedTriples: [(String, String, String)] = try await withThrowingTaskGroup(of: (String, String, String).self) { groupTask in
+                    for item in prepared {
+                        groupTask.addTask {
+                            let meta = try await clientRef.uploadMultipart(
+                                fileID: item.existingID,
+                                name: item.name,
+                                parentID: primaryID,
+                                payload: item.payload
+                            )
+                            return (item.name, meta.id, item.md5)
+                        }
+                    }
+                    var out: [(String, String, String)] = []
+                    for try await triple in groupTask { out.append(triple) }
+                    return out
+                }
+
+                for (name, newID, md5) in uploadedTriples {
+                    st.ids[name] = newID
+                    st.lastUploadedMd5[name] = md5
+                    st.dirty.removeAll { $0 == name }
+                }
+                actualUploadedCount = uploadedTriples.count
             }
         }
 
@@ -1240,7 +1942,7 @@ final class DriveSyncManager: ObservableObject {
         touchBookLogLRU(inkRelPath)
         saveLogState(st, for: inkRelPath)
 
-        let uploadedCount = dirtyFiles.count
+        let uploadedCount = actualUploadedCount
         let ownCount = st.ids.count
         let remoteCount = remoteGroups.count
         let didTransfer = (downloadedCount > 0 || uploadedCount > 0)

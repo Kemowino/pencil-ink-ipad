@@ -25,6 +25,8 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
     private let testBtn = NSButton(title: "Test Connection", target: nil, action: nil)
     private let syncVaultBtn = NSButton(title: "Sync Vault Now", target: nil, action: nil)
     private let disconnectBtn = NSButton(title: "Disconnect", target: nil, action: nil)
+    private let purgeTrashBtn = NSButton(title: "Purge >120d", target: nil, action: nil)
+    private let emptyTrashBtn = NSButton(title: "Empty Trash", target: nil, action: nil)
 
     private var authVerifier: String = ""
     private var cancellables = Set<AnyCancellable>()
@@ -106,8 +108,18 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
         disconnectBtn.contentTintColor = .systemRed
         disconnectBtn.target = self
         disconnectBtn.action = #selector(disconnectDrive)
+        purgeTrashBtn.bezelStyle = .rounded
+        purgeTrashBtn.target = self
+        purgeTrashBtn.action = #selector(purgeExpiredTrashAction)
+        emptyTrashBtn.bezelStyle = .rounded
+        emptyTrashBtn.contentTintColor = .systemOrange
+        emptyTrashBtn.target = self
+        emptyTrashBtn.action = #selector(emptyTrashAction)
+
         actionRow.addArrangedSubview(testBtn)
         actionRow.addArrangedSubview(syncVaultBtn)
+        actionRow.addArrangedSubview(purgeTrashBtn)
+        actionRow.addArrangedSubview(emptyTrashBtn)
         actionRow.addArrangedSubview(disconnectBtn)
         stack.addArrangedSubview(actionRow)
 
@@ -261,6 +273,8 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
 
         testBtn.isEnabled = connected && syncManager.visualState != .syncing
         syncVaultBtn.isEnabled = connected && vault.vaultURL != nil && syncManager.visualState != .syncing
+        purgeTrashBtn.isEnabled = connected && !syncManager.isTransferActive
+        emptyTrashBtn.isEnabled = connected && !syncManager.isTransferActive
         disconnectBtn.isEnabled = connected
     }
 
@@ -356,6 +370,28 @@ final class MacDriveSyncWindowController: NSWindowController, NSWindowDelegate {
         syncManager.disconnect()
         loadFieldsFromConfig()
         setFeedback("Disconnected from Google Drive.", isError: false)
+    }
+
+    @objc private func purgeExpiredTrashAction() {
+        Task {
+            let res = await syncManager.purgeExpiredDriveTrash(force: true)
+            setFeedback("Drive Trash checked: purged \(res.purged) expired (>120d), \(res.remaining) remaining in .PencilInk-Trash.", isError: false)
+        }
+    }
+
+    @objc private func emptyTrashAction() {
+        let alert = NSAlert()
+        alert.messageText = "Empty .PencilInk-Trash on Google Drive?"
+        alert.informativeText = "Permanently deletes all trashed PDFs, journals, and folders in .PencilInk-Trash immediately instead of waiting 120 days."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Empty Trash")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            Task {
+                let n = await syncManager.emptyDriveTrashNow()
+                setFeedback("Permanently deleted \(n) item\(n == 1 ? "" : "s") from .PencilInk-Trash.", isError: false)
+            }
+        }
     }
 
     @objc private func openGoogleSignIn() {

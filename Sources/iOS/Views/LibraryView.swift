@@ -55,6 +55,7 @@ struct LibraryView: View {
     @State private var newFolderName = ""
     @State private var renamingItem: PDFItem? = nil
     @State private var renameText = ""
+    @State private var deletingFolder: FolderItem? = nil
 
     private var allowedTypes: [UTType] {
         pickerMode == .folder ? [.folder] : [.pdf]
@@ -150,21 +151,7 @@ struct LibraryView: View {
                         .background(Color.orange.opacity(0.14))
                     }
 
-                    if !syncManager.syncProgressText.isEmpty {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text(syncManager.syncProgressText)
-                                .font(.caption.weight(.medium))
-                                .foregroundColor(.primary)
-                                .lineLimit(1)
-                            Spacer()
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.accentColor.opacity(0.12))
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                    }
+                    InlineSyncProgressStrip(syncManager: syncManager, compact: false)
 
                     if vault.vaultURL == nil {
                         emptyVaultView
@@ -365,6 +352,9 @@ struct LibraryView: View {
             Button("Create") {
                 try? vault.createFolder(name: newFolderName, inFolder: currentFolder)
                 newFolderName = ""
+                if syncManager.config.isConnected && syncManager.config.autoSync {
+                    Task { _ = await syncManager.syncVault(vault: vault, force: true) }
+                }
             }
             Button("Cancel", role: .cancel) { newFolderName = "" }
         }
@@ -397,6 +387,25 @@ struct LibraryView: View {
                 renamingItem = nil
             }
             Button("Cancel", role: .cancel) { renamingItem = nil }
+        }
+        .alert("Move Folder to Trash?", isPresented: Binding(
+            get: { deletingFolder != nil },
+            set: { if !$0 { deletingFolder = nil } }
+        )) {
+            Button("Move to Trash", role: .destructive) {
+                if let folder = deletingFolder {
+                    deleteFolderAndSyncTrash(folder)
+                }
+                deletingFolder = nil
+            }
+            Button("Cancel", role: .cancel) { deletingFolder = nil }
+        } message: {
+            if let folder = deletingFolder {
+                let countDesc = folder.pdfCount > 0 ? " (including \(folder.pdfCount) document\(folder.pdfCount == 1 ? "" : "s"))" : ""
+                Text(syncManager.config.isConnected
+                     ? "Removes \"\(folder.name)\"\(countDesc) locally and moves it to .PencilInk-Trash on Google Drive (auto-deleted after 120 days)."
+                     : "Removes \"\(folder.name)\"\(countDesc) from your vault.")
+            }
         }
         .fileImporter(
             isPresented: $showImporter,
@@ -462,12 +471,19 @@ struct LibraryView: View {
                 }
 
                 ForEach(visibleFolders) { folder in
-                    GoodnotesFolderTile(folder: folder) {
-                        withAnimation(.easeOut(duration: 0.18)) {
-                            currentFolder = folder.relativePath
+                    GoodnotesFolderTile(
+                        folder: folder,
+                        onOpen: {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                currentFolder = folder.relativePath
+                            }
+                            Haptics.selection()
+                        },
+                        onDelete: {
+                            deletingFolder = folder
+                            Haptics.light()
                         }
-                        Haptics.selection()
-                    }
+                    )
                 }
 
                 ForEach(visiblePDFs) { item in
@@ -490,9 +506,7 @@ struct LibraryView: View {
                             Haptics.light()
                         },
                         onDelete: {
-                            tabManager.handleDeletedDocument(relativePath: item.relativePath)
-                            try? vault.deletePDF(item)
-                            Haptics.light()
+                            deletePDFAndSyncTrash(item)
                         }
                     )
                 }
@@ -538,31 +552,47 @@ struct LibraryView: View {
             if !visibleFolders.isEmpty {
                 Section("Folders") {
                     ForEach(visibleFolders) { folder in
-                        Button {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                currentFolder = folder.relativePath
-                            }
-                            Haptics.selection()
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "folder.fill")
-                                    .font(.system(size: 22))
-                                    .foregroundColor(Color(red: 0.27, green: 0.65, blue: 0.96))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(folder.name)
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .foregroundColor(.primary)
-                                    Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "document" : "documents")")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                        HStack(spacing: 12) {
+                            Button {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    currentFolder = folder.relativePath
                                 }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
+                                Haptics.selection()
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "folder.fill")
+                                        .font(.system(size: 22))
+                                        .foregroundColor(Color(red: 0.27, green: 0.65, blue: 0.96))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(folder.name)
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .foregroundColor(.primary)
+                                        Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "document" : "documents")")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            Menu {
+                                Button {
+                                    withAnimation(.easeOut(duration: 0.18)) {
+                                        currentFolder = folder.relativePath
+                                    }
+                                } label: { Label("Open Folder", systemImage: "folder") }
+                                Divider()
+                                Button(role: .destructive) {
+                                    deletingFolder = folder
+                                } label: { Label("Move Folder to Trash", systemImage: "trash") }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                                    .font(.system(size: 18))
                                     .foregroundColor(.secondary)
                             }
-                            .padding(.vertical, 3)
                         }
+                        .padding(.vertical, 3)
                     }
                 }
             }
@@ -610,9 +640,8 @@ struct LibraryView: View {
                             Button { try? vault.duplicatePDF(item) } label: { Label("Duplicate", systemImage: "doc.on.doc") }
                             Divider()
                             Button(role: .destructive) {
-                                tabManager.handleDeletedDocument(relativePath: item.relativePath)
-                                try? vault.deletePDF(item)
-                            } label: { Label("Delete", systemImage: "trash") }
+                                deletePDFAndSyncTrash(item)
+                            } label: { Label("Move to Trash", systemImage: "trash") }
                         } label: {
                             Image(systemName: "ellipsis.circle")
                                 .font(.system(size: 18))
@@ -756,6 +785,30 @@ struct LibraryView: View {
         )
     }
 
+    private func deletePDFAndSyncTrash(_ item: PDFItem) {
+        let rel = item.relativePath
+        tabManager.handleDeletedDocument(relativePath: rel)
+        try? vault.deletePDF(item)
+        Haptics.light()
+        Task { _ = await syncManager.deleteFileOnDrive(relativePath: rel) }
+    }
+
+    private func deleteFolderAndSyncTrash(_ folder: FolderItem) {
+        let relFolder = folder.relativePath
+        tabManager.handleDeletedFolder(relativeFolder: relFolder)
+        let deletedPDFs = (try? vault.deleteFolder(folder)) ?? []
+        if currentFolder == relFolder || currentFolder.hasPrefix(relFolder + "/") {
+            currentFolder = ""
+        }
+        Haptics.light()
+        Task {
+            _ = await syncManager.deleteFolderOnDrive(
+                relativeFolderPath: relFolder,
+                containedPDFRelativePaths: deletedPDFs
+            )
+        }
+    }
+
     private func triggerSmartVaultSyncIfReady() {
         guard vault.vaultURL != nil, syncManager.config.isConnected else { return }
         Task {
@@ -830,10 +883,11 @@ struct LibraryView: View {
 private struct GoodnotesFolderTile: View {
     let folder: FolderItem
     let onOpen: () -> Void
+    let onDelete: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
-            VStack(spacing: 10) {
+        VStack(spacing: 10) {
+            Button(action: onOpen) {
                 Color.clear
                     .frame(height: 176)
                     .overlay(alignment: .bottom) {
@@ -841,21 +895,39 @@ private struct GoodnotesFolderTile: View {
                             .frame(maxWidth: 148, maxHeight: 122)
                             .padding(.bottom, 6)
                     }
-
-                VStack(spacing: 2) {
-                    Text(folder.name)
-                        .font(.system(size: 13.5, weight: .medium))
-                        .foregroundColor(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                    Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "item" : "items")")
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.secondary)
-                }
+                    .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button { onOpen() } label: { Label("Open Folder", systemImage: "folder") }
+                Divider()
+                Button(role: .destructive) { onDelete() } label: { Label("Move Folder to Trash", systemImage: "trash") }
+            }
+
+            VStack(spacing: 2) {
+                Menu {
+                    Button { onOpen() } label: { Label("Open Folder", systemImage: "folder") }
+                    Divider()
+                    Button(role: .destructive) { onDelete() } label: { Label("Move Folder to Trash", systemImage: "trash") }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(folder.name)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundColor(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Text("\(folder.pdfCount) \(folder.pdfCount == 1 ? "item" : "items")")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.secondary)
+            }
         }
-        .buttonStyle(.plain)
     }
 }
 

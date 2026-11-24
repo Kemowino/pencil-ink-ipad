@@ -35,7 +35,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         // Delay initial background vault sync by 6 seconds so launch stays cool & instant
         if syncManager.config.isConnected && vault.vaultURL != nil && MacPreferences.shared.syncMode == .smart {
             let t = DispatchSource.makeTimerSource(queue: .main)
-            t.schedule(deadline: .now() + .seconds(6), leeway: .seconds(2))
+            t.schedule(deadline: .now() + .seconds(3), leeway: .seconds(2))
             t.setEventHandler { [weak self] in
                 guard let self else { return }
                 self.startupSyncTimer?.cancel()

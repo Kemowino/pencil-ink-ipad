@@ -110,6 +110,8 @@ struct NotebookScreen: View {
             // Row 1: Goodnotes Primary Document Bar
             goodnotesPrimaryBar
 
+            InlineSyncProgressStrip(syncManager: syncManager, compact: true)
+
             Rectangle()
                 .fill(hairlineColor)
                 .frame(height: 0.5)

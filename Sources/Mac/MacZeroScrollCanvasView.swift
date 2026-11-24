@@ -5,6 +5,7 @@ import QuartzCore
 
 @MainActor
 protocol MacZeroScrollCanvasDelegate: AnyObject {
+    func zeroCanvas(_ view: MacZeroScrollCanvasView, hasAnnotationsForPageKey key: String) -> Bool
     func zeroCanvas(_ view: MacZeroScrollCanvasView, strokesForPageKey key: String) -> [InkStroke]
     func zeroCanvas(_ view: MacZeroScrollCanvasView, textBoxesForPageKey key: String) -> [InkTextBox]
     func zeroCanvas(_ view: MacZeroScrollCanvasView, activeHiddenTextBoxIDForPageKey key: String) -> String?
@@ -175,9 +176,15 @@ final class MacZeroScrollCanvasView: NSView {
     private let selectionLayer = CAShapeLayer()
     private let overlayHostView = MacOverlayHostView()
     private let scrollbarThumbLayer = CALayer()
-    private let pagePillView = NSView()
-    private let pagePillLabel = NSTextField(labelWithString: "")
+    private let pagePillLayer = CALayer()
+    private let pagePillTextLayer = CATextLayer()
     private var lastPagePillText: String = ""
+    private var lastScrollbarFrame: CGRect = .zero
+    private var lastAppliedAlignedX: CGFloat = -.greatestFiniteMagnitude
+    private var lastAppliedAlignedY: CGFloat = -.greatestFiniteMagnitude
+    private var lastReconcileScrollY: CGFloat = -.greatestFiniteMagnitude
+    private var cachedBackingScale: CGFloat = 2.0
+    private var cachedColorSpace: CGColorSpace = CGColorSpaceCreateDeviceRGB()
 
     private var pdfURL: URL?
     private var pdfDocument: PDFDocument?
@@ -311,32 +318,30 @@ final class MacZeroScrollCanvasView: NSView {
         scrollbarThumbLayer.zPosition = 100
         layer?.addSublayer(scrollbarThumbLayer)
 
-        // Studio Craft Floating Page Pill (opaque CALayer, fades with scrollbar — 0 idle timers!)
-        pagePillView.wantsLayer = true
-        pagePillView.translatesAutoresizingMaskIntoConstraints = false
-        pagePillView.layer?.cornerRadius = 13
-        pagePillView.layer?.borderWidth = 0.8
-        pagePillView.layer?.backgroundColor = DesignTokens.nsElevatedPill.cgColor
-        pagePillView.layer?.borderColor = DesignTokens.nsHairline.cgColor
-        pagePillView.alphaValue = 0.0
-        pagePillView.isHidden = true
+        // Pure GPU CALayer/CATextLayer Floating Page Pill (0 NSView, 0 Auto Layout, 0 NSAnimationContext!)
+        let pillActions: [String: CAAction] = [
+            "frame": NSNull(), "bounds": NSNull(), "position": NSNull(),
+            "hidden": NSNull(), "opacity": NSNull(), "string": NSNull(),
+            "backgroundColor": NSNull(), "borderColor": NSNull()
+        ]
+        pagePillLayer.actions = pillActions
+        pagePillLayer.cornerRadius = 13
+        pagePillLayer.borderWidth = 0.8
+        pagePillLayer.isOpaque = true
+        pagePillLayer.backgroundColor = DesignTokens.nsElevatedPill.cgColor
+        pagePillLayer.borderColor = DesignTokens.nsPageBorder.cgColor
+        pagePillLayer.opacity = 0.0
+        pagePillLayer.isHidden = true
+        pagePillLayer.zPosition = 101
 
-        pagePillLabel.translatesAutoresizingMaskIntoConstraints = false
-        pagePillLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
-        pagePillLabel.textColor = .labelColor
-        pagePillLabel.alignment = .center
-        pagePillView.addSubview(pagePillLabel)
-        addSubview(pagePillView)
-
-        NSLayoutConstraint.activate([
-            pagePillView.centerXAnchor.constraint(equalTo: centerXAnchor),
-            pagePillView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
-            pagePillView.heightAnchor.constraint(equalToConstant: 26),
-
-            pagePillLabel.leadingAnchor.constraint(equalTo: pagePillView.leadingAnchor, constant: 13),
-            pagePillLabel.trailingAnchor.constraint(equalTo: pagePillView.trailingAnchor, constant: -13),
-            pagePillLabel.centerYAnchor.constraint(equalTo: pagePillView.centerYAnchor)
-        ])
+        pagePillTextLayer.actions = pillActions
+        pagePillTextLayer.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        pagePillTextLayer.fontSize = 11.5
+        pagePillTextLayer.foregroundColor = NSColor.labelColor.cgColor
+        pagePillTextLayer.alignmentMode = .center
+        pagePillTextLayer.contentsScale = 2.0
+        pagePillLayer.addSublayer(pagePillTextLayer)
+        layer?.addSublayer(pagePillLayer)
     }
 
     override func viewDidMoveToWindow() {
@@ -344,15 +349,29 @@ final class MacZeroScrollCanvasView: NSView {
         if window == nil {
             teardownDisplayLink()
             cancelSettleTimer()
+        } else {
+            refreshCachedDisplayProperties()
         }
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        refreshCachedDisplayProperties()
+    }
+
+    private func refreshCachedDisplayProperties() {
+        cachedBackingScale = max(1.0, window?.backingScaleFactor ?? 2.0)
+        cachedColorSpace = MacIOSurfacePool.preferredDisplayColorSpace(for: window?.screen)
+        pagePillTextLayer.contentsScale = cachedBackingScale
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         layer?.backgroundColor = Self.backdropColor.cgColor
         scrollbarThumbLayer.backgroundColor = NSColor.labelColor.withAlphaComponent(0.34).cgColor
-        pagePillView.layer?.backgroundColor = DesignTokens.nsElevatedPill.cgColor
-        pagePillView.layer?.borderColor = DesignTokens.nsHairline.cgColor
+        pagePillLayer.backgroundColor = DesignTokens.nsElevatedPill.cgColor
+        pagePillLayer.borderColor = DesignTokens.nsPageBorder.cgColor
+        pagePillTextLayer.foregroundColor = NSColor.labelColor.cgColor
         let borderCG = DesignTokens.nsPageBorder.cgColor
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -494,10 +513,13 @@ final class MacZeroScrollCanvasView: NSView {
         showScrollbarIfNeeded()
         applyViewportPositions()
 
-        let skipDrafts = smoothedVelocityVPPerSec > 2.6
-        reconcileVisiblePages(tier: .draft, allowVelocitySkip: skipDrafts, forceOverlayCheck: false)
+        if abs(scrollY - lastReconcileScrollY) >= 48.0 || activeLayers.isEmpty {
+            lastReconcileScrollY = scrollY
+            let skipDrafts = smoothedVelocityVPPerSec > 2.0
+            reconcileVisiblePages(tier: .draft, allowVelocitySkip: skipDrafts, forceOverlayCheck: false)
+        }
 
-        if (now - lastHUDNotifyTime) >= 0.20 {
+        if (now - lastHUDNotifyTime) >= 0.35 {
             lastHUDNotifyTime = now
             updateCurrentPageFromViewport(forceNotify: false)
         }
@@ -559,6 +581,16 @@ final class MacZeroScrollCanvasView: NSView {
         cancelSettleTimer()
         flushPendingPagePersistence()
         clearSelection()
+        scrollbarVisible = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scrollbarThumbLayer.removeAnimation(forKey: "fadeOut")
+        scrollbarThumbLayer.isHidden = true
+        scrollbarThumbLayer.opacity = 0.0
+        pagePillLayer.removeAnimation(forKey: "fadeOut")
+        pagePillLayer.isHidden = true
+        pagePillLayer.opacity = 0.0
+        CATransaction.commit()
         teardownAllActivePages()
         renderer.hibernate()
     }
@@ -621,10 +653,14 @@ final class MacZeroScrollCanvasView: NSView {
         scrollY = max(0, min(maxScrollY(), centerFrac * newDocH - bounds.height * 0.5))
         scrollX = max(0, min(maxScrollX(), (contentSize.width - bounds.width) * 0.5))
 
+        lastAppliedAlignedX = -.greatestFiniteMagnitude
+        lastAppliedAlignedY = -.greatestFiniteMagnitude
+        lastReconcileScrollY = -.greatestFiniteMagnitude
         applyViewportPositions()
         if currentSelection != nil { updateSelectionHighlightPath() }
-        reconcileVisiblePages(tier: .draft, allowVelocitySkip: false, forceOverlayCheck: true)
-        schedulePostScrollRetinaUpgrade(delayMs: 100)
+        // Single-Pass Zoom Commit: keep GPU-scaled textures on screen & go straight to ONE Retina pass!
+        reconcileVisiblePages(tier: .draft, allowVelocitySkip: true, forceOverlayCheck: true)
+        schedulePostScrollRetinaUpgrade(delayMs: 140)
     }
 
     func goToPage(at index: Int, triggerSettle: Bool = true) {
@@ -705,6 +741,7 @@ final class MacZeroScrollCanvasView: NSView {
         worldLayer.bounds = CGRect(origin: .zero, size: newSize)
         selectionLayer.frame = worldLayer.bounds
         CATransaction.commit()
+        if !pagePillLayer.isHidden { updateFloatingPagePillText() }
 
         guard abs(newSize.width - lastViewportWidth) > 1.5 || contentSize == .zero else {
             applyViewportPositions()
@@ -844,6 +881,10 @@ final class MacZeroScrollCanvasView: NSView {
 
         lastVisibleLo = -1
         lastVisibleHi = -1
+        lastAppliedAlignedX = -.greatestFiniteMagnitude
+        lastAppliedAlignedY = -.greatestFiniteMagnitude
+        lastReconcileScrollY = -.greatestFiniteMagnitude
+        lastScrollbarFrame = .zero
     }
 
     private func maxScrollX() -> CGFloat {
@@ -855,7 +896,7 @@ final class MacZeroScrollCanvasView: NSView {
     }
 
     private func alignedScrollOrigin() -> (x: CGFloat, y: CGFloat) {
-        let backing = max(1.0, window?.backingScaleFactor ?? 2.0)
+        let backing = cachedBackingScale
         return (
             (scrollX * backing).rounded() / backing,
             (scrollY * backing).rounded() / backing
@@ -867,6 +908,11 @@ final class MacZeroScrollCanvasView: NSView {
         scrollX = max(0, min(maxScrollX(), scrollX))
         scrollY = max(0, min(maxScrollY(), scrollY))
         let aligned = alignedScrollOrigin()
+        if !isLiveZooming && aligned.x == lastAppliedAlignedX && aligned.y == lastAppliedAlignedY && CATransform3DIsIdentity(worldLayer.transform) {
+            return
+        }
+        lastAppliedAlignedX = aligned.x
+        lastAppliedAlignedY = aligned.y
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -930,37 +976,52 @@ final class MacZeroScrollCanvasView: NSView {
         let progress = scrollY / maxY
         let thumbY = scrollbarInset + ((trackH - thumbH) * progress).rounded()
         let thumbX = bounds.width - scrollbarWidth - scrollbarInset
-        scrollbarThumbLayer.frame = CGRect(x: thumbX, y: thumbY, width: scrollbarWidth, height: thumbH)
+        let newFrame = CGRect(x: thumbX, y: thumbY, width: scrollbarWidth, height: thumbH)
+        if newFrame != lastScrollbarFrame {
+            lastScrollbarFrame = newFrame
+            scrollbarThumbLayer.frame = newFrame
+        }
     }
 
     private func updateFloatingPagePillText() {
         guard !slots.isEmpty else { return }
         let cur = min(slots.count, max(1, currentPageIndex + 1))
         let text = "Page \(cur) of \(slots.count)"
+        let pillW = max(92.0, CGFloat(text.count) * 7.2 + 24.0).rounded()
+        let pillH: CGFloat = 26.0
+        let pillFrame = CGRect(
+            x: ((bounds.width - pillW) * 0.5).rounded(),
+            y: bounds.height - pillH - 14.0,
+            width: pillW,
+            height: pillH
+        )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         if text != lastPagePillText {
             lastPagePillText = text
-            pagePillLabel.stringValue = text
+            pagePillTextLayer.string = text
         }
+        if pagePillLayer.frame != pillFrame {
+            pagePillLayer.frame = pillFrame
+            pagePillTextLayer.frame = CGRect(x: 0, y: 5, width: pillW, height: 16)
+        }
+        CATransaction.commit()
     }
 
     private func showScrollbarIfNeeded() {
         guard !scrollbarVisible, maxScrollY() > 8, bounds.height > 60 else { return }
         scrollbarVisible = true
+        updateFloatingPagePillText()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         scrollbarThumbLayer.removeAnimation(forKey: "fadeOut")
         scrollbarThumbLayer.isHidden = false
         scrollbarThumbLayer.opacity = 1.0
+        pagePillLayer.removeAnimation(forKey: "fadeOut")
+        pagePillLayer.isHidden = false
+        pagePillLayer.opacity = 1.0
         updateScrollbarThumbGeometry()
         CATransaction.commit()
-
-        updateFloatingPagePillText()
-        pagePillView.isHidden = false
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.14
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            pagePillView.animator().alphaValue = 0.96
-        }
     }
 
     private func hideScrollbarSmoothly() {
@@ -973,21 +1034,12 @@ final class MacZeroScrollCanvasView: NSView {
         fade.fillMode = .forwards
         fade.isRemovedOnCompletion = false
         scrollbarThumbLayer.add(fade, forKey: "fadeOut")
+        pagePillLayer.add(fade, forKey: "fadeOut")
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         scrollbarThumbLayer.opacity = 0.0
+        pagePillLayer.opacity = 0.0
         CATransaction.commit()
-
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.26
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            pagePillView.animator().alphaValue = 0.0
-        }, completionHandler: { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, !self.scrollbarVisible else { return }
-                self.pagePillView.isHidden = true
-            }
-        })
     }
 
     // MARK: - VSync-Coalesced Scroll & Pinch-to-Zoom
@@ -1065,7 +1117,16 @@ final class MacZeroScrollCanvasView: NSView {
         beginLiveZoomIfNeeded()
         let clamped = max(0.30, min(5.0, targetScale))
         liveZoomRatio = clamped / max(0.01, liveZoomBaseScale)
-        applyViewportPositions()
+        let cx = bounds.width * 0.5
+        let cy = bounds.height * 0.5
+        var t = CATransform3DIdentity
+        t = CATransform3DTranslate(t, cx, cy, 0)
+        t = CATransform3DScale(t, liveZoomRatio, liveZoomRatio, 1.0)
+        t = CATransform3DTranslate(t, -cx, -cy, 0)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        worldLayer.transform = t
+        CATransaction.commit()
     }
 
     func commitLiveZoom() {
@@ -1170,13 +1231,13 @@ final class MacZeroScrollCanvasView: NSView {
         }
 
         // 2. Mount & directionally render visible pages
-        let backing = max(1.0, window?.backingScaleFactor ?? 2.0)
+        let backing = cachedBackingScale
         let aligned = alignedScrollOrigin()
         let hq = MacPreferences.shared.highQualityImages
         let paperMode = MacPreferences.shared.paperMode
         let paperBG = isHobonichi ? HobonichiEngine.creamColor.cgColor : paperMode.paperColor.cgColor
         let borderCG = DesignTokens.nsPageBorder.cgColor
-        let cs = MacIOSurfacePool.preferredDisplayColorSpace(for: window?.screen)
+        let cs = cachedColorSpace
         let docSnap: InkDocument? = isHobonichi ? docSnapshotProvider?() : nil
         let fitScale = computeFitScaleFactor()
         let isZoomedIn = scaleFactor > (fitScale * 1.15)
@@ -1259,7 +1320,7 @@ final class MacZeroScrollCanvasView: NSView {
             // Only spend Worker CPU on strictly visible pages + directional lookahead!
             guard idx >= renderLo && idx <= renderHi else { continue }
             // Skip prefetching offscreen lookahead page during brisk scrolling (> 1.4 vp/s)
-            if !isStrictlyVisible && smoothedVelocityVPPerSec > 1.4 { continue }
+            if !isStrictlyVisible && (displayLinkActive || smoothedVelocityVPPerSec > 0.6) { continue }
 
             renderer.requestRender(
                 tier: effectiveTier,
@@ -1289,8 +1350,17 @@ final class MacZeroScrollCanvasView: NSView {
     private func mountOverlayIfNeeded(for idx: Int, alignedX: CGFloat? = nil, alignedY: CGFloat? = nil) {
         guard idx >= 0 && idx < slots.count && idx < pageFrames.count else { return }
         let slot = slots[idx]
-        let strokes = canvasDelegate?.zeroCanvas(self, strokesForPageKey: slot.key) ?? []
-        let texts = canvasDelegate?.zeroCanvas(self, textBoxesForPageKey: slot.key) ?? []
+        let hasAnn = canvasDelegate?.zeroCanvas(self, hasAnnotationsForPageKey: slot.key) ?? false
+        if toolMode == .read && !hasAnn {
+            if let existing = activeOverlays.removeValue(forKey: idx) {
+                canvasDelegate?.zeroCanvas(self, willUnmountOverlay: existing)
+                existing.removeFromSuperview()
+            }
+            overlayHostView.isHidden = activeOverlays.isEmpty
+            return
+        }
+        let strokes = hasAnn ? (canvasDelegate?.zeroCanvas(self, strokesForPageKey: slot.key) ?? []) : []
+        let texts = hasAnn ? (canvasDelegate?.zeroCanvas(self, textBoxesForPageKey: slot.key) ?? []) : []
         let hiddenID = canvasDelegate?.zeroCanvas(self, activeHiddenTextBoxIDForPageKey: slot.key)
         let needsOverlay = (toolMode != .read) || !strokes.isEmpty || !texts.isEmpty || (hiddenID != nil)
 
@@ -1345,6 +1415,10 @@ final class MacZeroScrollCanvasView: NSView {
         overlayHostView.isHidden = true
         lastVisibleLo = -1
         lastVisibleHi = -1
+        lastAppliedAlignedX = -.greatestFiniteMagnitude
+        lastAppliedAlignedY = -.greatestFiniteMagnitude
+        lastReconcileScrollY = -.greatestFiniteMagnitude
+        lastScrollbarFrame = .zero
     }
 
     // MARK: - Single-Shot Coalesced Settle Timer (Zero Repeating Timers, 0 Wakeups at Idle!)

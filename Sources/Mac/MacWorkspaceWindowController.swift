@@ -68,9 +68,65 @@ final class MacTabSession: Identifiable {
 ///   (0.0% CPU, 0 wakeups/s, 0 MB active `IOSurface` VRAM for every background tab).
 /// Appearance-aware opaque tab strip container (0% live blur overhead, updates immediately on Dark/Light toggle).
 private final class MacTabStripContainerView: NSView {
+    let syncProgressLayer = CALayer()
+    private var currentFraction: CGFloat = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        syncProgressLayer.backgroundColor = DesignTokens.nsAccent.cgColor
+        syncProgressLayer.anchorPoint = .zero
+        syncProgressLayer.zPosition = 50
+        syncProgressLayer.isHidden = true
+        layer?.addSublayer(syncProgressLayer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        updateProgressFrame(animated: false)
+    }
+
+    func setSyncProgress(active: Bool, fraction: Double) {
+        if !active {
+            currentFraction = 0
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            syncProgressLayer.isHidden = true
+            syncProgressLayer.frame = CGRect(x: 0, y: 0, width: 0, height: 2.5)
+            CATransaction.commit()
+            return
+        }
+        let target: CGFloat = fraction < 0 ? 0.25 : max(0.04, min(1.0, CGFloat(fraction)))
+        currentFraction = target
+        if syncProgressLayer.isHidden {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            syncProgressLayer.isHidden = false
+            syncProgressLayer.backgroundColor = DesignTokens.nsAccent.cgColor
+            syncProgressLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * target, height: 2.5)
+            CATransaction.commit()
+        } else {
+            updateProgressFrame(animated: true)
+        }
+    }
+
+    private func updateProgressFrame(animated: Bool) {
+        guard !syncProgressLayer.isHidden else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        CATransaction.setAnimationDuration(0.18)
+        syncProgressLayer.frame = CGRect(x: 0, y: 0, width: (bounds.width * currentFraction).rounded(), height: 2.5)
+        CATransaction.commit()
+    }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         layer?.backgroundColor = DesignTokens.nsChromeSecondary.cgColor
+        syncProgressLayer.backgroundColor = DesignTokens.nsAccent.cgColor
     }
 }
 
@@ -400,6 +456,12 @@ final class MacWorkspaceWindowController: NSWindowController,
         libraryVC.onOpenSyncSettings = { [weak self] in
             self?.onRequestOpenSyncSettings?()
         }
+        libraryVC.onWillDeletePaths = { [weak self] relPaths in
+            self?.closeTabsMatchingRelativePaths(relPaths)
+        }
+        syncManager.onRemoteDeletedPath = { [weak self] relPath, isFolder in
+            self?.closeTabsForRemoteDelete(relativePath: relPath, isFolder: isFolder)
+        }
     }
 
     private func setupObservers() {
@@ -422,10 +484,40 @@ final class MacWorkspaceWindowController: NSWindowController,
             object: nil
         )
         syncManager.$statusText
+            .combineLatest(
+                syncManager.$isTransferActive,
+                syncManager.$syncProgressFraction,
+                syncManager.$syncPhaseLabel
+            )
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] text in
+            .sink { [weak self] text, active, frac, phase in
                 guard let self else { return }
-                self.syncButton.toolTip = "Google Drive: \(text)"
+                let speed = self.syncManager.syncSpeedText
+                let tipBase = phase.isEmpty ? "Google Drive: \(text)" : phase
+                self.syncButton.toolTip = speed.isEmpty ? tipBase : "\(tipBase) (\(speed)) — Click to pause/manage"
+
+                self.tabStripContainer.setSyncProgress(active: active, fraction: frac)
+
+                if active {
+                    let pctText: String
+                    if frac >= 0 {
+                        let pct = Int((frac * 100.0).rounded())
+                        pctText = speed.isEmpty ? " \(pct)%" : " \(pct)% · \(speed)"
+                    } else {
+                        pctText = " Syncing…"
+                    }
+                    self.syncButton.imagePosition = .imageLeading
+                    self.syncButton.title = pctText
+                    self.syncButton.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+                    self.syncButton.sizeToFit()
+                } else {
+                    if !self.syncButton.title.isEmpty {
+                        self.syncButton.title = ""
+                        self.syncButton.imagePosition = .imageOnly
+                        self.syncButton.sizeToFit()
+                    }
+                }
+
                 let st = self.syncManager.visualState
                 if self.lastSyncVisualState != st {
                     self.lastSyncVisualState = st
@@ -546,6 +638,29 @@ final class MacWorkspaceWindowController: NSWindowController,
         }
     }
 
+    func closeTabsMatchingRelativePaths(_ relativePaths: [String]) {
+        let lowerSet = Set(relativePaths.map { $0.lowercased() })
+        let matchingIDs = tabs.filter { !$0.isLibrary && lowerSet.contains($0.relativePath.lowercased()) }.map { $0.id }
+        for tid in matchingIDs {
+            if let s = tabs.first(where: { $0.id == tid }) { s.isDirty = false }
+            closeTab(id: tid)
+        }
+    }
+
+    func closeTabsForRemoteDelete(relativePath: String, isFolder: Bool) {
+        let low = relativePath.lowercased()
+        let prefix = low + "/"
+        let matchingIDs = tabs.filter { tab in
+            guard !tab.isLibrary else { return false }
+            let tl = tab.relativePath.lowercased()
+            return isFolder ? (tl.hasPrefix(prefix) || tl == low) : (tl == low)
+        }.map { $0.id }
+        for tid in matchingIDs {
+            if let s = tabs.first(where: { $0.id == tid }) { s.isDirty = false }
+            closeTab(id: tid)
+        }
+    }
+
     func switchToTab(id: String) {
         guard let target = tabs.first(where: { $0.id == id }) else { return }
 
@@ -574,6 +689,7 @@ final class MacWorkspaceWindowController: NSWindowController,
             ])
             window?.title = "Pencil Ink — Library"
             updateReaderToolbarState(isReader: false)
+            scheduleNextIdleCheck(stage: 0)
         } else {
             libraryVC.setTabActive(false)
             let splitView = readerSplitVC.view
@@ -934,6 +1050,13 @@ final class MacWorkspaceWindowController: NSWindowController,
     }
 
     // MARK: - MacZeroScrollCanvasDelegate
+
+    func zeroCanvas(_ view: MacZeroScrollCanvasView, hasAnnotationsForPageKey key: String) -> Bool {
+        guard let doc = activeReaderSession?.inkDoc else { return false }
+        if let s = doc.pages[key], !s.isEmpty { return true }
+        if let t = doc.texts[key], !t.isEmpty { return true }
+        return activeTextEditor?.pageKey == key
+    }
 
     func zeroCanvas(_ view: MacZeroScrollCanvasView, strokesForPageKey key: String) -> [InkStroke] {
         activeReaderSession?.inkDoc.pages[key] ?? []
@@ -1485,7 +1608,7 @@ final class MacWorkspaceWindowController: NSWindowController,
         let textTotal = session.inkDoc.texts.values.reduce(0) { $0 + $1.count }
         let fileName = session.pdfURL?.lastPathComponent ?? session.title
         let cal = MacEnergyImpactCalibrator.shared.weights.sourceDescription
-        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-VSync-v5.0, Cal=\(cal))"
+        return "\(fileName) (\(count) pages, \(strokeTotal) strokes, \(textTotal) text boxes, Engine=IOSurface-LZ4-Sub5-v5.1, Cal=\(cal))"
     }
 
     func diagnosticsPageCount() -> Int { activeReaderSession?.virtualResult?.slots.count ?? 0 }
@@ -1631,12 +1754,36 @@ final class MacWorkspaceWindowController: NSWindowController,
             onRequestOpenSyncSettings?()
             return
         }
+        if syncManager.isTransferActive {
+            let m = NSMenu()
+            let phase = syncManager.syncPhaseLabel.isEmpty ? "Sync in progress…" : syncManager.syncPhaseLabel
+            let infoItem = NSMenuItem(title: phase, action: nil, keyEquivalent: "")
+            infoItem.isEnabled = false
+            m.addItem(infoItem)
+            m.addItem(.separator())
+            let pauseItem = NSMenuItem(title: "Pause Transfer (Resumes at 8 MB Chunk)", action: #selector(pauseTransferAction), keyEquivalent: "")
+            pauseItem.target = self
+            m.addItem(pauseItem)
+            let settingsItem = NSMenuItem(title: "Google Drive Settings…", action: #selector(openSyncSettingsFromMenu), keyEquivalent: "")
+            settingsItem.target = self
+            m.addItem(settingsItem)
+            m.popUp(positioning: nil, at: NSPoint(x: 0, y: syncButton.bounds.height + 4), in: syncButton)
+            return
+        }
         if let session = activeReaderSession {
             saveSessionNow(session, flushDriveImmediately: false)
             triggerDriveSync(for: session, forceFolderScan: true)
         } else if vault.vaultURL != nil {
             Task { _ = await syncManager.syncVault(vault: vault, force: true) }
         }
+    }
+
+    @objc private func pauseTransferAction() {
+        syncManager.cancelActiveTransfer()
+    }
+
+    @objc private func openSyncSettingsFromMenu() {
+        onRequestOpenSyncSettings?()
     }
 
     @objc private func openDiagnosticsAction() {
@@ -1692,7 +1839,7 @@ final class MacWorkspaceWindowController: NSWindowController,
             self.saveSessionNow(session, flushDriveImmediately: false)
         }
         saveWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: item)
     }
 
     func saveAllDirtySessionsBeforeTerminate() {
@@ -1735,7 +1882,7 @@ final class MacWorkspaceWindowController: NSWindowController,
                     self.syncManager.scheduleBookSync(
                         pdfURL: targetURL,
                         relativePath: rel,
-                        delaySeconds: 4.0,
+                        delaySeconds: 1.6,
                         localDocProvider: { [weak session] in session?.inkDoc ?? snapshot },
                         onMerged: { [weak self, weak session] merged in
                             guard let self, let session else { return }
@@ -1792,31 +1939,60 @@ final class MacWorkspaceWindowController: NSWindowController,
         idleCheckTimer = nil
     }
 
+    /// Foreground-only Adaptive Changes-API Pulse (~300 B when idle, 0 folder scans when unchanged!):
+    /// - Active collaboration (stages 0..4): every 6s -> iPad strokes appear on MacBook in <10 seconds!
+    /// - Calm (stages 5..8): every 15s
+    /// - Idle (stages 9..12): every 45s
+    /// - Deep idle (stage 13+): every 180s (pauses completely when window is occluded/minimized!)
     private func scheduleNextIdleCheck(stage: Int) {
         cancelIdleCheckTimer()
         guard syncManager.config.isConnected,
               syncManager.config.autoSync,
-              MacPreferences.shared.syncMode == .smart,
-              activeReaderSession != nil else { return }
+              MacPreferences.shared.syncMode == .smart else { return }
         if let win = window, !win.occlusionState.contains(.visible) { return }
-        let delaysSec: [Int] = [180, 600]
-        guard stage >= 0 && stage < delaysSec.count else { return }
+
+        let baseDelay: Int
+        if stage < 5 { baseDelay = 6 }
+        else if stage < 9 { baseDelay = 15 }
+        else if stage < 13 { baseDelay = 45 }
+        else { baseDelay = 180 }
+        let delaySec = ProcessInfo.processInfo.isLowPowerModeEnabled ? (baseDelay * 2) : baseDelay
+        let leewaySec = max(1, min(10, delaySec / 3))
+
         let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + .seconds(delaysSec[stage]), leeway: .seconds(15))
+        t.schedule(deadline: .now() + .seconds(delaySec), leeway: .seconds(leewaySec))
         t.setEventHandler { [weak self] in
             guard let self else { return }
             self.cancelIdleCheckTimer()
             Task { @MainActor in
-                guard let session = self.activeReaderSession,
-                      !session.isDirty,
-                      self.activeTextEditor == nil,
-                      self.window?.occlusionState.contains(.visible) == true,
+                guard self.window?.occlusionState.contains(.visible) == true,
                       self.syncManager.config.isConnected,
+                      self.syncManager.config.autoSync,
                       MacPreferences.shared.syncMode == .smart else {
                     return
                 }
-                self.triggerDriveSync(for: session, forceFolderScan: false) { [weak self] gotUpdate in
-                    self?.scheduleNextIdleCheck(stage: gotUpdate ? 0 : stage + 1)
+                if self.activeTextEditor != nil || (self.activeReaderSession?.isDirty == true) {
+                    self.scheduleNextIdleCheck(stage: 0)
+                    return
+                }
+                let activeRel = self.activeReaderSession?.relativePath
+                let check = await self.syncManager.checkDriveChangesLightly(forBookRelativePath: activeRel)
+                switch check {
+                case .bookChanged:
+                    if let session = self.activeReaderSession {
+                        self.triggerDriveSync(for: session, forceFolderScan: false) { [weak self] _ in
+                            self?.scheduleNextIdleCheck(stage: 0)
+                        }
+                    } else {
+                        self.scheduleNextIdleCheck(stage: 0)
+                    }
+                case .vaultStructureChanged:
+                    if self.vault.vaultURL != nil {
+                        _ = await self.syncManager.syncVault(vault: self.vault, force: true)
+                    }
+                    self.scheduleNextIdleCheck(stage: 0)
+                case .noChanges, .failed:
+                    self.scheduleNextIdleCheck(stage: min(stage + 1, 14))
                 }
             }
         }
@@ -1830,21 +2006,38 @@ final class MacWorkspaceWindowController: NSWindowController,
         guard let win = window else { return }
         if !win.occlusionState.contains(.visible) {
             cancelIdleCheckTimer()
+        } else if idleCheckTimer == nil {
+            scheduleNextIdleCheck(stage: 0)
         }
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
-        guard let session = activeReaderSession,
-              session.isInitialInkLoaded,
-              activeTextEditor == nil,
+        guard activeTextEditor == nil,
               syncManager.config.isConnected,
               syncManager.config.autoSync,
               MacPreferences.shared.syncMode == .smart else { return }
         let now = Date()
-        let awayEnough = lastResignedAt.map { now.timeIntervalSince($0) >= 120.0 } ?? false
-        let stale = session.lastDriveCheckAt.map { now.timeIntervalSince($0) >= 120.0 } ?? false
-        if awayEnough || stale {
-            triggerDriveSync(for: session, forceFolderScan: true)
+        let awaySec = lastResignedAt.map { now.timeIntervalSince($0) } ?? 0
+        if awaySec >= 6.0 {
+            let activeRel = activeReaderSession?.relativePath
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let res = await self.syncManager.checkDriveChangesLightly(forBookRelativePath: activeRel)
+                switch res {
+                case .bookChanged:
+                    if let s = self.activeReaderSession, s.isInitialInkLoaded {
+                        self.triggerDriveSync(for: s, forceFolderScan: false)
+                    }
+                case .vaultStructureChanged:
+                    if self.vault.vaultURL != nil {
+                        _ = await self.syncManager.syncVault(vault: self.vault, force: true)
+                    }
+                case .noChanges, .failed:
+                    break
+                }
+                self.scheduleNextIdleCheck(stage: 0)
+            }
+        } else if idleCheckTimer == nil {
             scheduleNextIdleCheck(stage: 0)
         }
     }

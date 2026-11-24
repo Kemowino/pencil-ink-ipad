@@ -10,6 +10,7 @@ struct DriveFileMeta: Codable, Sendable {
     let size: String?
     let parents: [String]?
     let trashed: Bool?
+    let appProperties: [String: String]?
 }
 
 struct DriveConfig: Codable, Sendable {
@@ -55,8 +56,15 @@ struct RemoteVaultTree: Sendable {
     let pdfs: [RemotePDFFile]
     /// Relative paths (without `.ink.d`, e.g. `Folder/Book.pdf`) that have a remote `.ink.d` folder on Drive.
     let annotatedPDFPaths: Set<String>
-    /// Normalized lowercase filenames -> remote PDFs (for smart matching across nested roots).
     let folderIDByPath: [String: String]
+}
+
+struct DriveChangeDelta: Sendable {
+    let hasRelevantChanges: Bool
+    let hasVaultStructureChanges: Bool
+    let changedFileIDs: Set<String>
+    let changedParentIDs: Set<String>
+    let newStartPageToken: String
 }
 
 enum DriveClientError: LocalizedError {
@@ -64,6 +72,7 @@ enum DriveClientError: LocalizedError {
     case authExpired
     case apiError(status: Int, message: String)
     case invalidResponse
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -71,6 +80,7 @@ enum DriveClientError: LocalizedError {
         case .authExpired: return "Google sign-in expired. Please reconnect in Sync Settings."
         case .apiError(let status, let message): return "Drive error (\(status)): \(message)"
         case .invalidResponse: return "Unexpected response from Google Drive."
+        case .cancelled: return "Sync paused. Progress saved for instant resume."
         }
     }
 
@@ -81,31 +91,80 @@ enum DriveClientError: LocalizedError {
     }
 }
 
-/// Lightweight native Google Drive v3 client matching Obsidian Pencil Ink's exact OAuth2 PKCE & folder rules.
+private struct UploadCheckpoint: Codable {
+    var uploadURI: String
+    var fileSize: Int64
+    var fileMtimeSec: Int64
+    var name: String
+    var parentID: String
+    var createdAtMs: Int64
+}
+
+private struct DownloadCheckpoint: Codable {
+    var fileID: String
+    var md5Checksum: String
+    var modifiedTime: String
+    var totalBytes: Int64
+}
+
+/// Ultra-lean, battery-conscious Google Drive v3 client:
+/// - **Exact 8 MB (`8_388_608` B) Chunked Resumable Uploads** with `308 Resume Incomplete` & `Content-Range: bytes */total` fast resume.
+/// - **Exact 8 MB (`8_388_608` B) Chunked Byte-Range Downloads** with `.part` disk checkpoints & fast resume.
+/// - **Drive Changes API (`changes/startPageToken` + `changes/list`)** for ~300-byte sub-10s delta detection & single-book wake.
+/// - **`.PencilInk-Trash` Server-Side Move + 120-Day Automatic Retention Purge** (0 bytes transferred).
+/// - **HTTP/2 connection reuse + Gzip JSON responses** for minimum CPU, battery, and internet usage.
 actor GoogleDriveClient {
     static let scope = "https://www.googleapis.com/auth/drive"
     static let apiBase = "https://www.googleapis.com/drive/v3"
     static let uploadBase = "https://www.googleapis.com/upload/drive/v3"
     static let redirectURI = "http://127.0.0.1:8765"
     static let folderMime = "application/vnd.google-apps.folder"
-    static let fields = "id,name,mimeType,md5Checksum,modifiedTime,size,parents,trashed"
+    static let trashFolderName = ".PencilInk-Trash"
+    static let trashRetentionDays: Int = 120
+    /// Exact 8 MB (32 × 256 KB — strictly compliant with Google Drive API v3 resumable chunk rules).
+    static let chunkSizeBytes: Int64 = 8 * 1024 * 1024
+    static let fields = "id,name,mimeType,md5Checksum,modifiedTime,size,parents,trashed,appProperties"
 
     private(set) var config: DriveConfig
     private(set) var bytesUp: Int64 = 0
     private(set) var bytesDown: Int64 = 0
 
     private var rootFolderIDCache: (spec: String, id: String)?
+    private var trashFolderIDCache: (rootID: String, id: String)?
     private var dirIDCache: [String: String] = [:]
     private var metaCache: [String: DriveFileMeta] = [:]
+
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         cfg.urlCache = nil
+        cfg.httpMaximumConnectionsPerHost = 4
         cfg.timeoutIntervalForRequest = 35
-        cfg.timeoutIntervalForResource = 90
+        cfg.timeoutIntervalForResource = 120
+        cfg.allowsCellularAccess = true
+        cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
+        cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg)
     }()
+
     private var onConfigUpdated: @Sendable (DriveConfig) -> Void
+
+    private static let uploadStateDir: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("PencilInkNative/transfer-state", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static let partialDownloadDir: URL = {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = caches.appendingPathComponent("PencilInkPartialDownloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
 
     init(config: DriveConfig, onConfigUpdated: @escaping @Sendable (DriveConfig) -> Void) {
         self.config = config
@@ -115,10 +174,10 @@ actor GoogleDriveClient {
     func updateConfig(_ newConfig: DriveConfig) {
         if newConfig.driveFolder != config.driveFolder {
             rootFolderIDCache = nil
+            trashFolderIDCache = nil
             dirIDCache.removeAll()
         }
         var merged = newConfig
-        // Never overwrite a fresher refreshed access token with a stale cached one!
         if !config.refreshToken.isEmpty,
            merged.refreshToken == config.refreshToken,
            !config.accessToken.isEmpty,
@@ -137,7 +196,12 @@ actor GoogleDriveClient {
         (bytesUp, bytesDown)
     }
 
-    // MARK: - OAuth2 PKCE (Exact Same Flow as Obsidian Pencil Ink)
+    func invalidateFolderCaches() {
+        dirIDCache.removeAll()
+        metaCache.removeAll()
+    }
+
+    // MARK: - OAuth2 PKCE
 
     static func beginAuth(clientId: String) -> (url: URL, verifier: String)? {
         var raw = [UInt8](repeating: 0, count: 48)
@@ -249,47 +313,184 @@ actor GoogleDriveClient {
         return access
     }
 
-    // MARK: - Transport with Automatic Retry & Token Refresh
+    // MARK: - Transport with Automatic Retry, Gzip JSON & Token Refresh
 
     private func authedRequest(
         url: URL,
         method: String = "GET",
         contentType: String? = nil,
         body: Data? = nil,
+        extraHeaders: [String: String] = [:],
+        requestGzip: Bool = true,
         timeout: TimeInterval = 45
-    ) async throws -> (Data, Int) {
+    ) async throws -> (Data, Int, HTTPURLResponse?) {
         var attempt = 0
         while true {
+            try Task.checkCancellation()
             let token = try await ensureValidToken()
             var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
             req.httpMethod = method
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
             req.setValue("no-cache", forHTTPHeaderField: "Pragma")
+            if requestGzip {
+                req.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
+            } else {
+                req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            }
             if let ct = contentType {
                 req.setValue(ct, forHTTPHeaderField: "Content-Type")
             }
+            for (k, v) in extraHeaders {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
             req.httpBody = body
 
-            let (data, resp) = try await session.data(for: req)
-            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 401 && attempt < 1 {
-                config.expiresAt = 0
-                attempt += 1
-                continue
+            do {
+                let (data, resp) = try await session.data(for: req)
+                let http = resp as? HTTPURLResponse
+                let status = http?.statusCode ?? 0
+                if status == 401 && attempt < 1 {
+                    config.expiresAt = 0
+                    attempt += 1
+                    continue
+                }
+                if (status == 429 || status >= 500) && attempt < 3 {
+                    attempt += 1
+                    let delayNs = UInt64(600_000_000 * (1 << attempt))
+                    try await Task.sleep(nanoseconds: delayNs)
+                    continue
+                }
+                if status >= 200 && status < 400 {
+                    if let b = body { bytesUp += Int64(b.count) }
+                    bytesDown += Int64(data.count)
+                }
+                return (data, status, http)
+            } catch is CancellationError {
+                throw DriveClientError.cancelled
+            } catch {
+                if attempt < 2 && isTransientNetworkError(error) {
+                    attempt += 1
+                    let delayNs = UInt64(700_000_000 * (1 << attempt))
+                    try await Task.sleep(nanoseconds: delayNs)
+                    continue
+                }
+                throw error
             }
-            if (status == 429 || status >= 500) && attempt < 3 {
-                attempt += 1
-                let delayNs = UInt64(600_000_000 * (1 << attempt))
-                try? await Task.sleep(nanoseconds: delayNs)
-                continue
-            }
-            if status >= 200 && status < 400 {
-                if let b = body { bytesUp += Int64(b.count) }
-                bytesDown += Int64(data.count)
-            }
-            return (data, status)
         }
+    }
+
+    private func isTransientNetworkError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        guard ns.domain == NSURLErrorDomain else { return false }
+        switch ns.code {
+        case NSURLErrorTimedOut,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorNotConnectedToInternet,
+             NSURLErrorInternationalRoamingOff:
+            return true
+        default:
+            return false
+        }
+    }
+
+    // MARK: - Drive Changes API (~300-Byte Delta Check & Instant Single-Book Wake!)
+
+    func getStartPageToken() async throws -> String {
+        struct StartTokenResp: Codable { let startPageToken: String }
+        let url = URL(string: "\(Self.apiBase)/changes/startPageToken")!
+        let (data, status, _) = try await authedRequest(url: url, method: "GET")
+        guard status >= 200 && status < 300,
+              let decoded = try? JSONDecoder().decode(StartTokenResp.self, from: data) else {
+            throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+        }
+        return decoded.startPageToken
+    }
+
+    func listChangesSince(pageToken: String, ownDeviceLabel: String = "") async throws -> DriveChangeDelta {
+        struct ChangeEntry: Codable {
+            let fileId: String?
+            let removed: Bool?
+            let file: DriveFileMeta?
+        }
+        struct ChangesResp: Codable {
+            let nextPageToken: String?
+            let newStartPageToken: String?
+            let changes: [ChangeEntry]?
+        }
+
+        let ownLogPrefix = ownDeviceLabel.isEmpty ? "" : "log_\(ownDeviceLabel.lowercased())_"
+        let ownTxtName = ownDeviceLabel.isEmpty ? "" : "txt_\(ownDeviceLabel.lowercased()).json"
+
+        var token = pageToken
+        var latestStartToken = pageToken
+        var changedIDs = Set<String>()
+        var changedParentIDs = Set<String>()
+        var hasChanges = false
+        var hasStructureChanges = false
+        var pagesFetched = 0
+
+        while pagesFetched < 10 {
+            pagesFetched += 1
+            var comps = URLComponents(string: "\(Self.apiBase)/changes")!
+            comps.queryItems = [
+                URLQueryItem(name: "pageToken", value: token),
+                URLQueryItem(name: "pageSize", value: "200"),
+                URLQueryItem(name: "restrictToMyDrive", value: "true"),
+                URLQueryItem(name: "fields", value: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,trashed,parents))")
+            ]
+            let (data, status, _) = try await authedRequest(url: comps.url!, method: "GET")
+            guard status >= 200 && status < 300,
+                  let decoded = try? JSONDecoder().decode(ChangesResp.self, from: data) else {
+                throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+            }
+            if let list = decoded.changes, !list.isEmpty {
+                for c in list {
+                    if let f = c.file {
+                        metaCache[f.id] = f
+                        let nm = f.name.lowercased()
+                        // Ignore our own device's shard echoes so we don't trigger self-pulls!
+                        if (!ownLogPrefix.isEmpty && nm.hasPrefix(ownLogPrefix)) || (!ownTxtName.isEmpty && nm == ownTxtName) {
+                            continue
+                        }
+                        if let fid = c.fileId { changedIDs.insert(fid) }
+                        if let ps = f.parents {
+                            for p in ps { changedParentIDs.insert(p) }
+                        }
+                        if nm.hasPrefix("log_") || nm.hasPrefix("txt_") {
+                            hasChanges = true
+                        } else if f.mimeType == Self.folderMime
+                            || nm.hasSuffix(".pdf")
+                            || nm == ".trash-manifest.json"
+                            || f.trashed == true {
+                            hasChanges = true
+                            hasStructureChanges = true
+                        }
+                    } else if c.removed == true {
+                        if let fid = c.fileId { changedIDs.insert(fid) }
+                        hasChanges = true
+                        hasStructureChanges = true
+                    }
+                }
+            }
+            if let nst = decoded.newStartPageToken, !nst.isEmpty {
+                latestStartToken = nst
+            }
+            if let next = decoded.nextPageToken, !next.isEmpty {
+                token = next
+            } else {
+                break
+            }
+        }
+        return DriveChangeDelta(
+            hasRelevantChanges: hasChanges,
+            hasVaultStructureChanges: hasStructureChanges,
+            changedFileIDs: changedIDs,
+            changedParentIDs: changedParentIDs,
+            newStartPageToken: latestStartToken
+        )
     }
 
     // MARK: - Drive Folders & Files
@@ -303,7 +504,6 @@ actor GoogleDriveClient {
             return cached.id
         }
 
-        // Check if spec is a Drive folder link or raw folder ID
         if let linkRange = spec.range(of: #"folders/([A-Za-z0-9_-]{10,})"#, options: .regularExpression) {
             let sub = String(spec[linkRange]).replacingOccurrences(of: "folders/", with: "")
             rootFolderIDCache = (spec, sub)
@@ -322,6 +522,34 @@ actor GoogleDriveClient {
         let created = try await createFolder(name: spec, parentID: "root")
         rootFolderIDCache = (spec, created.id)
         return created.id
+    }
+
+    func ensureTrashFolderID() async throws -> String {
+        let rootID = try await resolveRootFolderID()
+        if let cached = trashFolderIDCache, cached.rootID == rootID {
+            return cached.id
+        }
+        let found = try await findChildren(parentID: rootID, name: Self.trashFolderName, mimeType: Self.folderMime)
+        if let existing = found.sorted(by: { $0.id < $1.id }).first {
+            trashFolderIDCache = (rootID, existing.id)
+            return existing.id
+        }
+        let made = try await createFolder(name: Self.trashFolderName, parentID: rootID)
+        trashFolderIDCache = (rootID, made.id)
+        return made.id
+    }
+
+    func findExistingTrashFolderID() async throws -> String? {
+        let rootID = try await resolveRootFolderID()
+        if let cached = trashFolderIDCache, cached.rootID == rootID {
+            return cached.id
+        }
+        let found = try await findChildren(parentID: rootID, name: Self.trashFolderName, mimeType: Self.folderMime)
+        if let existing = found.sorted(by: { $0.id < $1.id }).first {
+            trashFolderIDCache = (rootID, existing.id)
+            return existing.id
+        }
+        return nil
     }
 
     func ensureRemoteDir(relativeDir: String) async throws -> String {
@@ -352,10 +580,35 @@ actor GoogleDriveClient {
         return currentParent
     }
 
-    func getFile(id: String) async throws -> DriveFileMeta? {
-        if let cached = metaCache[id] { return cached }
+    func lookupRemoteDir(relativeDir: String) async throws -> String? {
+        let rootID = try await resolveRootFolderID()
+        let clean = relativeDir.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if clean.isEmpty { return rootID }
+        if let cached = dirIDCache[clean] { return cached }
+
+        let segments = clean.split(separator: "/").map(String.init)
+        var currentParent = rootID
+        var accPath = ""
+        for seg in segments {
+            accPath = accPath.isEmpty ? seg : "\(accPath)/\(seg)"
+            if let cached = dirIDCache[accPath] {
+                currentParent = cached
+                continue
+            }
+            let found = try await findChildren(parentID: currentParent, name: seg, mimeType: Self.folderMime)
+            guard let existing = found.sorted(by: { $0.id < $1.id }).first else {
+                return nil
+            }
+            dirIDCache[accPath] = existing.id
+            currentParent = existing.id
+        }
+        return currentParent
+    }
+
+    func getFile(id: String, bypassCache: Bool = false) async throws -> DriveFileMeta? {
+        if !bypassCache, let cached = metaCache[id] { return cached }
         let url = URL(string: "\(Self.apiBase)/files/\(id)?fields=\(Self.fields)")!
-        let (data, status) = try await authedRequest(url: url, method: "GET")
+        let (data, status, _) = try await authedRequest(url: url, method: "GET")
         if status == 404 { return nil }
         guard status >= 200 && status < 300 else {
             throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
@@ -374,7 +627,6 @@ actor GoogleDriveClient {
         return results
     }
 
-    /// Searches Google Drive for any non-trashed folders with the exact name (e.g. `Book.pdf.ink.d`).
     func findFoldersNamed(_ name: String) async throws -> [DriveFileMeta] {
         let escName = escapeQuery(name)
         let q = "name = '\(escName)' and mimeType = '\(Self.folderMime)' and trashed=false"
@@ -383,7 +635,6 @@ actor GoogleDriveClient {
         return results
     }
 
-    /// Walks up `parents` to verify a folder lives inside `rootID`, returning its relative path under `rootID` (or `nil` if outside).
     func resolvePathUnderRoot(folder: DriveFileMeta, rootID: String) async throws -> String? {
         if folder.id == rootID { return "" }
         var segments: [String] = [folder.name]
@@ -391,9 +642,16 @@ actor GoogleDriveClient {
         var hops = 0
         while let pid = curParent, hops < 12 {
             if pid == rootID {
-                return segments.reversed().joined(separator: "/")
+                let rel = segments.reversed().joined(separator: "/")
+                if rel == Self.trashFolderName || rel.hasPrefix(Self.trashFolderName + "/") {
+                    return nil
+                }
+                return rel
             }
             guard let parentMeta = try await getFile(id: pid), parentMeta.trashed != true else {
+                return nil
+            }
+            if parentMeta.name == Self.trashFolderName {
                 return nil
             }
             segments.append(parentMeta.name)
@@ -426,7 +684,7 @@ actor GoogleDriveClient {
             ]
             if let pt = pageToken { items.append(URLQueryItem(name: "pageToken", value: pt)) }
             comps.queryItems = items
-            let (data, status) = try await authedRequest(url: comps.url!)
+            let (data, status, _) = try await authedRequest(url: comps.url!)
             guard status >= 200 && status < 300 else {
                 throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
             }
@@ -445,16 +703,18 @@ actor GoogleDriveClient {
             "parents": [parentID]
         ]
         let body = try JSONSerialization.data(withJSONObject: meta)
-        let (data, status) = try await authedRequest(url: url, method: "POST", contentType: "application/json", body: body)
+        let (data, status, _) = try await authedRequest(url: url, method: "POST", contentType: "application/json", body: body)
         guard status >= 200 && status < 300 else {
             throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
         }
-        return try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        let decoded = try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        metaCache[decoded.id] = decoded
+        return decoded
     }
 
     func download(fileID: String) async throws -> Data {
         let url = URL(string: "\(Self.apiBase)/files/\(fileID)?alt=media")!
-        let (data, status) = try await authedRequest(url: url, method: "GET")
+        let (data, status, _) = try await authedRequest(url: url, method: "GET", requestGzip: false)
         guard status >= 200 && status < 300 else {
             throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
         }
@@ -476,23 +736,28 @@ actor GoogleDriveClient {
         body.append(payload)
         body.append(Data("\r\n--\(boundary)--".utf8))
 
-        let (data, status) = try await authedRequest(
+        let (data, status, _) = try await authedRequest(
             url: url,
             method: method,
             contentType: "multipart/related; boundary=\(boundary)",
             body: body
         )
+        if status == 404 && fileID != nil {
+            return try await uploadMultipart(fileID: nil, name: name, parentID: parentID, payload: payload)
+        }
         guard status >= 200 && status < 300 else {
             throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
         }
-        return try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        let decoded = try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        metaCache[decoded.id] = decoded
+        return decoded
     }
 
     func renameFile(fileID: String, newName: String) async throws -> DriveFileMeta {
         let url = URL(string: "\(Self.apiBase)/files/\(fileID)?fields=\(Self.fields)")!
         let payload: [String: Any] = ["name": newName]
         let body = try JSONSerialization.data(withJSONObject: payload)
-        let (data, status) = try await authedRequest(url: url, method: "PATCH", contentType: "application/json", body: body)
+        let (data, status, _) = try await authedRequest(url: url, method: "PATCH", contentType: "application/json", body: body)
         guard status >= 200 && status < 300 else {
             throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
         }
@@ -501,10 +766,136 @@ actor GoogleDriveClient {
         return meta
     }
 
-    /// Walks the Google Drive sync root folder via batched BFS to discover ALL remote `.pdf` files
-    /// and ALL remote `.ink.d` annotation folders in just 1–3 API calls.
+    // MARK: - `.PencilInk-Trash` 120-Day Server-Side Move & Auto-Purge
+
+    func moveItemToTrashFolder(
+        fileID: String,
+        currentParents: [String]? = nil,
+        trashFolderID: String,
+        originalPath: String,
+        kind: String,
+        deletedAtMs: Int64
+    ) async throws -> DriveFileMeta? {
+        var oldParents = currentParents ?? []
+        if oldParents.isEmpty, let meta = try await getFile(id: fileID, bypassCache: true) {
+            oldParents = meta.parents ?? []
+        }
+        if oldParents.contains(trashFolderID) && oldParents.count == 1 {
+            return metaCache[fileID]
+        }
+        let removeClause = oldParents.filter { $0 != trashFolderID }.joined(separator: ",")
+        var comps = URLComponents(string: "\(Self.apiBase)/files/\(fileID)")!
+        var qItems = [
+            URLQueryItem(name: "addParents", value: trashFolderID),
+            URLQueryItem(name: "fields", value: Self.fields)
+        ]
+        if !removeClause.isEmpty {
+            qItems.append(URLQueryItem(name: "removeParents", value: removeClause))
+        }
+        comps.queryItems = qItems
+
+        let safeOrigPath = String(originalPath.prefix(96))
+        let payload: [String: Any] = [
+            "appProperties": [
+                "pinkDelMs": String(deletedAtMs),
+                "pinkKind": kind,
+                "pinkPath": safeOrigPath
+            ]
+        ]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, status, _) = try await authedRequest(
+            url: comps.url!,
+            method: "PATCH",
+            contentType: "application/json",
+            body: body
+        )
+        if status == 404 { return nil }
+        guard status >= 200 && status < 300 else {
+            throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+        }
+        let decoded = try JSONDecoder().decode(DriveFileMeta.self, from: data)
+        metaCache[fileID] = decoded
+        return decoded
+    }
+
+    func permanentlyDeleteFile(fileID: String) async throws {
+        let url = URL(string: "\(Self.apiBase)/files/\(fileID)")!
+        let (data, status, _) = try await authedRequest(url: url, method: "DELETE")
+        metaCache.removeValue(forKey: fileID)
+        if status == 404 || status == 204 || (status >= 200 && status < 300) {
+            return
+        }
+        throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
+    }
+
+    func purgeExpiredTrash(retentionDays: Int = GoogleDriveClient.trashRetentionDays) async throws -> (purged: Int, remaining: Int) {
+        Self.pruneStaleTransferCheckpoints()
+        guard let trashID = try await findExistingTrashFolderID() else {
+            return (0, 0)
+        }
+        let items = try await listChildren(parentIDs: [trashID])
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let cutoffMs = nowMs - Int64(retentionDays) * 86_400_000
+        let isoFull = ISO8601DateFormatter()
+        isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoBasic = ISO8601DateFormatter()
+
+        var purged = 0
+        var remaining = 0
+        for item in items {
+            if item.name == ".trash-manifest.json" { continue }
+            let delMs: Int64
+            if let s = item.appProperties?["pinkDelMs"], let parsed = Int64(s) {
+                delMs = parsed
+            } else if let mt = item.modifiedTime,
+                      let d = isoFull.date(from: mt) ?? isoBasic.date(from: mt) {
+                delMs = Int64(d.timeIntervalSince1970 * 1000)
+            } else {
+                delMs = nowMs
+            }
+
+            if delMs <= cutoffMs {
+                try await permanentlyDeleteFile(fileID: item.id)
+                purged += 1
+            } else {
+                remaining += 1
+            }
+        }
+        return (purged, remaining)
+    }
+
+    private static func pruneStaleTransferCheckpoints() {
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-7 * 86_400)
+        for dir in [partialDownloadDir, uploadStateDir] {
+            guard let urls = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for u in urls {
+                if let mtime = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                   mtime < cutoff {
+                    try? fm.removeItem(at: u)
+                }
+            }
+        }
+    }
+
+    func emptyTrashFolder() async throws -> Int {
+        guard let trashID = try await findExistingTrashFolderID() else { return 0 }
+        let items = try await listChildren(parentIDs: [trashID])
+        var deleted = 0
+        for item in items {
+            if item.name == ".trash-manifest.json" { continue }
+            try await permanentlyDeleteFile(fileID: item.id)
+            deleted += 1
+        }
+        return deleted
+    }
+
     func listVaultTree(rootID: String) async throws -> RemoteVaultTree {
-        let ignoredFolders: Set<String> = [".obsidian", ".trash", ".git", ".stfolder", "__MACOSX"]
+        let ignoredFolders: Set<String> = [".obsidian", ".trash", ".git", ".stfolder", "__MACOSX", Self.trashFolderName]
         var queue: [(id: String, relDir: String)] = [(rootID, "")]
         var visited = Set<String>([rootID])
         var pdfs: [RemotePDFFile] = []
@@ -512,6 +903,7 @@ actor GoogleDriveClient {
         var folderIDByPath: [String: String] = ["": rootID]
 
         while !queue.isEmpty {
+            try Task.checkCancellation()
             let batchCount = min(15, queue.count)
             let batch = Array(queue.prefix(batchCount))
             queue.removeFirst(batchCount)
@@ -528,7 +920,6 @@ actor GoogleDriveClient {
 
                 if child.mimeType == Self.folderMime {
                     if child.name.hasSuffix(".ink.d") {
-                        // Record the associated PDF relative path (strip `.ink.d`) without descending!
                         let pdfRel = String(childRel.dropLast(6))
                         annotatedPDFPaths.insert(pdfRel)
                         continue
@@ -549,7 +940,6 @@ actor GoogleDriveClient {
             }
         }
 
-        // Deduplicate by lowercase relative path (prefer newest modifiedTime if duplicate on Drive)
         var dedup: [String: RemotePDFFile] = [:]
         for item in pdfs {
             let key = item.relativePath.lowercased()
@@ -571,11 +961,118 @@ actor GoogleDriveClient {
         )
     }
 
-    /// Streams a Google Drive file directly to a temporary URL on disk (~2 MB RAM even for 250 MB textbooks!).
-    func downloadToFile(fileID: String) async throws -> URL {
+    // MARK: - 8 MB Chunked Byte-Range Download with Fast Resume!
+
+    func downloadFileChunked(
+        meta: DriveFileMeta,
+        expectedSize: Int64,
+        onProgress: @escaping @Sendable (_ downloadedBytes: Int64, _ totalBytes: Int64) -> Void
+    ) async throws -> URL {
+        let fileID = meta.id
+        let totalBytes = expectedSize > 0 ? expectedSize : (Int64(meta.size ?? "0") ?? 0)
+        guard totalBytes > 0 else {
+            return try await downloadToFileLegacy(fileID: fileID)
+        }
+
+        let partURL = Self.partialDownloadDir.appendingPathComponent("\(fileID).part")
+        let ckptURL = Self.partialDownloadDir.appendingPathComponent("\(fileID).meta.json")
+        let fm = FileManager.default
+        let curMD5 = meta.md5Checksum ?? ""
+        let curMod = meta.modifiedTime ?? ""
+
+        var offset: Int64 = 0
+        if fm.fileExists(atPath: partURL.path),
+           let ckData = try? Data(contentsOf: ckptURL),
+           let ck = try? JSONDecoder().decode(DownloadCheckpoint.self, from: ckData),
+           ck.fileID == fileID,
+           ck.totalBytes == totalBytes,
+           ck.md5Checksum == curMD5,
+           ck.modifiedTime == curMod {
+            let existingSize = ((try? fm.attributesOfItem(atPath: partURL.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            if existingSize > 0 && existingSize <= totalBytes {
+                offset = existingSize
+            } else {
+                try? fm.removeItem(at: partURL)
+                try? fm.removeItem(at: ckptURL)
+            }
+        } else {
+            try? fm.removeItem(at: partURL)
+            try? fm.removeItem(at: ckptURL)
+        }
+
+        if !fm.fileExists(atPath: partURL.path) {
+            fm.createFile(atPath: partURL.path, contents: nil)
+        }
+        let ck = DownloadCheckpoint(fileID: fileID, md5Checksum: curMD5, modifiedTime: curMod, totalBytes: totalBytes)
+        if let ckData = try? JSONEncoder().encode(ck) {
+            try? ckData.write(to: ckptURL, options: .atomic)
+        }
+
+        onProgress(offset, totalBytes)
+
+        let url = URL(string: "\(Self.apiBase)/files/\(fileID)?alt=media")!
+        let handle = try FileHandle(forUpdating: partURL)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+
+        var didReset416 = false
+        while offset < totalBytes {
+            try Task.checkCancellation()
+            let chunkEnd = min(totalBytes - 1, offset + Self.chunkSizeBytes - 1)
+            let rangeHeader = "bytes=\(offset)-\(chunkEnd)"
+            let (chunkData, status, _) = try await authedRequest(
+                url: url,
+                method: "GET",
+                extraHeaders: ["Range": rangeHeader],
+                requestGzip: false,
+                timeout: 90
+            )
+
+            if status == 416 && !didReset416 {
+                didReset416 = true
+                offset = 0
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
+                continue
+            }
+            guard status == 206 || status == 200 else {
+                throw DriveClientError.apiError(status: status, message: parseErrorMessage(chunkData))
+            }
+            if status == 200 && offset > 0 {
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
+                offset = 0
+            }
+            guard !chunkData.isEmpty else {
+                throw DriveClientError.invalidResponse
+            }
+
+            try autoreleasepool {
+                try handle.write(contentsOf: chunkData)
+            }
+            offset += Int64(chunkData.count)
+            onProgress(min(offset, totalBytes), totalBytes)
+
+            if status == 200 {
+                break
+            }
+        }
+
+        try? handle.close()
+        try? fm.removeItem(at: ckptURL)
+
+        let stableTemp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pink-dl-\(UUID().uuidString).pdf")
+        try? fm.removeItem(at: stableTemp)
+        try fm.moveItem(at: partURL, to: stableTemp)
+        return stableTemp
+    }
+
+    private func downloadToFileLegacy(fileID: String) async throws -> URL {
         let url = URL(string: "\(Self.apiBase)/files/\(fileID)?alt=media")!
         var attempt = 0
         while true {
+            try Task.checkCancellation()
             let token = try await ensureValidToken()
             var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 300)
             req.httpMethod = "GET"
@@ -592,8 +1089,7 @@ actor GoogleDriveClient {
             if (status == 429 || status >= 500) && attempt < 3 {
                 try? FileManager.default.removeItem(at: tempURL)
                 attempt += 1
-                let delayNs = UInt64(700_000_000 * (1 << attempt))
-                try? await Task.sleep(nanoseconds: delayNs)
+                try await Task.sleep(nanoseconds: UInt64(700_000_000 * (1 << attempt)))
                 continue
             }
             guard status >= 200 && status < 300 else {
@@ -602,7 +1098,6 @@ actor GoogleDriveClient {
                 throw DriveClientError.apiError(status: status, message: parseErrorMessage(errData))
             }
 
-            // Move out of URLSession's ephemeral download location immediately so iOS doesn't purge it
             let stableTemp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("pink-dl-\(UUID().uuidString).pdf")
             try? FileManager.default.removeItem(at: stableTemp)
@@ -615,11 +1110,262 @@ actor GoogleDriveClient {
         }
     }
 
-    /// Uploads a local PDF file from disk using Google Drive Resumable Upload (zero 5 MB limit, low RAM!).
-    func uploadPDFFile(fileURL: URL, name: String, parentID: String) async throws -> DriveFileMeta {
-        let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let fileSize = (attrs[.size] as? Int64) ?? 0
+    // MARK: - 8 MB Chunked Resumable Upload with Fast Resume (`308 Resume Incomplete`)!
 
+    private func uploadCheckpointURL(for key: String) -> URL {
+        let hash = WireCodec.md5Hex(Data(key.utf8))
+        return Self.uploadStateDir.appendingPathComponent("up_\(hash).json")
+    }
+
+    func uploadPDFFileChunked(
+        fileURL: URL,
+        name: String,
+        parentID: String,
+        resumeKey: String,
+        onProgress: @escaping @Sendable (_ uploadedBytes: Int64, _ totalBytes: Int64) -> Void
+    ) async throws -> DriveFileMeta {
+        let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        let mtimeSec = Int64(((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).rounded())
+
+        if fileSize == 0 {
+            let meta = try await uploadMultipart(fileID: nil, name: name, parentID: parentID, payload: Data())
+            onProgress(0, 0)
+            return meta
+        }
+
+        let ckURL = uploadCheckpointURL(for: resumeKey)
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var uploadURI: URL? = nil
+        var offset: Int64 = 0
+
+        if let ckData = try? Data(contentsOf: ckURL),
+           let ck = try? JSONDecoder().decode(UploadCheckpoint.self, from: ckData),
+           ck.fileSize == fileSize,
+           ck.fileMtimeSec == mtimeSec,
+           ck.name == name,
+           ck.parentID == parentID,
+           (nowMs - ck.createdAtMs) < 6 * 86_400_000,
+           let savedURL = URL(string: ck.uploadURI) {
+            let probe = try await probeResumableOffset(uploadURL: savedURL, totalSize: fileSize)
+            switch probe {
+            case .completed(let meta):
+                try? FileManager.default.removeItem(at: ckURL)
+                onProgress(fileSize, fileSize)
+                metaCache[meta.id] = meta
+                return meta
+            case .resumeAt(let nextByte):
+                uploadURI = savedURL
+                offset = min(fileSize, max(0, nextByte))
+            case .expired:
+                try? FileManager.default.removeItem(at: ckURL)
+            }
+        }
+
+        if uploadURI == nil {
+            let freshURL = try await initiateResumableUpload(name: name, parentID: parentID, fileSize: fileSize)
+            uploadURI = freshURL
+            offset = 0
+            let ck = UploadCheckpoint(
+                uploadURI: freshURL.absoluteString,
+                fileSize: fileSize,
+                fileMtimeSec: mtimeSec,
+                name: name,
+                parentID: parentID,
+                createdAtMs: nowMs
+            )
+            if let encoded = try? JSONEncoder().encode(ck) {
+                try? encoded.write(to: ckURL, options: .atomic)
+            }
+        }
+
+        guard var activeUploadURL = uploadURI else {
+            throw DriveClientError.invalidResponse
+        }
+
+        onProgress(offset, fileSize)
+
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        var sessionRestarts = 0
+        while offset < fileSize {
+            try Task.checkCancellation()
+            let remaining = fileSize - offset
+            let chunkLen = min(Self.chunkSizeBytes, remaining)
+
+            let chunkData: Data = try autoreleasepool {
+                try handle.seek(toOffset: UInt64(offset))
+                return try handle.read(upToCount: Int(chunkLen)) ?? Data()
+            }
+            guard !chunkData.isEmpty else {
+                throw DriveClientError.invalidResponse
+            }
+
+            let actualEnd = offset + Int64(chunkData.count) - 1
+            let contentRange = "bytes \(offset)-\(actualEnd)/\(fileSize)"
+            var chunkAttempt = 0
+            var chunkAccepted = false
+
+            while !chunkAccepted {
+                try Task.checkCancellation()
+                let token = try await ensureValidToken()
+                var putReq = URLRequest(url: activeUploadURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 90)
+                putReq.httpMethod = "PUT"
+                putReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                putReq.setValue("application/pdf", forHTTPHeaderField: "Content-Type")
+                putReq.setValue("\(chunkData.count)", forHTTPHeaderField: "Content-Length")
+                putReq.setValue(contentRange, forHTTPHeaderField: "Content-Range")
+                putReq.httpBody = chunkData
+
+                do {
+                    let (respData, resp) = try await session.data(for: putReq)
+                    let http = resp as? HTTPURLResponse
+                    let status = http?.statusCode ?? 0
+
+                    if status == 200 || status == 201 {
+                        bytesUp += Int64(chunkData.count)
+                        try? FileManager.default.removeItem(at: ckURL)
+                        onProgress(fileSize, fileSize)
+                        let meta = try JSONDecoder().decode(DriveFileMeta.self, from: respData)
+                        metaCache[meta.id] = meta
+                        return meta
+                    }
+
+                    if status == 308 {
+                        bytesUp += Int64(chunkData.count)
+                        if let rangeStr = http?.value(forHTTPHeaderField: "Range"),
+                           let serverNext = Self.parseRangeNextByte(rangeStr) {
+                            offset = min(fileSize, serverNext)
+                        } else {
+                            offset = actualEnd + 1
+                        }
+                        onProgress(offset, fileSize)
+                        chunkAccepted = true
+                        continue
+                    }
+
+                    if status == 401 && chunkAttempt < 1 {
+                        config.expiresAt = 0
+                        chunkAttempt += 1
+                        continue
+                    }
+
+                    if (status == 404 || status == 410) && sessionRestarts < 1 {
+                        sessionRestarts += 1
+                        try? FileManager.default.removeItem(at: ckURL)
+                        activeUploadURL = try await initiateResumableUpload(name: name, parentID: parentID, fileSize: fileSize)
+                        offset = 0
+                        let ck = UploadCheckpoint(
+                            uploadURI: activeUploadURL.absoluteString,
+                            fileSize: fileSize,
+                            fileMtimeSec: mtimeSec,
+                            name: name,
+                            parentID: parentID,
+                            createdAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+                        )
+                        if let encoded = try? JSONEncoder().encode(ck) {
+                            try? encoded.write(to: ckURL, options: .atomic)
+                        }
+                        chunkAccepted = true
+                        break
+                    }
+
+                    if (status == 429 || status >= 500) && chunkAttempt < 3 {
+                        chunkAttempt += 1
+                        try await Task.sleep(nanoseconds: UInt64(700_000_000 * (1 << chunkAttempt)))
+                        if case .resumeAt(let nextByte) = try? await probeResumableOffset(uploadURL: activeUploadURL, totalSize: fileSize),
+                           nextByte > offset {
+                            offset = min(fileSize, nextByte)
+                            onProgress(offset, fileSize)
+                            chunkAccepted = true
+                            break
+                        }
+                        continue
+                    }
+
+                    throw DriveClientError.apiError(status: status, message: parseErrorMessage(respData))
+                } catch is CancellationError {
+                    throw DriveClientError.cancelled
+                } catch {
+                    if chunkAttempt < 3 && isTransientNetworkError(error) {
+                        chunkAttempt += 1
+                        try await Task.sleep(nanoseconds: UInt64(800_000_000 * (1 << chunkAttempt)))
+                        if let probe = try? await probeResumableOffset(uploadURL: activeUploadURL, totalSize: fileSize) {
+                            switch probe {
+                            case .completed(let meta):
+                                try? FileManager.default.removeItem(at: ckURL)
+                                onProgress(fileSize, fileSize)
+                                metaCache[meta.id] = meta
+                                return meta
+                            case .resumeAt(let nextByte) where nextByte > offset:
+                                offset = min(fileSize, nextByte)
+                                onProgress(offset, fileSize)
+                                chunkAccepted = true
+                                continue
+                            default:
+                                break
+                            }
+                        }
+                        continue
+                    }
+                    throw error
+                }
+            }
+        }
+
+        if case .completed(let meta) = try await probeResumableOffset(uploadURL: activeUploadURL, totalSize: fileSize) {
+            try? FileManager.default.removeItem(at: ckURL)
+            onProgress(fileSize, fileSize)
+            metaCache[meta.id] = meta
+            return meta
+        }
+        throw DriveClientError.invalidResponse
+    }
+
+    private enum ResumableProbeResult {
+        case completed(DriveFileMeta)
+        case resumeAt(Int64)
+        case expired
+    }
+
+    private func probeResumableOffset(uploadURL: URL, totalSize: Int64) async throws -> ResumableProbeResult {
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+            let token = try await ensureValidToken()
+            var req = URLRequest(url: uploadURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 30)
+            req.httpMethod = "PUT"
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            req.setValue("0", forHTTPHeaderField: "Content-Length")
+            req.setValue("bytes */\(totalSize)", forHTTPHeaderField: "Content-Range")
+
+            let (data, resp) = try await session.data(for: req)
+            let http = resp as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
+            if status == 401 && attempt < 1 {
+                config.expiresAt = 0
+                attempt += 1
+                continue
+            }
+            if status == 200 || status == 201 {
+                if let meta = try? JSONDecoder().decode(DriveFileMeta.self, from: data) {
+                    return .completed(meta)
+                }
+                return .expired
+            }
+            if status == 308 {
+                if let rangeStr = http?.value(forHTTPHeaderField: "Range"),
+                   let next = Self.parseRangeNextByte(rangeStr) {
+                    return .resumeAt(next)
+                }
+                return .resumeAt(0)
+            }
+            return .expired
+        }
+    }
+
+    private func initiateResumableUpload(name: String, parentID: String, fileSize: Int64) async throws -> URL {
         let initURL = URL(string: "\(Self.uploadBase)/files?uploadType=resumable&fields=\(Self.fields)")!
         let metaObj: [String: Any] = [
             "name": name,
@@ -628,9 +1374,9 @@ actor GoogleDriveClient {
         ]
         let metaBody = try JSONSerialization.data(withJSONObject: metaObj)
 
-        var uploadSessionURL: URL? = nil
         var attempt = 0
-        while uploadSessionURL == nil {
+        while true {
+            try Task.checkCancellation()
             let token = try await ensureValidToken()
             var initReq = URLRequest(url: initURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 45)
             initReq.httpMethod = "POST"
@@ -648,35 +1394,32 @@ actor GoogleDriveClient {
                 attempt += 1
                 continue
             }
+            if (status == 429 || status >= 500) && attempt < 3 {
+                attempt += 1
+                try await Task.sleep(nanoseconds: UInt64(600_000_000 * (1 << attempt)))
+                continue
+            }
             guard status >= 200 && status < 300,
                   let locStr = http?.value(forHTTPHeaderField: "Location"),
                   let locURL = URL(string: locStr) else {
                 throw DriveClientError.apiError(status: status, message: parseErrorMessage(data))
             }
-            uploadSessionURL = locURL
+            return locURL
         }
+    }
 
-        let putURL = uploadSessionURL!
-        let token = try await ensureValidToken()
-        var putReq = URLRequest(url: putURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 300)
-        putReq.httpMethod = "PUT"
-        putReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        putReq.setValue("application/pdf", forHTTPHeaderField: "Content-Type")
-        putReq.setValue("\(fileSize)", forHTTPHeaderField: "Content-Length")
-
-        let (respData, resp) = try await session.upload(for: putReq, fromFile: fileURL)
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard status >= 200 && status < 300 else {
-            throw DriveClientError.apiError(status: status, message: parseErrorMessage(respData))
-        }
-        bytesUp += fileSize
-        return try JSONDecoder().decode(DriveFileMeta.self, from: respData)
+    private static func parseRangeNextByte(_ header: String) -> Int64? {
+        guard let dashIdx = header.lastIndex(of: "-") else { return nil }
+        let tail = header[header.index(after: dashIdx)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let lastByte = Int64(tail), lastByte >= 0 else { return nil }
+        return lastByte + 1
     }
 
     func trash(fileID: String) async throws {
         let url = URL(string: "\(Self.apiBase)/files/\(fileID)?fields=id")!
         let body = Data("{\"trashed\":true}".utf8)
-        let (_, status) = try await authedRequest(url: url, method: "PATCH", contentType: "application/json", body: body)
+        let (_, status, _) = try await authedRequest(url: url, method: "PATCH", contentType: "application/json", body: body)
+        metaCache.removeValue(forKey: fileID)
         if status == 404 { return }
     }
 

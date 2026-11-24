@@ -125,7 +125,7 @@ struct SettingsSheet: View {
 
                 Section(
                     header: Text("Cloud Sync"),
-                    footer: Text("Smart Sync never interrupts while you write or type, batches uploads 4 seconds after you finish, and checks Google Drive when you return or step away.")
+                    footer: Text("Smart Sync never interrupts while you write or type, batches uploads ~1.6 seconds after pen-up and uses lightweight Changes checks for sub-10s sync, and checks Google Drive when you return or step away.")
                 ) {
                     Button {
                         showSyncSheet = true
@@ -231,7 +231,7 @@ struct SettingsSheet: View {
                         Text("Pencil Ink Native")
                             .fontWeight(.medium)
                         Spacer()
-                        Text("v5.0.0")
+                        Text("v5.1.0")
                             .font(.caption.monospaced())
                             .foregroundColor(.secondary)
                     }

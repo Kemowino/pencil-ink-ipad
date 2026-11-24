@@ -11,6 +11,18 @@ private enum MacLibrarySidebarEntry {
     case annotated
     case journals
     case folder(FolderItem)
+
+    var selectionKey: String {
+        switch self {
+        case .header(let h): return "hdr:\(h)"
+        case .allPDFs: return "all"
+        case .recent: return "recent"
+        case .favorites: return "favorites"
+        case .annotated: return "annotated"
+        case .journals: return "journals"
+        case .folder(let f): return "folder:\(f.relativePath.lowercased())"
+        }
+    }
 }
 
 /// Interactive Studio Craft Grid Cover Card (`NSCollectionViewItem`) with hover lift,
@@ -481,12 +493,13 @@ private final class MacThemeObserverView: NSView {
 final class MacLibraryViewController: NSViewController,
     NSTableViewDataSource, NSTableViewDelegate,
     NSCollectionViewDataSource, NSCollectionViewDelegate,
-    NSSearchFieldDelegate {
+    NSSearchFieldDelegate, NSMenuDelegate {
 
     let vault: VaultManager
     let syncManager: DriveSyncManager
     var onOpenPDF: ((PDFItem) -> Void)?
     var onOpenSyncSettings: (() -> Void)?
+    var onWillDeletePaths: (([String]) -> Void)?
 
     private let splitView = NSSplitView()
     private let leftPane = NSView()
@@ -518,9 +531,12 @@ final class MacLibraryViewController: NSViewController,
     private let emptySub = NSTextField(labelWithString: "Choose your vault folder to browse PDFs, view iPad notes, and sync with Google Drive.")
     private let emptyChooseBtn = NSButton(title: "Choose Vault Folder…", target: nil, action: nil)
     private let statusFooter = NSTextField(labelWithString: "")
+    private let footerProgressBar = NSProgressIndicator()
+    private let footerCancelSyncBtn = NSButton()
 
     private var sidebarEntries: [MacLibrarySidebarEntry] = []
     private var selectedSidebarIndex: Int = 1
+    private var selectedSidebarKey: String = "all"
     private var filteredItems: [PDFItem] = []
     private var cachedAnnotatedCount: Int = 0
     private var cachedJournalCount: Int = 0
@@ -619,6 +635,7 @@ final class MacLibraryViewController: NSViewController,
         sidebarTable.rowHeight = 28
         sidebarTable.dataSource = self
         sidebarTable.delegate = self
+        sidebarTable.menu = makeSidebarContextMenu()
 
         sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
         sidebarScroll.documentView = sidebarTable
@@ -822,10 +839,29 @@ final class MacLibraryViewController: NSViewController,
         rightPane.addSubview(footerSep)
 
         statusFooter.translatesAutoresizingMaskIntoConstraints = false
-        statusFooter.font = NSFont.systemFont(ofSize: 11.5)
+        statusFooter.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         statusFooter.textColor = .secondaryLabelColor
         statusFooter.lineBreakMode = .byTruncatingTail
         rightPane.addSubview(statusFooter)
+
+        footerProgressBar.translatesAutoresizingMaskIntoConstraints = false
+        footerProgressBar.style = .bar
+        footerProgressBar.controlSize = .small
+        footerProgressBar.minValue = 0
+        footerProgressBar.maxValue = 1
+        footerProgressBar.isIndeterminate = false
+        footerProgressBar.isHidden = true
+        rightPane.addSubview(footerProgressBar)
+
+        footerCancelSyncBtn.translatesAutoresizingMaskIntoConstraints = false
+        footerCancelSyncBtn.image = NSImage(systemSymbolName: "pause.circle.fill", accessibilityDescription: "Pause Sync")
+        footerCancelSyncBtn.isBordered = false
+        footerCancelSyncBtn.contentTintColor = .secondaryLabelColor
+        footerCancelSyncBtn.toolTip = "Pause transfer (resumes from last 8 MB chunk)"
+        footerCancelSyncBtn.target = self
+        footerCancelSyncBtn.action = #selector(cancelFooterSyncAction)
+        footerCancelSyncBtn.isHidden = true
+        rightPane.addSubview(footerCancelSyncBtn)
 
         // Polished Studio Empty Card
         emptyCard.translatesAutoresizingMaskIntoConstraints = false
@@ -916,8 +952,17 @@ final class MacLibraryViewController: NSViewController,
             footerSep.bottomAnchor.constraint(equalTo: statusFooter.topAnchor, constant: -4),
 
             statusFooter.leadingAnchor.constraint(equalTo: rightPane.leadingAnchor, constant: 16),
-            statusFooter.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor, constant: -16),
+            statusFooter.trailingAnchor.constraint(lessThanOrEqualTo: footerProgressBar.leadingAnchor, constant: -10),
             statusFooter.bottomAnchor.constraint(equalTo: rightPane.bottomAnchor, constant: -5),
+
+            footerCancelSyncBtn.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor, constant: -12),
+            footerCancelSyncBtn.centerYAnchor.constraint(equalTo: statusFooter.centerYAnchor),
+            footerCancelSyncBtn.widthAnchor.constraint(equalToConstant: 18),
+            footerCancelSyncBtn.heightAnchor.constraint(equalToConstant: 18),
+
+            footerProgressBar.trailingAnchor.constraint(equalTo: footerCancelSyncBtn.leadingAnchor, constant: -6),
+            footerProgressBar.centerYAnchor.constraint(equalTo: statusFooter.centerYAnchor),
+            footerProgressBar.widthAnchor.constraint(equalToConstant: 120),
 
             emptyCard.centerXAnchor.constraint(equalTo: gridScroll.centerXAnchor),
             emptyCard.centerYAnchor.constraint(equalTo: gridScroll.centerYAnchor),
@@ -1006,25 +1051,65 @@ final class MacLibraryViewController: NSViewController,
             .store(in: &cancellables)
 
         syncManager.$statusText
-            .combineLatest(syncManager.$syncProgressText)
+            .combineLatest(
+                syncManager.$syncPhaseLabel,
+                syncManager.$syncProgressFraction,
+                syncManager.$isTransferActive
+            )
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] status, progress in
-                self?.updateFooterAndSyncUI(status: status, progress: progress)
+            .sink { [weak self] status, phase, _, _ in
+                self?.updateFooterAndSyncUI(status: status, progress: phase)
             }
             .store(in: &cancellables)
     }
 
     private func updateFooterAndSyncUI(status: String, progress: String) {
         let countLabel = "\(filteredItems.count) document\(filteredItems.count == 1 ? "" : "s")"
-        let syncPart = progress.isEmpty ? "Google Drive: \(status)" : progress
+        let active = syncManager.isTransferActive
+        let frac = syncManager.syncProgressFraction
+        let speed = syncManager.syncSpeedText
+        let syncPart: String
+        if active && !progress.isEmpty {
+            let pctSuffix = frac >= 0 ? " (\(Int((frac * 100.0).rounded()))%)" : ""
+            let spdSuffix = speed.isEmpty ? "" : " · \(speed)"
+            syncPart = "\(progress)\(pctSuffix)\(spdSuffix)"
+        } else {
+            syncPart = progress.isEmpty ? "Google Drive: \(status)" : progress
+        }
         statusFooter.stringValue = "\(countLabel)  ·  \(syncPart)"
-        syncNowBtn.title = syncManager.config.isConnected ? "Sync" : "Connect…"
+        syncNowBtn.title = syncManager.config.isConnected ? (active ? "Syncing…" : "Sync") : "Connect…"
+        syncNowBtn.isEnabled = !active
+
+        footerProgressBar.isHidden = !active
+        footerCancelSyncBtn.isHidden = !active
+        if active {
+            if frac < 0 {
+                if !footerProgressBar.isIndeterminate {
+                    footerProgressBar.isIndeterminate = true
+                    footerProgressBar.startAnimation(nil)
+                }
+            } else {
+                if footerProgressBar.isIndeterminate {
+                    footerProgressBar.stopAnimation(nil)
+                    footerProgressBar.isIndeterminate = false
+                }
+                footerProgressBar.doubleValue = max(0, min(1, frac))
+            }
+        } else if footerProgressBar.isIndeterminate {
+            footerProgressBar.stopAnimation(nil)
+            footerProgressBar.isIndeterminate = false
+        }
+
         switch syncManager.visualState {
         case .ok: syncDotView.layer?.backgroundColor = DesignTokens.nsEmerald.cgColor
         case .syncing: syncDotView.layer?.backgroundColor = DesignTokens.nsAccent.cgColor
         case .error: syncDotView.layer?.backgroundColor = DesignTokens.nsCoralRed.cgColor
         case .disconnected: syncDotView.layer?.backgroundColor = NSColor.systemGray.cgColor
         }
+    }
+
+    @objc private func cancelFooterSyncAction() {
+        syncManager.cancelActiveTransfer()
     }
 
     private func currentFolderPath() -> String {
@@ -1058,8 +1143,11 @@ final class MacLibraryViewController: NSViewController,
             }
         }
         sidebarEntries = entries
-        if selectedSidebarIndex < 0 || selectedSidebarIndex >= sidebarEntries.count {
+        if let matchedIdx = sidebarEntries.firstIndex(where: { $0.selectionKey == selectedSidebarKey }) {
+            selectedSidebarIndex = matchedIdx
+        } else if selectedSidebarIndex < 0 || selectedSidebarIndex >= sidebarEntries.count {
             selectedSidebarIndex = 1
+            selectedSidebarKey = "all"
         }
         sidebarTable.reloadData()
         sidebarTable.selectRowIndexes(IndexSet(integer: selectedSidebarIndex), byExtendingSelection: false)
@@ -1088,7 +1176,7 @@ final class MacLibraryViewController: NSViewController,
             sectionTitleLabel.stringValue = "Hobonichi Journals"
             base = vault.pdfs.filter { $0.isHobonichi }
         case .folder(let f):
-            sectionTitleLabel.stringValue = f.name
+            sectionTitleLabel.stringValue = f.relativePath.replacingOccurrences(of: "/", with: " › ")
             let prefix = f.relativePath + "/"
             base = vault.pdfs.filter { $0.relativeFolder == f.relativePath || $0.relativeFolder.hasPrefix(prefix) }
         default:
@@ -1201,7 +1289,11 @@ final class MacLibraryViewController: NSViewController,
         alert.addButton(withTitle: "Create")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            try? vault.createFolder(name: tf.stringValue, inFolder: currentFolderPath())
+            let parent = currentFolderPath()
+            try? vault.createFolder(name: tf.stringValue, inFolder: parent)
+            if syncManager.config.isConnected && syncManager.config.autoSync {
+                Task { _ = await syncManager.syncVault(vault: vault, force: true) }
+            }
         }
     }
 
@@ -1241,7 +1333,7 @@ final class MacLibraryViewController: NSViewController,
         if panel.runModal() == .OK, let url = panel.url {
             vault.setVaultFolder(url)
             if syncManager.config.isConnected {
-                Task { _ = await syncManager.syncVault(vault: vault, force: false) }
+                Task { _ = await syncManager.syncVault(vault: vault, force: true) }
             }
         }
     }
@@ -1373,13 +1465,63 @@ final class MacLibraryViewController: NSViewController,
     @objc private func ctxDeletePDF() {
         guard let item = resolveContextItem() else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete \"\(item.name)\"?"
-        alert.informativeText = "This removes the PDF and its local annotation sidecar from your vault folder."
+        alert.messageText = "Move \"\(item.name)\" to Trash?"
+        alert.informativeText = syncManager.config.isConnected
+            ? "Removes the file locally and moves it to .PencilInk-Trash on Google Drive (auto-deleted after 120 days)."
+            : "Removes the file and its local annotation sidecar from your vault folder."
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Move to Trash")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
+            let relPath = item.relativePath
+            onWillDeletePaths?([relPath])
             try? vault.deletePDF(item)
+            Task { _ = await syncManager.deleteFileOnDrive(relativePath: relPath) }
+        }
+    }
+
+    private func makeSidebarContextMenu() -> NSMenu {
+        let m = NSMenu()
+        m.delegate = self
+        return m
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === sidebarTable.menu else { return }
+        menu.removeAllItems()
+        let row = sidebarTable.clickedRow
+        guard row >= 0 && row < sidebarEntries.count, case .folder(let f) = sidebarEntries[row] else {
+            return
+        }
+        let del = NSMenuItem(title: "Move \"\(f.name)\" to Trash…", action: #selector(ctxDeleteSidebarFolder), keyEquivalent: "")
+        del.target = self
+        menu.addItem(del)
+    }
+
+    @objc private func ctxDeleteSidebarFolder() {
+        let row = sidebarTable.clickedRow >= 0 ? sidebarTable.clickedRow : sidebarTable.selectedRow
+        guard row >= 0 && row < sidebarEntries.count else { return }
+        guard case .folder(let folder) = sidebarEntries[row] else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Move Folder \"\(folder.name)\" to Trash?"
+        let countDesc = folder.pdfCount > 0 ? " (including \(folder.pdfCount) document\(folder.pdfCount == 1 ? "" : "s"))" : ""
+        alert.informativeText = syncManager.config.isConnected
+            ? "Removes this folder\(countDesc) locally and moves it to .PencilInk-Trash on Google Drive (auto-deleted after 120 days)."
+            : "Removes this folder\(countDesc) from your vault."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            let relFolder = folder.relativePath
+            let prefix = relFolder + "/"
+            let contained = vault.pdfs.filter { $0.relativeFolder == relFolder || $0.relativePath.hasPrefix(prefix) }.map { $0.relativePath }
+            onWillDeletePaths?(contained)
+            let deletedPaths = (try? vault.deleteFolder(folder)) ?? contained
+            selectedSidebarIndex = 1
+            selectedSidebarKey = "all"
+            rebuildSidebarAndList()
+            Task { _ = await syncManager.deleteFolderOnDrive(relativeFolderPath: relFolder, containedPDFRelativePaths: deletedPaths) }
         }
     }
 
@@ -1436,6 +1578,7 @@ final class MacLibraryViewController: NSViewController,
         if row >= 0 && row < sidebarEntries.count {
             if case .header = sidebarEntries[row] { return }
             selectedSidebarIndex = row
+            selectedSidebarKey = sidebarEntries[row].selectionKey
             rebuildFilteredList()
         }
     }
@@ -1486,8 +1629,10 @@ final class MacLibraryViewController: NSViewController,
                 cnt.alignment = .right
                 cnt.tag = 77
                 c.addSubview(cnt)
+                let leadC = iv.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 6)
+                leadC.identifier = "sidebarIconLeading"
                 NSLayoutConstraint.activate([
-                    iv.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 6),
+                    leadC,
                     iv.centerYAnchor.constraint(equalTo: c.centerYAnchor),
                     iv.widthAnchor.constraint(equalToConstant: 16),
                     iv.heightAnchor.constraint(equalToConstant: 16),
@@ -1501,6 +1646,8 @@ final class MacLibraryViewController: NSViewController,
             }()
 
             let cntLabel = cell.viewWithTag(77) as? NSTextField
+            let iconLead = cell.constraints.first(where: { $0.identifier == "sidebarIconLeading" })
+            iconLead?.constant = 6
             switch entry {
             case .allPDFs:
                 cell.imageView?.image = Self.iconBooks
@@ -1528,6 +1675,8 @@ final class MacLibraryViewController: NSViewController,
                 cell.textField?.stringValue = "Journals"
                 cntLabel?.stringValue = "\(cachedJournalCount)"
             case .folder(let f):
+                let depth = min(4, max(0, f.relativePath.split(separator: "/").count - 1))
+                iconLead?.constant = 6 + CGFloat(depth) * 14.0
                 cell.imageView?.image = Self.iconFolder
                 cell.imageView?.contentTintColor = Self.folderTint
                 cell.textField?.stringValue = f.name

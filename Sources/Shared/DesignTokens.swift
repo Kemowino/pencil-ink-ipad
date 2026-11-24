@@ -78,7 +78,7 @@ enum DesignTokens {
     static let nsWarmGold        = NSColor(red: warmGoldRGB.r, green: warmGoldRGB.g, blue: warmGoldRGB.b, alpha: 1.0)
     static let nsEmerald         = NSColor(red: emeraldRGB.r, green: emeraldRGB.g, blue: emeraldRGB.b, alpha: 1.0)
     static let nsCoralRed        = NSColor(red: coralRedRGB.r, green: coralRedRGB.g, blue: coralRedRGB.b, alpha: 1.0)
-    static let nsPageBorder      = dynamicNS(light: RGBA(0.059, 0.090, 0.165, 0.14), dark: RGBA(1, 1, 1, 0.08))
+    static let nsPageBorder      = dynamicNS(light: RGBA(0.835, 0.855, 0.886, 1.0), dark: RGBA(0.165, 0.180, 0.215, 1.0))
     #endif
 
     #if canImport(UIKit)

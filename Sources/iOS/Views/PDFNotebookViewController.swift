@@ -172,9 +172,7 @@ final class NotebookToolState: ObservableObject {
         get { hud.isOnHoboNotes }
         set { if hud.isOnHoboNotes != newValue { hud.isOnHoboNotes = newValue } }
     }
-    var isWriting: Bool = false {
-        didSet { if isWriting != oldValue { onHUDChanged?() } }
-    }
+    var isWriting: Bool = false
     var isCurrentPageBookmarked: Bool {
         hud.isCurrentPageBookmarked
     }
@@ -1159,9 +1157,8 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                 pagePillButton.configuration = cfg
             }
         }
-        let targetAlpha: CGFloat = toolState.isWriting ? 0.25 : 0.96
-        if abs(pagePillButton.alpha - targetAlpha) > 0.01 {
-            pagePillButton.alpha = targetAlpha
+        if pagePillButton.alpha != 1.0 {
+            pagePillButton.alpha = 1.0
         }
     }
 
@@ -3995,53 +3992,74 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
             self?.saveNow(flushDriveImmediately: false)
         }
         saveWorkItem = item
-        // Save locally after 0.75s pause; Drive upload batches cleanly after 4.0s of idle!
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: item)
+        // Save locally after 0.50s pause; Drive upload batches cleanly after 1.6s of idle!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: item)
     }
 
     private func handleReturnedToApp() {
         guard isTabActive,
               AppSettings.shared.syncMode == .smart,
               let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
-        // Only check Drive on return if we were away or haven't checked recently (>= 12s)
         let now = Date()
-        let awayLongEnough = lastBackgroundedAt.map { now.timeIntervalSince($0) >= 120.0 } ?? false
-        let staleCheck = lastDriveSyncCheckAt.map { now.timeIntervalSince($0) >= 120.0 } ?? true
+        let awaySec = lastBackgroundedAt.map { now.timeIntervalSince($0) } ?? 0
+        let staleCheck = lastDriveSyncCheckAt.map { now.timeIntervalSince($0) >= 20.0 } ?? true
         lastBackgroundedAt = nil
-        if awayLongEnough || staleCheck {
-            syncNowWithDrive(silent: true, forceFolderScan: true)
+        if awaySec >= 6.0 || staleCheck {
+            let rel = relativePath
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let res = await sm.checkDriveChangesLightly(forBookRelativePath: rel)
+                if res == .bookChanged || awaySec >= 120.0 {
+                    self.syncNowWithDrive(silent: true, forceFolderScan: awaySec >= 120.0)
+                }
+                self.scheduleNextIdleCheck(stage: 0)
+            }
+        } else if idleCheckWorkItem == nil {
             scheduleNextIdleCheck(stage: 0)
         }
     }
 
-    /// Adaptive idle pull backoff (60s -> 3m -> 10m -> sleep) — zero wasteful 3.5s/5s/10s polling!
+    /// Foreground-only Adaptive Changes-API Pulse (~300 B when idle, 0 folder scans when unchanged!):
+    /// - Active collaboration (stages 0..4): every 6s -> sub-10s cross-device sync!
+    /// - Calm (stages 5..8): every 15s
+    /// - Idle (stages 9..12): every 45s
+    /// - Deep idle (stage 13+): every 180s (pauses completely when inactive/backgrounded or while writing!)
     private func scheduleNextIdleCheck(stage: Int) {
         idleCheckWorkItem?.cancel()
         idleCheckWorkItem = nil
         guard isTabActive,
               AppSettings.shared.syncMode == .smart,
               let sm = syncManager, sm.config.isConnected, sm.config.autoSync else { return }
-        let delays: [TimeInterval] = [180.0, 600.0]
-        guard stage >= 0 && stage < delays.count else { return }
-        let delay = delays[stage]
+
+        let baseDelay: TimeInterval
+        if stage < 5 { baseDelay = 6.0 }
+        else if stage < 9 { baseDelay = 15.0 }
+        else if stage < 13 { baseDelay = 45.0 }
+        else { baseDelay = 180.0 }
+        let delay = ProcessInfo.processInfo.isLowPowerModeEnabled ? (baseDelay * 2.0) : baseDelay
+
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.idleCheckWorkItem = nil
             Task { @MainActor in
-                // Never interrupt active drawing or active text-box typing!
                 guard self.isTabActive,
                       AppSettings.shared.syncMode == .smart,
-                      self.activePageView == nil,
-                      self.activeTextEditor == nil,
-                      !self.laserDown,
-                      !self.isDirty,
                       let sm = self.syncManager, sm.config.isConnected, sm.config.autoSync else {
-                    self.scheduleNextIdleCheck(stage: stage)
                     return
                 }
-                self.syncNowWithDrive(silent: true, forceFolderScan: false) { [weak self] gotRemoteUpdate in
-                    guard let self else { return }
-                    // If remote changes arrived, reset backoff; otherwise back off cleanly to save battery
-                    self.scheduleNextIdleCheck(stage: gotRemoteUpdate ? 0 : stage + 1)
+                // Never interrupt active stylus writing, laser, text typing, or unsaved edits!
+                if self.activePageView != nil || self.activeTextEditor != nil || self.laserDown || self.isDirty {
+                    self.scheduleNextIdleCheck(stage: 0)
+                    return
+                }
+                let check = await sm.checkDriveChangesLightly(forBookRelativePath: self.relativePath)
+                switch check {
+                case .bookChanged:
+                    self.syncNowWithDrive(silent: true, forceFolderScan: false) { [weak self] _ in
+                        self?.scheduleNextIdleCheck(stage: 0)
+                    }
+                case .noChanges, .vaultStructureChanged, .failed:
+                    self.scheduleNextIdleCheck(stage: min(stage + 1, 14))
                 }
             }
         }
@@ -4199,11 +4217,11 @@ final class PDFNotebookViewController: UIViewController, UIScrollViewDelegate, U
                         sm.cancelScheduledSync(for: rel)
                         self.syncNowWithDrive(silent: true, forceFolderScan: false)
                     } else if self.activePageView == nil && self.activeTextEditor == nil {
-                        // Batch edits and push cleanly 4 seconds after you stop writing/typing!
+                        // Batch edits and push cleanly 1.6 seconds after pen-up (capped at 8s during nonstop writing)!
                         sm.scheduleBookSync(
                             pdfURL: targetURL,
                             relativePath: rel,
-                            delaySeconds: 4.0,
+                            delaySeconds: 1.6,
                             localDocProvider: { [weak self] in self?.inkDoc ?? snapshot },
                             onMerged: { [weak self] merged in self?.applyRemoteMergedDocument(merged) }
                         )

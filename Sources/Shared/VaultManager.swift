@@ -391,7 +391,44 @@ final class VaultManager: ObservableObject {
                 statusMessage = "LiveContainer reset external folder permission for \"\(lastSavedVaultName)\". Re-select the folder (with Fix File Picker enabled) or switch to LiveContainer App Folder + Drive Sync."
             }
         }
+
+        #if os(macOS)
+        // 4. macOS auto-detection: locate active Obsidian Vault from `~/Library/Application Support/obsidian/obsidian.json`
+        if vaultURL == nil, let detected = Self.autoDetectMacObsidianVault() {
+            setVaultFolder(detected)
+        }
+        #endif
     }
+
+    #if os(macOS)
+    /// Reads Obsidian's desktop registry (`obsidian.json`) to auto-detect the user's active Vault folder on first run.
+    static func autoDetectMacObsidianVault() -> URL? {
+        let appSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/obsidian/obsidian.json")
+        guard let data = try? Data(contentsOf: appSupport),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let vaults = root["vaults"] as? [String: [String: Any]] else {
+            return nil
+        }
+        var candidates: [(path: String, isOpen: Bool, ts: Double)] = []
+        for entry in vaults.values {
+            guard let path = entry["path"] as? String, !path.isEmpty else { continue }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
+                  isDir.boolValue,
+                  FileManager.default.isReadableFile(atPath: path) else { continue }
+            let isOpen = (entry["open"] as? Bool) ?? false
+            let ts = (entry["ts"] as? NSNumber)?.doubleValue ?? 0
+            candidates.append((path, isOpen, ts))
+        }
+        candidates.sort {
+            if $0.isOpen != $1.isOpen { return $0.isOpen && !$1.isOpen }
+            return $0.ts > $1.ts
+        }
+        guard let best = candidates.first else { return nil }
+        return URL(fileURLWithPath: best.path, isDirectory: true)
+    }
+    #endif
 
     func ensureSecurityScopeActive() {
         if !accessingRoot, let url = scopedRootURL, !isUsingLocalFallback {
@@ -449,7 +486,7 @@ final class VaultManager: ObservableObject {
                     let vals = try? itemURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
                     if vals?.isDirectory == true {
                         // Skip `.ink.d` internal folders and iOS Share Sheet's ephemeral `Inbox` folder
-                        if itemURL.lastPathComponent.hasSuffix(".ink.d") || relPath == "Inbox" {
+                        if itemURL.lastPathComponent.hasSuffix(".ink.d") || relPath == "Inbox" || itemURL.lastPathComponent == ".PencilInk-Trash" {
                             enumerator.skipDescendants()
                             continue
                         }
@@ -498,7 +535,7 @@ final class VaultManager: ObservableObject {
                     relativePath: rel,
                     pdfCount: folderPDFCounts[rel] ?? 0
                 )
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }.sorted { $0.relativePath.localizedCaseInsensitiveCompare($1.relativePath) == .orderedAscending }
 
             DispatchQueue.main.async {
                 self.pdfs = foundPDFs
@@ -790,6 +827,7 @@ final class VaultManager: ObservableObject {
     }
 
     func deletePDF(_ item: PDFItem) throws {
+        ensureSecurityScopeActive()
         try FileManager.default.removeItem(at: item.url)
         let sidecar = InkDocument.sidecarURL(for: item.url)
         if FileManager.default.fileExists(atPath: sidecar.path) {
@@ -801,6 +839,118 @@ final class VaultManager: ObservableObject {
         recentPaths.removeAll { $0 == item.relativePath }
         saveMetadata()
         refreshPDFList()
+    }
+
+    @discardableResult
+    func ensureLocalFolderExists(relativePath: String) -> Bool {
+        ensureSecurityScopeActive()
+        guard let root = vaultURL else { return false }
+        let clean = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !clean.isEmpty else { return false }
+        let dirURL = root.appendingPathComponent(clean, isDirectory: true)
+        if FileManager.default.fileExists(atPath: dirURL.path) { return false }
+        do {
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    func moveLocalPDFSilently(from oldRelativePath: String, to newRelativePath: String) -> Bool {
+        ensureSecurityScopeActive()
+        guard let root = vaultURL else { return false }
+        let cleanOld = oldRelativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let cleanNew = newRelativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !cleanOld.isEmpty, !cleanNew.isEmpty, cleanOld.lowercased() != cleanNew.lowercased() else { return false }
+        let src = root.appendingPathComponent(cleanOld, isDirectory: false)
+        let dst = root.appendingPathComponent(cleanNew, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: src.path),
+              !FileManager.default.fileExists(atPath: dst.path) else { return false }
+        do {
+            try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: src, to: dst)
+            let oldSidecar = InkDocument.sidecarURL(for: src)
+            let newSidecar = InkDocument.sidecarURL(for: dst)
+            if FileManager.default.fileExists(atPath: oldSidecar.path) {
+                try? FileManager.default.moveItem(at: oldSidecar, to: newSidecar)
+            }
+            if let col = coverColors.removeValue(forKey: cleanOld) { coverColors[cleanNew] = col }
+            if journalPaths.remove(cleanOld) != nil { journalPaths.insert(cleanNew) }
+            if favoritePaths.remove(cleanOld) != nil { favoritePaths.insert(cleanNew) }
+            recentPaths = recentPaths.map { $0 == cleanOld ? cleanNew : $0 }
+            saveMetadata()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    func deleteFolder(_ folder: FolderItem) throws -> [String] {
+        ensureSecurityScopeActive()
+        let prefix = folder.relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/"
+        let affectedPDFs = pdfs.filter {
+            $0.relativeFolder == folder.relativePath || $0.relativePath.hasPrefix(prefix)
+        }.map { $0.relativePath }
+
+        if FileManager.default.fileExists(atPath: folder.url.path) {
+            try FileManager.default.removeItem(at: folder.url)
+        }
+
+        for rel in affectedPDFs {
+            coverColors.removeValue(forKey: rel)
+            journalPaths.remove(rel)
+            favoritePaths.remove(rel)
+        }
+        recentPaths.removeAll { rel in affectedPDFs.contains(rel) || rel.hasPrefix(prefix) }
+        saveMetadata()
+        refreshPDFList()
+        return affectedPDFs
+    }
+
+    func removeLocalFileSilently(relativePath: String) -> Bool {
+        ensureSecurityScopeActive()
+        guard let root = vaultURL else { return false }
+        let cleanRel = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !cleanRel.isEmpty else { return false }
+        let fileURL = root.appendingPathComponent(cleanRel, isDirectory: false)
+        var removedAny = false
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try? FileManager.default.removeItem(at: fileURL)
+            removedAny = true
+        }
+        let sidecar = InkDocument.sidecarURL(for: fileURL)
+        if FileManager.default.fileExists(atPath: sidecar.path) {
+            try? FileManager.default.removeItem(at: sidecar)
+            removedAny = true
+        }
+        if removedAny {
+            coverColors.removeValue(forKey: cleanRel)
+            journalPaths.remove(cleanRel)
+            favoritePaths.remove(cleanRel)
+            recentPaths.removeAll { $0 == cleanRel }
+            saveMetadata()
+        }
+        return removedAny
+    }
+
+    func removeLocalFolderSilently(relativeFolder: String) -> Bool {
+        ensureSecurityScopeActive()
+        guard let root = vaultURL else { return false }
+        let cleanDir = relativeFolder.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !cleanDir.isEmpty else { return false }
+        let dirURL = root.appendingPathComponent(cleanDir, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: dirURL.path) else { return false }
+        try? FileManager.default.removeItem(at: dirURL)
+        let prefix = cleanDir + "/"
+        coverColors = coverColors.filter { !$0.key.hasPrefix(prefix) }
+        journalPaths = journalPaths.filter { !$0.hasPrefix(prefix) }
+        favoritePaths = favoritePaths.filter { !$0.hasPrefix(prefix) }
+        recentPaths.removeAll { $0.hasPrefix(prefix) }
+        saveMetadata()
+        return true
     }
 
     /// Installs a PDF streamed from Google Drive into `<vaultRoot>/<relativePath>`, creating any missing subfolders

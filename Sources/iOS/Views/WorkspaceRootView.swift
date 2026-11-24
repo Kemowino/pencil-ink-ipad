@@ -57,6 +57,13 @@ struct WorkspaceRootView: View {
         }
         .onAppear {
             tabManager.restoreSessionIfNeeded(from: vault)
+            syncManagerRef.onRemoteDeletedPath = { relPath, isFolder in
+                if isFolder {
+                    tabManager.handleDeletedFolder(relativeFolder: relPath)
+                } else {
+                    tabManager.handleDeletedDocument(relativePath: relPath)
+                }
+            }
         }
         .sheet(item: $incomingFiles.pendingFile, onDismiss: {
             if incomingFiles.pendingFile != nil {

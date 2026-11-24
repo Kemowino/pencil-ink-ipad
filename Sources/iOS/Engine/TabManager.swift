@@ -156,7 +156,21 @@ final class TabManager: ObservableObject {
     }
 
     func handleDeletedDocument(relativePath: String) {
-        if let tab = tabs.first(where: { $0.relativePath == relativePath }) {
+        if let tab = tabs.first(where: { $0.relativePath.lowercased() == relativePath.lowercased() }) {
+            tab.controllerBox.vc?.cancelAllPendingIO()
+            closeTab(tab.id)
+        }
+    }
+
+    func handleDeletedFolder(relativeFolder: String) {
+        let low = relativeFolder.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        let prefix = low + "/"
+        let matching = tabs.filter {
+            let rp = $0.relativePath.lowercased()
+            return rp == low || rp.hasPrefix(prefix)
+        }
+        for tab in matching {
+            tab.controllerBox.vc?.cancelAllPendingIO()
             closeTab(tab.id)
         }
     }
