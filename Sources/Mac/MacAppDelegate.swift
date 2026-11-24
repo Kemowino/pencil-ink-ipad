@@ -7,11 +7,10 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     let vault = VaultManager()
     let syncManager = DriveSyncManager()
 
-    private var libraryController: MacLibraryWindowController?
+    private var workspaceController: MacWorkspaceWindowController?
     private var syncWindowController: MacDriveSyncWindowController?
     private var diagnosticsController: MacDiagnosticsWindowController?
     private var startupSyncTimer: DispatchSourceTimer?
-    private var openDocControllers: [String: MacPDFWindowController] = [:]
 
     static func main() {
         let app = NSApplication.shared
@@ -22,17 +21,18 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Prevent macOS VisionKit Live Text background OCR/GPU scans on every PDF page jump!
+        // Prevent macOS VisionKit Live Text background OCR/GPU scans
         UserDefaults.standard.register(defaults: [
             "AppleLiveTextEnabled": false
         ])
         UserDefaults.standard.set(false, forKey: "AppleLiveTextEnabled")
-        NSWindow.allowsAutomaticWindowTabbing = true
+        NSWindow.allowsAutomaticWindowTabbing = false
         syncManager.isSmartSyncEnabled = { MacPreferences.shared.syncMode == .smart }
-        buildMainMenu()
-        showLibraryWindow()
 
-        // Delay initial background vault sync by 6 seconds so launch stays cool & instant!
+        buildMainMenu()
+        showWorkspaceWindow()
+
+        // Delay initial background vault sync by 6 seconds so launch stays cool & instant
         if syncManager.config.isConnected && vault.vaultURL != nil && MacPreferences.shared.syncMode == .smart {
             let t = DispatchSource.makeTimerSource(queue: .main)
             t.schedule(deadline: .now() + .seconds(6), leeway: .seconds(2))
@@ -49,108 +49,77 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            showLibraryWindow()
-        }
+        showWorkspaceWindow()
         return true
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        showWorkspaceWindow()
         for url in urls where url.pathExtension.lowercased() == "pdf" {
-            openPDF(at: url, relativePath: vault.relativePath(for: url))
+            workspaceController?.openPDFTab(at: url, relativePath: vault.relativePath(for: url))
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        for wc in openDocControllers.values {
-            wc.commitActiveTextBox()
-            wc.saveNow(flushDriveImmediately: false)
-        }
+        workspaceController?.saveAllDirtySessionsBeforeTerminate()
     }
 
-    // MARK: - Window & Tab Orchestration
+    // MARK: - Single-Window Workspace Orchestration
 
-    @objc func showLibraryWindow() {
-        if let existing = libraryController {
-            existing.refreshIfPendingOnShow()
+    @objc func showWorkspaceWindow() {
+        if let existing = workspaceController {
             existing.showWindow(nil)
             existing.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        let lib = MacLibraryWindowController(vault: vault, syncManager: syncManager)
-        lib.onOpenPDF = { [weak self] item in
-            self?.openPDF(at: item.url, relativePath: item.relativePath)
-        }
-        lib.onOpenSyncSettings = { [weak self] in
+        let ws = MacWorkspaceWindowController(vault: vault, syncManager: syncManager)
+        ws.onRequestOpenSyncSettings = { [weak self] in
             self?.showDriveSyncSettings()
         }
-        lib.onOpenDiagnostics = { [weak self] in
+        ws.onRequestOpenDiagnostics = { [weak self] in
             self?.showDiagnosticsWindow()
         }
-        libraryController = lib
-        lib.showWindow(nil)
-        lib.window?.makeKeyAndOrderFront(nil)
+        workspaceController = ws
+        ws.showWindow(nil)
+        ws.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func openPDF(at url: URL, relativePath: String, tabHost: MacPDFWindowController? = nil) {
-        let key = url.standardizedFileURL.path
-        if let existing = openDocControllers[key] {
-            existing.showWindow(nil)
-            existing.window?.makeKeyAndOrderFront(nil)
-            return
-        }
-        let wc = MacPDFWindowController(pdfURL: url, relativePath: relativePath, syncManager: syncManager)
-        wc.onRequestNewTab = { [weak self] _ in
-            self?.showLibraryWindow()
-        }
-        wc.onRequestOpenSyncSettings = { [weak self] in
-            self?.showDriveSyncSettings()
-        }
-        wc.onRequestOpenDiagnostics = { [weak self] in
-            self?.showDiagnosticsWindow()
-        }
-        wc.onWindowClosed = { [weak self] closed in
-            self?.openDocControllers.removeValue(forKey: closed.pdfURL.standardizedFileURL.path)
-        }
-        openDocControllers[key] = wc
-
-        // Native macOS window tabbing: attach cleanly as a tab on the frontmost reader window!
-        let hostWindow = tabHost?.window ?? activeReaderController()?.window
-        if let host = hostWindow, let newWin = wc.window {
-            host.addTabbedWindow(newWin, ordered: .above)
-            newWin.makeKeyAndOrderFront(nil)
-        } else {
-            wc.window?.center()
-            wc.showWindow(nil)
-            wc.window?.makeKeyAndOrderFront(nil)
-        }
-        NSApp.activate(ignoringOtherApps: true)
+    @objc func showLibraryTabAction() {
+        showWorkspaceWindow()
+        workspaceController?.showLibraryTab(focusSearch: false)
     }
 
-    private func activeReaderController() -> MacPDFWindowController? {
-        if let keyWin = NSApp.keyWindow, let wc = keyWin.windowController as? MacPDFWindowController {
-            return wc
-        }
-        return openDocControllers.values.first
+    @objc func newTabLibraryAction() {
+        showWorkspaceWindow()
+        workspaceController?.showLibraryTab(focusSearch: true)
     }
 
     @objc func openPDFPanelAction() {
+        showWorkspaceWindow()
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.pdf]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if panel.runModal() == .OK {
             for url in panel.urls {
-                openPDF(at: url, relativePath: vault.relativePath(for: url))
+                workspaceController?.openPDFTab(at: url, relativePath: vault.relativePath(for: url))
             }
         }
     }
 
     @objc func chooseVaultAction() {
-        showLibraryWindow()
-        libraryController?.chooseVaultFolder()
+        showWorkspaceWindow()
+        workspaceController?.chooseVaultFolder()
+    }
+
+    @objc func closeTabOrWindowAction() {
+        if let keyWin = NSApp.keyWindow, keyWin !== workspaceController?.window {
+            keyWin.performClose(nil)
+            return
+        }
+        workspaceController?.closeActiveTabOrWindow()
     }
 
     @objc func showDriveSyncSettings() {
@@ -178,8 +147,8 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
             return
         }
         let dc = MacDiagnosticsWindowController()
-        dc.activeReaderProvider = { [weak self] in
-            self?.activeReaderController()
+        dc.activeWorkspaceProvider = { [weak self] in
+            self?.workspaceController
         }
         dc.onWindowClosed = { [weak self] in
             self?.diagnosticsController = nil
@@ -190,14 +159,14 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: - Menu Bar Actions Forwarded to Active Reader Window
+    // MARK: - Menu Bar Actions Forwarded to Active Workspace
 
     @objc private func menuUndo() {
         if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
             tv.undoManager?.undo()
             return
         }
-        activeReaderController()?.performDocumentUndo()
+        workspaceController?.performDocumentUndo()
     }
 
     @objc private func menuRedo() {
@@ -205,62 +174,63 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
             tv.undoManager?.redo()
             return
         }
-        activeReaderController()?.performDocumentRedo()
+        workspaceController?.performDocumentRedo()
     }
 
     @objc private func menuExportAnnotatedPDF() {
-        activeReaderController()?.exportAnnotatedPDFAction()
+        workspaceController?.exportAnnotatedPDFAction()
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        let reader = activeReaderController()
+        let hasReader = (workspaceController?.activeReaderSession != nil)
         switch menuItem.action {
         case #selector(menuUndo):
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
                 return tv.undoManager?.canUndo ?? false
             }
-            return reader?.canUndoDocument ?? false
+            return workspaceController?.canUndoDocument ?? false
         case #selector(menuRedo):
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
                 return tv.undoManager?.canRedo ?? false
             }
-            return reader?.canRedoDocument ?? false
+            return workspaceController?.canRedoDocument ?? false
         case #selector(menuHighlightSelection):
-            return reader?.hasTextSelection ?? false
-        case #selector(menuExportAnnotatedPDF), #selector(menuToggleSidebar), #selector(menuFind),
+            return workspaceController?.hasTextSelection ?? false
+        case #selector(menuExportAnnotatedPDF), #selector(menuToggleSidebar),
              #selector(menuModeRead), #selector(menuModeHighlight), #selector(menuModeTextBox),
-             #selector(menuToggleBookmark), #selector(menuZoomIn), #selector(menuZoomOut), #selector(menuZoomFit), #selector(menuToggleTwoUp):
-            return reader != nil
+             #selector(menuToggleBookmark), #selector(menuZoomIn), #selector(menuZoomOut),
+             #selector(menuZoomFit), #selector(menuToggleTwoUp):
+            return hasReader
         case #selector(menuToggleHighQualityImages):
             menuItem.state = MacPreferences.shared.highQualityImages ? .on : .off
             return true
+        case #selector(menuSwitchTab(_:)):
+            return menuItem.tag < (workspaceController?.openTabCount ?? 0)
+        case #selector(menuPrevTab), #selector(menuNextTab):
+            return (workspaceController?.openTabCount ?? 0) > 1
         default:
             return true
         }
     }
 
-    @objc private func menuToggleSidebar() { activeReaderController()?.toggleSidebarAction() }
-    @objc private func menuFind() { activeReaderController()?.focusSearchAction() }
-    @objc private func menuHighlightSelection() { activeReaderController()?.highlightSelectionAction() }
-    @objc private func menuModeRead() { activeReaderController()?.setToolMode(.read) }
-    @objc private func menuModeHighlight() { activeReaderController()?.setToolMode(.highlighter) }
-    @objc private func menuModeTextBox() { activeReaderController()?.setToolMode(.textBox) }
-    @objc private func menuToggleBookmark() { activeReaderController()?.toggleBookmarkAction() }
-    @objc private func menuZoomIn() { activeReaderController()?.zoomInAction() }
-    @objc private func menuZoomOut() { activeReaderController()?.zoomOutAction() }
-    @objc private func menuZoomFit() { activeReaderController()?.zoomToFitAction() }
-    @objc private func menuToggleTwoUp() { activeReaderController()?.toggleTwoUpAction() }
-    @objc private func menuToggleHighQualityImages() {
-        MacPreferences.shared.highQualityImages.toggle()
-    }
+    @objc private func menuToggleSidebar() { workspaceController?.toggleSidebarAction() }
+    @objc private func menuFind() { workspaceController?.focusSearchAction() }
+    @objc private func menuHighlightSelection() { workspaceController?.highlightSelectionAction() }
+    @objc private func menuModeRead() { workspaceController?.setToolMode(.read) }
+    @objc private func menuModeHighlight() { workspaceController?.setToolMode(.highlighter) }
+    @objc private func menuModeTextBox() { workspaceController?.setToolMode(.textBox) }
+    @objc private func menuToggleBookmark() { workspaceController?.toggleBookmarkAction() }
+    @objc private func menuZoomIn() { workspaceController?.zoomInAction() }
+    @objc private func menuZoomOut() { workspaceController?.zoomOutAction() }
+    @objc private func menuZoomFit() { workspaceController?.zoomToFitAction() }
+    @objc private func menuToggleTwoUp() { workspaceController?.toggleTwoUpAction() }
+    @objc private func menuToggleHighQualityImages() { MacPreferences.shared.highQualityImages.toggle() }
+    @objc private func menuSwitchTab(_ sender: NSMenuItem) { workspaceController?.switchToTabAtIndex(sender.tag) }
+    @objc private func menuPrevTab() { workspaceController?.cycleTab(delta: -1) }
+    @objc private func menuNextTab() { workspaceController?.cycleTab(delta: 1) }
+
     @objc private func menuSyncNow() {
-        if let active = activeReaderController() {
-            active.syncNowAction()
-        } else if syncManager.config.isConnected {
-            Task { _ = await syncManager.syncVault(vault: vault, force: true) }
-        } else {
-            showDriveSyncSettings()
-        }
+        workspaceController?.syncNowAction()
     }
 
     // MARK: - Pure AppKit Main Menu Bar
@@ -283,15 +253,15 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         // File Menu
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
-        fileMenu.addItem(withTitle: "New Tab (Library)", action: #selector(showLibraryWindow), keyEquivalent: "t")
-        fileMenu.addItem(withTitle: "Library Window", action: #selector(showLibraryWindow), keyEquivalent: "l")
+        fileMenu.addItem(withTitle: "New Tab (Search Library)", action: #selector(newTabLibraryAction), keyEquivalent: "t")
+        fileMenu.addItem(withTitle: "Library Tab", action: #selector(showLibraryTabAction), keyEquivalent: "l")
         fileMenu.addItem(withTitle: "Choose Vault Folder…", action: #selector(chooseVaultAction), keyEquivalent: "O")
         fileMenu.addItem(withTitle: "Open PDF…", action: #selector(openPDFPanelAction), keyEquivalent: "o")
         let expItem = NSMenuItem(title: "Export Annotated PDF…", action: #selector(menuExportAnnotatedPDF), keyEquivalent: "E")
         expItem.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(expItem)
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Close Tab / Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileMenu.addItem(withTitle: "Close Tab / Window", action: #selector(closeTabOrWindowAction), keyEquivalent: "w")
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
@@ -308,16 +278,22 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Find in PDF…", action: #selector(menuFind), keyEquivalent: "f")
+        editMenu.addItem(withTitle: "Find…", action: #selector(menuFind), keyEquivalent: "f")
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
         // Tools Menu
         let toolsItem = NSMenuItem()
         let toolsMenu = NSMenu(title: "Tools")
-        toolsMenu.addItem(withTitle: "Read Mode", action: #selector(menuModeRead), keyEquivalent: "1")
-        toolsMenu.addItem(withTitle: "Highlighter Mode", action: #selector(menuModeHighlight), keyEquivalent: "2")
-        toolsMenu.addItem(withTitle: "Text Box Mode", action: #selector(menuModeTextBox), keyEquivalent: "3")
+        let rItem = NSMenuItem(title: "Read Mode", action: #selector(menuModeRead), keyEquivalent: "r")
+        rItem.keyEquivalentModifierMask = [.command, .option]
+        toolsMenu.addItem(rItem)
+        let hItem = NSMenuItem(title: "Highlighter Mode", action: #selector(menuModeHighlight), keyEquivalent: "h")
+        hItem.keyEquivalentModifierMask = [.command, .option]
+        toolsMenu.addItem(hItem)
+        let tItem = NSMenuItem(title: "Text Box Mode", action: #selector(menuModeTextBox), keyEquivalent: "t")
+        tItem.keyEquivalentModifierMask = [.command, .option]
+        toolsMenu.addItem(tItem)
         toolsMenu.addItem(.separator())
         let hlSel = NSMenuItem(title: "Highlight Selected Text", action: #selector(menuHighlightSelection), keyEquivalent: "H")
         hlSel.keyEquivalentModifierMask = [.command, .shift]
@@ -343,7 +319,6 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         let twoUpItem = NSMenuItem(title: "Toggle Two-Page Spread", action: #selector(menuToggleTwoUp), keyEquivalent: "2")
         twoUpItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(twoUpItem)
-
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "High-Quality Image Resampling", action: #selector(menuToggleHighQualityImages), keyEquivalent: "")
         viewItem.submenu = viewMenu
@@ -359,14 +334,25 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidatio
         syncItem.submenu = syncMenu
         mainMenu.addItem(syncItem)
 
-        // Window Menu (Enables Native macOS Tab Bar & Window Management!)
+        // Window & In-App Tabs Menu (Cmd+1 Library, Cmd+2..9 PDF Tabs, Cmd+Shift+[ / ])
         let winItem = NSMenuItem()
         let winMenu = NSMenu(title: "Window")
         winMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         winMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         winMenu.addItem(.separator())
-        winMenu.addItem(withTitle: "Show Tab Bar", action: #selector(NSWindow.toggleTabBar(_:)), keyEquivalent: "")
-        winMenu.addItem(withTitle: "Merge All Windows", action: #selector(NSWindow.mergeAllWindows(_:)), keyEquivalent: "")
+        let prevTab = NSMenuItem(title: "Previous Tab", action: #selector(menuPrevTab), keyEquivalent: "[")
+        prevTab.keyEquivalentModifierMask = [.command, .shift]
+        winMenu.addItem(prevTab)
+        let nextTab = NSMenuItem(title: "Next Tab", action: #selector(menuNextTab), keyEquivalent: "]")
+        nextTab.keyEquivalentModifierMask = [.command, .shift]
+        winMenu.addItem(nextTab)
+        winMenu.addItem(.separator())
+        for i in 0..<9 {
+            let title = (i == 0) ? "Library Tab" : "Tab \(i + 1)"
+            let item = NSMenuItem(title: title, action: #selector(menuSwitchTab(_:)), keyEquivalent: "\(i + 1)")
+            item.tag = i
+            winMenu.addItem(item)
+        }
         winItem.submenu = winMenu
         mainMenu.addItem(winItem)
 

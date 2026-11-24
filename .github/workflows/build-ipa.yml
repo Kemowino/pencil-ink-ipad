@@ -83,12 +83,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(grep -m1 'CFBundleShortVersionString:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="v${VER:-3.5.0}"
+          TAG="v${VER:-4.0.0}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip --clobber
           else
             gh release create "$TAG" PencilInkNative.ipa PencilInkNative-macOS.zip \
               --title "Pencil Ink Native $TAG" \
-              --notes "Pencil Ink Native $TAG — Step 2B Ultra-Low-Power Pure CALayer + CGPDFDocument Engine: Replaces PDFView completely with MacLitePDFCanvasView (2-4 pooled opaque CALayers, single serial .utility CGPDFDocument rasterizer with stale-page cancellation, bounded 8-page LRU cache, zero CATiledLayer / zero NSScrollingConcurrentVBLMonitor / zero macOS 26 Vision analyzer), opts out of macOS 26 Tahoe Liquid Glass blur via UIDesignRequiresCompatibility=true + opaque expanded toolbar, keeps 100% native PDF text selection, Copy, Highlight Selection, clickable links, 60Hz GPU pinch-to-zoom, inline text boxes, & Google Drive sync, and upgrades Self-Test telemetry to PowerTelemetryData.SystemLoad + ri_billed_energy." \
+              --notes "Pencil Ink Native $TAG — v4.0 Sub-5 EI Architecture & Single-Window In-App Workspace: Hardware-aligned zero-copy recycled IOSurface ring buffer (MacIOSurfacePool) tagged with native Display P3 colorspace, Two-Tier Progressive CGPDFDocument rasterizer (Tier 0 velocity skip -> Tier 1 .utility <=0.45MP draft -> Tier 2 .background exact 1:1 Retina on settle) with edge-to-edge cropBox + rotation matrix fixing white borders on 16:9 lecture slides, Pure event-driven NSView viewport (MacZeroScrollCanvasView) dropping NSScrollView/NSScrollerImp completely, Single-window pinned Library + in-app PDF tabs (MacWorkspaceWindowController) with zero-VRAM background tab hibernation, and pmenergy-calibrated Sub-5 EI Self-Test." \
               --latest
           fi

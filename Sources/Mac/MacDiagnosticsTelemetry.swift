@@ -4,7 +4,7 @@ import QuartzCore
 import Darwin
 import IOKit
 
-/// Lightweight atomic-like overlay & rendering telemetry counters (incremented only on actual draws/layouts).
+/// Lightweight overlay & rendering telemetry counters (incremented only on actual draws/layouts).
 @MainActor
 final class MacOverlayMetrics {
     static let shared = MacOverlayMetrics()
@@ -47,7 +47,7 @@ struct MacBatterySample {
     let percent: Int
     let voltageMV: Int
     let amperageMA: Int
-    /// Actual Mac system load in Watts (reads `PowerTelemetryData.SystemLoad` on AC/Battery; falls back to battery discharge W).
+    /// Actual Mac system load in Watts (`PowerTelemetryData.SystemLoad` on AC/Battery; falls back to battery discharge W).
     let watts: Double
     let isSystemLoadMetric: Bool
     let isCharging: Bool
@@ -57,6 +57,119 @@ struct MacBatterySample {
 struct MacGPUSample {
     let name: String
     let utilizationPercent: Int
+}
+
+struct MacSurfacePoolTelemetrySample {
+    let hitRatePercent: Double
+    let totalAllocations: UInt64
+    let poolHits: UInt64
+    let poolMisses: UInt64
+    let pooledDraftCount: Int
+    let pooledRetinaCount: Int
+    let estimatedPooledMB: Double
+}
+
+/// Reads `/usr/share/pmenergy/<board-id>.plist` when readable (falling back to Intel Kaby Lake-H MacBookPro14,3 weights)
+/// so Self-Test Energy Impact closely matches Activity Monitor's Intel formula (QoS CPU + 3x GPU + IDLEW wakeups).
+final class MacEnergyImpactCalibrator {
+    static let shared = MacEnergyImpactCalibrator()
+
+    struct Weights {
+        let boardID: String
+        let sourceDescription: String
+        let cpuWeight: Double
+        let uiQosMultiplier: Double
+        let initQosMultiplier: Double
+        let defaultQosMultiplier: Double
+        let utilityQosMultiplier: Double
+        let backgroundQosMultiplier: Double
+        let gpuWeight: Double
+        let pkgIdleWakeupWeight: Double
+        let timerUnder5msWeight: Double
+    }
+
+    let weights: Weights
+
+    private init() {
+        let boardID = Self.readBoardID() ?? "Mac-B4831CEBD52A0C4C"
+        let plistPath = "/usr/share/pmenergy/\(boardID).plist"
+        if let dict = NSDictionary(contentsOfFile: plistPath) as? [String: Any],
+           let constants = dict["energy_constants"] as? [String: Any] {
+            let cpuW = (constants["kcpu_time"] as? NSNumber)?.doubleValue ?? 1.0
+            let gpuW = (constants["kgpu_time"] as? NSNumber)?.doubleValue ?? 3.0
+            let wkW  = (constants["kcpu_wakeups"] as? NSNumber)?.doubleValue ?? 0.04
+            self.weights = Weights(
+                boardID: boardID,
+                sourceDescription: "pmenergy(\(boardID))",
+                cpuWeight: max(0.5, cpuW),
+                uiQosMultiplier: 1.15,
+                initQosMultiplier: 1.10,
+                defaultQosMultiplier: 1.0,
+                utilityQosMultiplier: 0.88,
+                backgroundQosMultiplier: 0.72,
+                gpuWeight: max(1.0, gpuW),
+                pkgIdleWakeupWeight: max(0.0, wkW),
+                timerUnder5msWeight: 0.02
+            )
+        } else {
+            self.weights = Weights(
+                boardID: boardID,
+                sourceDescription: "Intel-KBL-H(\(boardID))",
+                cpuWeight: 1.0,
+                uiQosMultiplier: 1.15,
+                initQosMultiplier: 1.10,
+                defaultQosMultiplier: 1.0,
+                utilityQosMultiplier: 0.88,
+                backgroundQosMultiplier: 0.72,
+                gpuWeight: 3.0,
+                pkgIdleWakeupWeight: 0.04,
+                timerUnder5msWeight: 0.02
+            )
+        }
+    }
+
+    func estimateEnergyImpact(
+        totalCpuPct: Double,
+        uiPct: Double,
+        initPct: Double,
+        defPct: Double,
+        utilPct: Double,
+        bgPct: Double,
+        procGpuPct: Double,
+        pkgIdleWakeupsPerSec: Double,
+        timerUnder5msPerSec: Double
+    ) -> Double {
+        let qosSum = uiPct + initPct + defPct + utilPct + bgPct
+        let unaccounted = max(0.0, totalCpuPct - qosSum)
+        let weightedCpu =
+            (uiPct * weights.uiQosMultiplier) +
+            (initPct * weights.initQosMultiplier) +
+            (defPct * weights.defaultQosMultiplier) +
+            (utilPct * weights.utilityQosMultiplier) +
+            (bgPct * weights.backgroundQosMultiplier) +
+            unaccounted
+
+        return max(
+            0.0,
+            (weightedCpu * weights.cpuWeight) +
+            (procGpuPct * weights.gpuWeight) +
+            (pkgIdleWakeupsPerSec * weights.pkgIdleWakeupWeight) +
+            (timerUnder5msPerSec * weights.timerUnder5msWeight)
+        )
+    }
+
+    private static func readBoardID() -> String? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let cfVal = IORegistryEntryCreateCFProperty(service, "board-id" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
+            return nil
+        }
+        if let data = cfVal as? Data {
+            return String(decoding: data.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return "\(cfVal)".trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 struct MacProcessSnapshot {
@@ -83,6 +196,7 @@ struct MacProcessSnapshot {
     let gpus: [MacGPUSample]
     let thermalState: ProcessInfo.ThermalState
     let overlay: MacOverlayMetrics.Snapshot
+    let surfacePool: MacSurfacePoolTelemetrySample
 
     var totalCPUSec: Double { userCPUSec + sysCPUSec }
 }
@@ -118,6 +232,7 @@ struct MacIntervalMetrics {
     let p95FrameMs: Double
     let p99FrameMs: Double
     let droppedFrames: Int
+    let surfacePool: MacSurfacePoolTelemetrySample
 }
 
 /// Pure Darwin / Mach / IOKit telemetry collector (ZERO `sudo`, ZERO Metal / dGPU wakeups!).
@@ -136,7 +251,7 @@ enum MacDiagnosticsCollector {
     static func captureSnapshot() -> MacProcessSnapshot {
         let ts = CACurrentMediaTime()
 
-        // 1. proc_pid_rusage (RUSAGE_INFO_V4): exact CPU, QoS, Memory Footprint, Idle Wakeups, Disk IO
+        // 1. proc_pid_rusage (RUSAGE_INFO_V4): exact CPU, QoS buckets, Memory Footprint, Idle Wakeups, Disk IO
         var rusage = rusage_info_v4()
         let rc: Int32 = withUnsafeMutablePointer(to: &rusage) { ptr in
             ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
@@ -166,14 +281,19 @@ enum MacDiagnosticsCollector {
         let bin2 = pwr2KR == KERN_SUCCESS ? pwr2.cpu_energy.task_timer_wakeups_bin_2 : 0
         let procGPUSec = pwr2KR == KERN_SUCCESS ? Double(pwr2.gpu_energy.task_gpu_utilisation) / 1_000_000_000.0 : 0
 
-        // 3. Per-thread CPU & names (pinpoints PDFKit / Vision / CoreImage / Main / DriveSync!)
         let threads = sampleThreads()
-
-        // 4. IOKit AppleSmartBattery (real system wattage, voltage, amperage)
         let battery = sampleBattery()
-
-        // 5. IOKit IOAccelerator (read-only IORegistry GPU utilization — NEVER wakes dGPU!)
         let gpus = sampleGPUs()
+        let ps = MacIOSurfacePool.shared.snapshotStats()
+        let poolSample = MacSurfacePoolTelemetrySample(
+            hitRatePercent: ps.hitRatePercent,
+            totalAllocations: ps.totalAllocations,
+            poolHits: ps.poolHits,
+            poolMisses: ps.poolMisses,
+            pooledDraftCount: ps.pooledDraftCount,
+            pooledRetinaCount: ps.pooledRetinaCount,
+            estimatedPooledMB: Double(ps.estimatedPooledBytes) / (1024.0 * 1024.0)
+        )
 
         return MacProcessSnapshot(
             timestamp: ts,
@@ -198,7 +318,8 @@ enum MacDiagnosticsCollector {
             battery: battery,
             gpus: gpus,
             thermalState: ProcessInfo.processInfo.thermalState,
-            overlay: MacOverlayMetrics.shared.snapshot()
+            overlay: MacOverlayMetrics.shared.snapshot(),
+            surfacePool: poolSample
         )
     }
 
@@ -215,6 +336,7 @@ enum MacDiagnosticsCollector {
         let dProcGPU = max(0, end.processGPUSec - start.processGPUSec)
         let dEnergy = end.billedEnergyRaw >= start.billedEnergyRaw ? (end.billedEnergyRaw - start.billedEnergyRaw) : 0
         let energyPerSec = Double(dEnergy) / dt
+
         let userPct = (dUser / dt) * 100.0
         let sysPct = (dSys / dt) * 100.0
         let billedPct = (dBilled / dt) * 100.0
@@ -234,10 +356,6 @@ enum MacDiagnosticsCollector {
         let dRead = end.diskReadBytes >= start.diskReadBytes ? (end.diskReadBytes - start.diskReadBytes) : 0
         let dWrite = end.diskWriteBytes >= start.diskWriteBytes ? (end.diskWriteBytes - start.diskWriteBytes) : 0
 
-        // Apple Activity Monitor Energy Impact approximation (CPU% + Process GPU% + Idle Wakeups)
-        let energyApprox = totalPct + procGPUPct + pkgPerSec * 0.05 + bin1PerSec * 0.02
-
-        // QoS breakdown
         let qUI = max(0, end.qosInteractiveSec - start.qosInteractiveSec) / dt * 100.0
         let qInit = max(0, end.qosInitiatedSec - start.qosInitiatedSec) / dt * 100.0
         let qDef = max(0, end.qosDefaultSec - start.qosDefaultSec) / dt * 100.0
@@ -248,7 +366,19 @@ enum MacDiagnosticsCollector {
             qUI, qInit, qDef, qUtil, qBg
         )
 
-        // Top CPU threads delta
+        // Calibrated pmenergy Activity Monitor Energy Impact estimate (QoS CPU + 3x GPU + IDLEW wakeups)
+        let energyApprox = MacEnergyImpactCalibrator.shared.estimateEnergyImpact(
+            totalCpuPct: totalPct,
+            uiPct: qUI,
+            initPct: qInit,
+            defPct: qDef,
+            utilPct: qUtil,
+            bgPct: qBg,
+            procGpuPct: procGPUPct,
+            pkgIdleWakeupsPerSec: pkgPerSec,
+            timerUnder5msPerSec: bin1PerSec
+        )
+
         var threadDeltas: [(name: String, cpuPercent: Double)] = []
         for (tid, endT) in end.threads {
             let startCPU = start.threads[tid]?.cpuSeconds ?? 0
@@ -262,7 +392,6 @@ enum MacDiagnosticsCollector {
         threadDeltas.sort { $0.cpuPercent > $1.cpuPercent }
         let topThreads = Array(threadDeltas.prefix(6))
 
-        // Frame time stats
         var fps = 0.0
         var p50 = 0.0
         var p95 = 0.0
@@ -317,7 +446,8 @@ enum MacDiagnosticsCollector {
             p50FrameMs: p50,
             p95FrameMs: p95,
             p99FrameMs: p99,
-            droppedFrames: dropped
+            droppedFrames: dropped,
+            surfacePool: end.surfacePool
         )
     }
 
@@ -369,7 +499,7 @@ enum MacDiagnosticsCollector {
             if uniqueID == mainTID {
                 name = "Main Thread"
             } else if name.isEmpty {
-                name = "GCD/PDFKit Worker #\(uniqueID % 1000)"
+                name = "Worker #\(uniqueID % 1000)"
             }
             let cpuSec = Double(ext.pth_user_time + ext.pth_system_time) / 1_000_000_000.0
             result[uniqueID] = MacThreadSample(threadID: uniqueID, name: name, cpuSeconds: cpuSec)
@@ -399,7 +529,6 @@ enum MacDiagnosticsCollector {
         let charging = (dict["IsCharging"] as? Bool) ?? false
         let extConn = (dict["ExternalConnected"] as? Bool) ?? false
 
-        // Prefer true Mac system load (`PowerTelemetryData.SystemLoad` in mW) so AC charging current never pollutes readings!
         var watts: Double = 0
         var isSysLoad = false
         if let ptd = dict["PowerTelemetryData"] as? [String: Any],
@@ -408,9 +537,6 @@ enum MacDiagnosticsCollector {
             isSysLoad = true
         } else if !extConn || amp < 0 {
             watts = (Double(voltage) * Double(abs(amp))) / 1_000_000.0
-        } else {
-            // Charging on AC without SystemLoad telemetry: do not misreport charging rate as system draw
-            watts = 0
         }
 
         return MacBatterySample(

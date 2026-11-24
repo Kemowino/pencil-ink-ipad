@@ -1,13 +1,6 @@
 import AppKit
 import Combine
 
-private extension NSToolbarItem.Identifier {
-    static let libChooseVault = NSToolbarItem.Identifier("pencilink.lib.chooseVault")
-    static let libSync = NSToolbarItem.Identifier("pencilink.lib.sync")
-    static let libDiagnostics = NSToolbarItem.Identifier("pencilink.lib.diagnostics")
-    static let libSearch = NSToolbarItem.Identifier("pencilink.lib.search")
-}
-
 private enum MacLibrarySidebarEntry {
     case header(String)
     case allPDFs
@@ -148,23 +141,26 @@ private final class MacDocumentRowCell: NSTableCellView {
     }
 }
 
-/// Pure AppKit native macOS 2-pane Library & Vault Browser window:
-/// - Native Unified `NSToolbar` + `NSSearchToolbarItem`
-/// - Native macOS Source List sidebar (Smart filters + Vault Folders)
-/// - Spacious 56 pt document rows with cached PDF cover thumbnails
+/// Pure AppKit embeddable 2-pane Library view controller mounted inside Tab 0 of `MacWorkspaceWindowController`.
 @MainActor
-final class MacLibraryWindowController: NSWindowController,
-    NSToolbarDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+final class MacLibraryViewController: NSViewController,
+    NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
 
     let vault: VaultManager
     let syncManager: DriveSyncManager
     var onOpenPDF: ((PDFItem) -> Void)?
     var onOpenSyncSettings: (() -> Void)?
-    var onOpenDiagnostics: (() -> Void)?
 
-    private let splitVC = NSSplitViewController()
+    private let splitView = NSSplitView()
     private let sidebarScroll = NSScrollView()
     private let sidebarTable = NSTableView()
+
+    private let headerBar = NSView()
+    private let vaultNameLabel = NSTextField(labelWithString: "No Vault Selected")
+    private let chooseVaultBtn = NSButton(title: "Choose Vault…", target: nil, action: nil)
+    private let syncNowBtn = NSButton(title: "Sync Drive", target: nil, action: nil)
+    private let searchField = NSSearchField()
+
     private let docScroll = NSScrollView()
     private let docTable = NSTableView()
     private let emptyStack = NSStackView()
@@ -173,12 +169,10 @@ final class MacLibraryWindowController: NSWindowController,
     private let emptyChooseBtn = NSButton(title: "Choose Vault Folder…", target: nil, action: nil)
     private let statusFooter = NSTextField(labelWithString: "")
 
-    private let syncToolbarBtn = NSButton()
-    private let searchToolbarItem = NSSearchToolbarItem(itemIdentifier: .libSearch)
-
     private var sidebarEntries: [MacLibrarySidebarEntry] = []
-    private var selectedSidebarIndex: Int = 1 // "All Documents"
+    private var selectedSidebarIndex: Int = 1
     private var filteredItems: [PDFItem] = []
+    private var isActiveTab = true
     private var needsReloadWhenShown = false
     private var searchDebounce: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
@@ -193,41 +187,38 @@ final class MacLibraryWindowController: NSWindowController,
     init(vault: VaultManager, syncManager: DriveSyncManager) {
         self.vault = vault
         self.syncManager = syncManager
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 920, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        win.title = "Pencil Ink"
-        win.subtitle = vault.vaultURL?.lastPathComponent ?? "Library"
-        win.minSize = NSSize(width: 660, height: 420)
-        win.toolbarStyle = .unified
-        win.center()
-        super.init(window: win)
-
-        setupToolbar()
-        setupSplitView()
-        bindPublishers()
-        rebuildSidebarAndList()
+        super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private func setupToolbar() {
-        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("PencilInkMacLibraryToolbar"))
-        toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        toolbar.allowsUserCustomization = false
-        window?.toolbar = toolbar
+    override func loadView() {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
+        self.view = root
+        setupUI(in: root)
+        bindPublishers()
+        rebuildSidebarAndList()
     }
 
-    private func setupSplitView() {
-        // Left Pane: Native macOS Source List Sidebar
-        let sidebarVC = NSViewController()
-        let sidebarContainer = NSView(frame: NSRect(x: 0, y: 0, width: 210, height: 540))
+    private func setupUI(in root: NSView) {
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(splitView)
+
+        NSLayoutConstraint.activate([
+            splitView.topAnchor.constraint(equalTo: root.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor)
+        ])
+
+        // Left Pane: Source List Sidebar
+        let leftPane = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 640))
+        leftPane.wantsLayer = true
+        leftPane.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
 
         let sCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("sidebar"))
         sCol.resizingMask = .autoresizingMask
@@ -243,25 +234,55 @@ final class MacLibraryWindowController: NSWindowController,
         sidebarScroll.documentView = sidebarTable
         sidebarScroll.hasVerticalScroller = true
         sidebarScroll.drawsBackground = false
-        sidebarContainer.addSubview(sidebarScroll)
+        leftPane.addSubview(sidebarScroll)
 
         NSLayoutConstraint.activate([
-            sidebarScroll.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
-            sidebarScroll.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
-            sidebarScroll.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
-            sidebarScroll.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            leftPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 195),
+            leftPane.widthAnchor.constraint(lessThanOrEqualToConstant: 280),
+            sidebarScroll.topAnchor.constraint(equalTo: leftPane.topAnchor, constant: 6),
+            sidebarScroll.bottomAnchor.constraint(equalTo: leftPane.bottomAnchor),
+            sidebarScroll.leadingAnchor.constraint(equalTo: leftPane.leadingAnchor),
+            sidebarScroll.trailingAnchor.constraint(equalTo: leftPane.trailingAnchor)
         ])
-        sidebarVC.view = sidebarContainer
 
-        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
-        sidebarItem.minimumThickness = 195
-        sidebarItem.maximumThickness = 280
-        sidebarItem.canCollapse = false
-        sidebarItem.allowsFullHeightLayout = true
+        // Right Pane: Header Bar (Vault + Search) + Document List + Status Footer
+        let rightPane = NSView(frame: NSRect(x: 0, y: 0, width: 740, height: 640))
 
-        // Right Pane: Rich Document List + Status Footer
-        let contentVC = NSViewController()
-        let contentRoot = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 540))
+        headerBar.translatesAutoresizingMaskIntoConstraints = false
+        rightPane.addSubview(headerBar)
+
+        vaultNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        vaultNameLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        vaultNameLabel.textColor = .labelColor
+        vaultNameLabel.lineBreakMode = .byTruncatingTail
+        vaultNameLabel.stringValue = vault.vaultURL?.lastPathComponent ?? "No Vault Selected"
+
+        chooseVaultBtn.translatesAutoresizingMaskIntoConstraints = false
+        chooseVaultBtn.bezelStyle = .rounded
+        chooseVaultBtn.controlSize = .small
+        chooseVaultBtn.target = self
+        chooseVaultBtn.action = #selector(chooseVaultFolder)
+
+        syncNowBtn.translatesAutoresizingMaskIntoConstraints = false
+        syncNowBtn.bezelStyle = .rounded
+        syncNowBtn.controlSize = .small
+        syncNowBtn.target = self
+        syncNowBtn.action = #selector(handleSyncButton)
+
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.placeholderString = "Search PDFs…"
+        searchField.controlSize = .regular
+        searchField.delegate = self
+
+        let headerSep = NSBox()
+        headerSep.boxType = .separator
+        headerSep.translatesAutoresizingMaskIntoConstraints = false
+
+        headerBar.addSubview(vaultNameLabel)
+        headerBar.addSubview(chooseVaultBtn)
+        headerBar.addSubview(syncNowBtn)
+        headerBar.addSubview(searchField)
+        headerBar.addSubview(headerSep)
 
         let dCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("doc"))
         dCol.resizingMask = .autoresizingMask
@@ -278,7 +299,7 @@ final class MacLibraryWindowController: NSWindowController,
         docTable.doubleAction = #selector(tableDoubleClicked)
 
         let ctxMenu = NSMenu()
-        ctxMenu.addItem(withTitle: "Open", action: #selector(ctxOpenPDF), keyEquivalent: "")
+        ctxMenu.addItem(withTitle: "Open in Tab", action: #selector(ctxOpenPDF), keyEquivalent: "")
         ctxMenu.addItem(withTitle: "Toggle Favorite", action: #selector(ctxToggleFavorite), keyEquivalent: "")
         ctxMenu.addItem(withTitle: "Show in Finder", action: #selector(ctxRevealInFinder), keyEquivalent: "")
         ctxMenu.addItem(.separator())
@@ -291,21 +312,19 @@ final class MacLibraryWindowController: NSWindowController,
         docScroll.documentView = docTable
         docScroll.hasVerticalScroller = true
         docScroll.drawsBackground = true
-        contentRoot.addSubview(docScroll)
+        rightPane.addSubview(docScroll)
 
-        // Subtle Footer Status Bar
         let footerSep = NSBox()
         footerSep.boxType = .separator
         footerSep.translatesAutoresizingMaskIntoConstraints = false
-        contentRoot.addSubview(footerSep)
+        rightPane.addSubview(footerSep)
 
         statusFooter.translatesAutoresizingMaskIntoConstraints = false
         statusFooter.font = NSFont.systemFont(ofSize: 11.5)
         statusFooter.textColor = .secondaryLabelColor
         statusFooter.lineBreakMode = .byTruncatingTail
-        contentRoot.addSubview(statusFooter)
+        rightPane.addSubview(statusFooter)
 
-        // Empty State Stack
         emptyStack.orientation = .vertical
         emptyStack.alignment = .centerX
         emptyStack.spacing = 10
@@ -323,38 +342,65 @@ final class MacLibraryWindowController: NSWindowController,
         emptyStack.addArrangedSubview(emptyTitle)
         emptyStack.addArrangedSubview(emptySub)
         emptyStack.addArrangedSubview(emptyChooseBtn)
-        contentRoot.addSubview(emptyStack)
+        rightPane.addSubview(emptyStack)
 
         NSLayoutConstraint.activate([
-            docScroll.topAnchor.constraint(equalTo: contentRoot.safeAreaLayoutGuide.topAnchor),
-            docScroll.leadingAnchor.constraint(equalTo: contentRoot.leadingAnchor),
-            docScroll.trailingAnchor.constraint(equalTo: contentRoot.trailingAnchor),
+            headerBar.topAnchor.constraint(equalTo: rightPane.topAnchor),
+            headerBar.leadingAnchor.constraint(equalTo: rightPane.leadingAnchor),
+            headerBar.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor),
+            headerBar.heightAnchor.constraint(equalToConstant: 44),
+
+            vaultNameLabel.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 14),
+            vaultNameLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+
+            chooseVaultBtn.leadingAnchor.constraint(equalTo: vaultNameLabel.trailingAnchor, constant: 10),
+            chooseVaultBtn.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+
+            syncNowBtn.leadingAnchor.constraint(equalTo: chooseVaultBtn.trailingAnchor, constant: 6),
+            syncNowBtn.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+
+            searchField.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -14),
+            searchField.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            searchField.widthAnchor.constraint(equalToConstant: 230),
+            searchField.leadingAnchor.constraint(greaterThanOrEqualTo: syncNowBtn.trailingAnchor, constant: 12),
+
+            headerSep.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
+            headerSep.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
+            headerSep.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor),
+
+            docScroll.topAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            docScroll.leadingAnchor.constraint(equalTo: rightPane.leadingAnchor),
+            docScroll.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor),
             docScroll.bottomAnchor.constraint(equalTo: footerSep.topAnchor),
 
-            footerSep.leadingAnchor.constraint(equalTo: contentRoot.leadingAnchor),
-            footerSep.trailingAnchor.constraint(equalTo: contentRoot.trailingAnchor),
+            footerSep.leadingAnchor.constraint(equalTo: rightPane.leadingAnchor),
+            footerSep.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor),
             footerSep.bottomAnchor.constraint(equalTo: statusFooter.topAnchor, constant: -4),
 
-            statusFooter.leadingAnchor.constraint(equalTo: contentRoot.leadingAnchor, constant: 14),
-            statusFooter.trailingAnchor.constraint(equalTo: contentRoot.trailingAnchor, constant: -14),
-            statusFooter.bottomAnchor.constraint(equalTo: contentRoot.bottomAnchor, constant: -5),
+            statusFooter.leadingAnchor.constraint(equalTo: rightPane.leadingAnchor, constant: 14),
+            statusFooter.trailingAnchor.constraint(equalTo: rightPane.trailingAnchor, constant: -14),
+            statusFooter.bottomAnchor.constraint(equalTo: rightPane.bottomAnchor, constant: -5),
 
             emptyStack.centerXAnchor.constraint(equalTo: docScroll.centerXAnchor),
             emptyStack.centerYAnchor.constraint(equalTo: docScroll.centerYAnchor)
         ])
-        contentVC.view = contentRoot
 
-        let mainItem = NSSplitViewItem(viewController: contentVC)
-        splitVC.addSplitViewItem(sidebarItem)
-        splitVC.addSplitViewItem(mainItem)
-        window?.contentViewController = splitVC
+        splitView.addArrangedSubview(leftPane)
+        splitView.addArrangedSubview(rightPane)
+        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 1)
     }
 
-    func refreshIfPendingOnShow() {
-        if needsReloadWhenShown {
+    func setTabActive(_ active: Bool) {
+        isActiveTab = active
+        if active && needsReloadWhenShown {
             needsReloadWhenShown = false
             rebuildSidebarAndList()
         }
+    }
+
+    func focusSearchField() {
+        view.window?.makeFirstResponder(searchField)
     }
 
     private func bindPublishers() {
@@ -363,7 +409,7 @@ final class MacLibraryWindowController: NSWindowController,
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _, _ in
                 guard let self else { return }
-                if self.window?.isVisible == true {
+                if self.isActiveTab {
                     self.rebuildSidebarAndList()
                 } else {
                     self.needsReloadWhenShown = true
@@ -374,7 +420,7 @@ final class MacLibraryWindowController: NSWindowController,
         vault.$vaultURL
             .receive(on: DispatchQueue.main)
             .sink { [weak self] url in
-                self?.window?.subtitle = url?.lastPathComponent ?? "No Vault Selected"
+                self?.vaultNameLabel.stringValue = url?.lastPathComponent ?? "No Vault Selected"
             }
             .store(in: &cancellables)
 
@@ -382,8 +428,7 @@ final class MacLibraryWindowController: NSWindowController,
             .combineLatest(syncManager.$syncProgressText)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] status, progress in
-                guard let self else { return }
-                self.updateFooterAndSyncUI(status: status, progress: progress)
+                self?.updateFooterAndSyncUI(status: status, progress: progress)
             }
             .store(in: &cancellables)
     }
@@ -392,18 +437,7 @@ final class MacLibraryWindowController: NSWindowController,
         let countLabel = "\(filteredItems.count) document\(filteredItems.count == 1 ? "" : "s")"
         let syncPart = progress.isEmpty ? "Drive: \(status)" : progress
         statusFooter.stringValue = "\(countLabel)  ·  \(syncPart)"
-
-        let imgName: String
-        switch syncManager.visualState {
-        case .ok: imgName = "checkmark.icloud"
-        case .syncing: imgName = "arrow.triangle.2.circlepath.icloud"
-        case .error: imgName = "exclamationmark.icloud"
-        case .disconnected: imgName = "icloud.slash"
-        }
-        syncToolbarBtn.image = NSImage(systemSymbolName: imgName, accessibilityDescription: status)
-        syncToolbarBtn.toolTip = syncManager.config.isConnected
-            ? "Sync Google Drive (\(status))"
-            : "Connect Google Drive…"
+        syncNowBtn.title = syncManager.config.isConnected ? "Sync Drive" : "Connect Drive…"
     }
 
     private func rebuildSidebarAndList() {
@@ -430,7 +464,7 @@ final class MacLibraryWindowController: NSWindowController,
     }
 
     private func rebuildFilteredList() {
-        let q = searchToolbarItem.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let base: [PDFItem]
         let entry = (selectedSidebarIndex >= 0 && selectedSidebarIndex < sidebarEntries.count)
             ? sidebarEntries[selectedSidebarIndex]
@@ -469,7 +503,7 @@ final class MacLibraryWindowController: NSWindowController,
             emptySub.stringValue = "Choose your vault folder to browse PDFs, view iPad notes, and sync with Google Drive."
         } else if !q.isEmpty {
             emptyTitle.stringValue = "No Results"
-            emptySub.stringValue = "No PDFs matching \"\(searchToolbarItem.searchField.stringValue)\"."
+            emptySub.stringValue = "No PDFs matching \"\(searchField.stringValue)\"."
         } else {
             emptyTitle.stringValue = "No Documents Here"
             emptySub.stringValue = "Add PDFs to this folder or sync from Google Drive."
@@ -502,10 +536,6 @@ final class MacLibraryWindowController: NSWindowController,
         Task {
             _ = await syncManager.syncVault(vault: vault, force: true)
         }
-    }
-
-    @objc private func handleDiagnosticsButton() {
-        onOpenDiagnostics?()
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -586,66 +616,7 @@ final class MacLibraryWindowController: NSWindowController,
         }
     }
 
-    // MARK: - NSToolbarDelegate
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.libChooseVault, .libSync, .libDiagnostics, .flexibleSpace, .libSearch]
-    }
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.libChooseVault, .libSync, .libDiagnostics, .flexibleSpace, .libSearch]
-    }
-
-    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-        switch itemIdentifier {
-        case .libChooseVault:
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            let btn = NSButton(
-                image: NSImage(systemSymbolName: "folder.badge.gearshape", accessibilityDescription: "Choose Vault") ?? NSImage(),
-                target: self,
-                action: #selector(chooseVaultFolder)
-            )
-            btn.bezelStyle = .texturedRounded
-            btn.toolTip = "Choose Vault Folder…"
-            item.view = btn
-            item.label = "Vault"
-            return item
-
-        case .libSync:
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            syncToolbarBtn.bezelStyle = .texturedRounded
-            syncToolbarBtn.image = NSImage(systemSymbolName: "icloud", accessibilityDescription: "Sync")
-            syncToolbarBtn.imagePosition = .imageOnly
-            syncToolbarBtn.target = self
-            syncToolbarBtn.action = #selector(handleSyncButton)
-            item.view = syncToolbarBtn
-            item.label = "Sync"
-            return item
-
-        case .libDiagnostics:
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            let btn = NSButton(
-                image: NSImage(systemSymbolName: "gauge.with.dots.needle.bottom.50percent", accessibilityDescription: "Self-Test") ?? NSImage(),
-                target: self,
-                action: #selector(handleDiagnosticsButton)
-            )
-            btn.bezelStyle = .texturedRounded
-            btn.toolTip = "Performance & Battery Self-Test (⌘⌥B)"
-            item.view = btn
-            item.label = "Self-Test"
-            return item
-
-        case .libSearch:
-            searchToolbarItem.searchField.placeholderString = "Search PDFs…"
-            searchToolbarItem.searchField.delegate = self
-            return searchToolbarItem
-
-        default:
-            return nil
-        }
-    }
-
-    // MARK: - NSTableViewDataSource & Delegate (Sidebar + Document List)
+    // MARK: - NSTableViewDataSource & Delegate
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView === sidebarTable { return sidebarEntries.count }
@@ -768,7 +739,6 @@ final class MacLibraryWindowController: NSWindowController,
             return cell
         }
 
-        // Right Pane: Rich 56 pt Document Row
         guard row < filteredItems.count else { return nil }
         let item = filteredItems[row]
         let id = NSUserInterfaceItemIdentifier("DocRowCell")
